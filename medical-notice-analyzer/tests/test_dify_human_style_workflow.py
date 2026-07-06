@@ -16,6 +16,12 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
         start_vars = by_id["start_node"]["variables"]
         self.assertEqual(start_vars[0]["variable"], "pack_id")
         self.assertTrue(start_vars[0]["required"])
+        start_by_name = {item["variable"]: item for item in start_vars}
+        self.assertIn("use_report_memory", start_by_name)
+        self.assertFalse(start_by_name["use_report_memory"]["required"])
+        self.assertIn("report_memory", start_by_name)
+        self.assertFalse(start_by_name["report_memory"]["required"])
+        self.assertGreaterEqual(start_by_name["report_memory"]["max_length"], 15000)
         self.assertEqual(by_id["fetch_evidence_pack"]["url"], "http://192.168.34.88:8099/analysis/packs/{{#start_node.pack_id#}}")
 
         for node_id in ["generate_report", "qa_report_first", "revise_report", "qa_revised_report"]:
@@ -38,6 +44,12 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
         self.assertIn("附件表格摘要", qa_prompt)
         self.assertIn("声明或资料说明", qa_prompt)
         self.assertIn("只补齐缺失项", revision_prompt)
+        for node_id in ["generate_report", "qa_report_first", "revise_report", "qa_revised_report"]:
+            prompt = "\n".join(item.get("text", "") for item in by_id[node_id]["prompt_template"])
+            self.assertIn("{{#start_node.use_report_memory#}}", prompt)
+            self.assertIn("{{#start_node.report_memory#}}", prompt)
+            self.assertIn("不得使用 report_memory 覆盖当前公告事实", prompt)
+            self.assertIn("report_memory 为空", prompt)
 
 
 if __name__ == "__main__":

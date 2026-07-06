@@ -14,9 +14,9 @@
       --text: #172033;
       --muted: #667085;
       --subtle: #98a2b3;
-      --brand: #0788a8;
-      --brand-dark: #056d88;
-      --brand-soft: #e8f7fb;
+      --brand: #246bdf;
+      --brand-dark: #1758c5;
+      --brand-soft: #edf4ff;
       --blue: #1677ff;
       --blue-soft: #eaf3ff;
       --green: #079455;
@@ -27,7 +27,7 @@
       --orange-soft: #fff4e5;
       --danger: #d92d20;
       --danger-soft: #fff1f3;
-      --shadow: 0 8px 28px rgba(16, 24, 40, .06);
+      --shadow: 0 4px 18px rgba(25, 57, 104, .055);
       --radius: 8px;
     }
 
@@ -36,7 +36,8 @@
     body {
       margin: 0;
       min-width: 1180px;
-      background: var(--bg);
+      padding-bottom: 78px;
+      background: #f5f7fb;
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
       font-size: 13px;
@@ -103,16 +104,77 @@
     a { color: var(--blue); text-decoration: none; }
     a:hover { text-decoration: underline; }
 
-    .page {
-      padding: 18px;
-    }
+    .page { padding: 0 24px 18px; }
 
     .workspace {
+      max-width: 1720px;
+      margin: 0 auto;
+    }
+
+    .app-header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin: 0 -24px 0;
+      padding: 0 24px;
+      border-bottom: 1px solid #e8edf5;
+      background: linear-gradient(90deg, #fff, #f8fbff);
+    }
+
+    .brand-block,
+    .header-tools {
+      display: flex;
+      align-items: center;
+    }
+
+    .brand-block { gap: 10px; }
+    .header-tools { gap: 18px; color: #667085; font-size: 12px; }
+
+    .brand-shield {
+      width: 30px;
+      height: 34px;
       display: grid;
-      grid-template-columns: minmax(640px, 1fr) 260px 360px;
-      grid-template-rows: auto auto minmax(0, 1fr);
-      gap: 14px;
-      align-items: start;
+      place-items: center;
+      border-radius: 8px 8px 11px 11px;
+      background: linear-gradient(145deg, #3a84f7, #1f65db);
+      color: #fff;
+      font-size: 20px;
+      font-weight: 800;
+      box-shadow: 0 5px 12px rgba(36, 107, 223, .22);
+    }
+
+    .brand-copy strong {
+      display: block;
+      color: #102044;
+      font-size: 16px;
+      line-height: 1.25;
+    }
+
+    .brand-copy span {
+      display: block;
+      margin-top: 2px;
+      color: #98a2b3;
+      font-size: 10px;
+    }
+
+    .user-chip {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      color: #475467;
+    }
+
+    .user-avatar {
+      width: 25px;
+      height: 25px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: #2d71e8;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 800;
     }
 
     .card {
@@ -122,86 +184,81 @@
       box-shadow: var(--shadow);
     }
 
-    .hero-card {
-      grid-column: 1 / 3;
-      min-height: 76px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      padding: 16px 18px;
-    }
-
-    .hero-title {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      min-width: 0;
-    }
-
-    .hero-icon {
-      width: 36px;
-      height: 36px;
-      border-radius: 8px;
-      display: grid;
-      place-items: center;
-      background: linear-gradient(135deg, #0788a8, #12b3b0);
-      color: #fff;
-      font-weight: 800;
-      font-size: 18px;
-      flex: 0 0 auto;
-    }
-
-    .hero-card h1 {
-      margin: 0;
-      font-size: 22px;
-      line-height: 1.2;
-      letter-spacing: 0;
-    }
-
-    .hero-card p {
-      margin: 6px 0 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .hero-badges {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex: 0 0 auto;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 28px;
-      border-radius: 6px;
-      padding: 4px 12px;
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-
-    .badge.green { background: var(--green-soft); color: var(--green); }
-    .badge.blue { background: var(--blue-soft); color: #175cd3; }
-    .badge.purple { background: var(--purple-soft); color: var(--purple); }
-
     .filter-card {
-      grid-column: 1 / 3;
-      padding: 14px 16px;
+      margin-top: 0;
+      padding: 11px 14px;
+      border-top: 0;
+      border-radius: 0 0 8px 8px;
     }
 
     .filters {
       display: grid;
       grid-template-columns: 1.15fr .9fr .9fr .9fr .95fr .8fr .8fr auto auto;
-      gap: 11px;
+      gap: 10px;
       align-items: end;
     }
 
+    .workflow-steps {
+      height: 46px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      align-items: center;
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 0 16px;
+    }
+
+    .workflow-step {
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 9px;
+      color: #667085;
+      font-size: 12px;
+    }
+
+    .workflow-step:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      left: calc(50% + 54px);
+      right: calc(-50% + 54px);
+      height: 1px;
+      background: #dfe5ef;
+    }
+
+    .step-number {
+      width: 22px;
+      height: 22px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: #e5eaf2;
+      color: #475467;
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .workflow-step.active {
+      color: #246bdf;
+      font-weight: 750;
+    }
+
+    .workflow-step.active .step-number {
+      background: #246bdf;
+      color: #fff;
+      box-shadow: 0 3px 8px rgba(36, 107, 223, .25);
+    }
+
+    .workspace-grid {
+      display: grid;
+      grid-template-columns: minmax(650px, 1fr) 282px 246px;
+      gap: 10px;
+      align-items: stretch;
+      min-height: calc(100vh - 236px);
+    }
+
     .result-card {
-      grid-column: 1;
       min-width: 0;
       overflow: hidden;
     }
@@ -211,8 +268,8 @@
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      min-height: 48px;
-      padding: 13px 16px;
+      min-height: 42px;
+      padding: 10px 13px;
       border-bottom: 1px solid var(--line);
     }
 
@@ -235,8 +292,8 @@
     .table-wrap {
       position: relative;
       overflow: auto;
-      min-height: 560px;
-      max-height: calc(100vh - 214px);
+      min-height: 455px;
+      max-height: calc(100vh - 276px);
     }
 
     table {
@@ -261,16 +318,35 @@
     }
 
     tbody td {
-      padding: 12px 9px;
+      padding: 10px 8px;
       border-bottom: 1px solid var(--line);
       vertical-align: top;
       background: #fff;
     }
 
     tbody tr:hover td { background: #fbfdff; }
-    tbody tr.active td { background: #f0fbff; }
+    tbody tr.active td { background: #eef5ff; }
 
-    .title-cell { min-width: 0; }
+    .title-cell {
+      position: relative;
+      min-width: 0;
+      padding-left: 35px;
+    }
+
+    .row-selector {
+      position: absolute;
+      left: 12px;
+      top: 16px;
+      width: 13px;
+      height: 13px;
+      border: 1px solid #ced7e5;
+      border-radius: 50%;
+      background: #fff;
+    }
+
+    tr.active .row-selector {
+      border: 4px solid #2e73e8;
+    }
 
     .nowrap-cell {
       white-space: nowrap;
@@ -331,46 +407,61 @@
     .tag.empty { color: var(--subtle); font-weight: 500; }
 
     .row-actions {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: flex-start;
+      gap: 4px;
+      flex-wrap: nowrap;
       min-width: 0;
+    }
+
+    .action-link {
+      height: 24px;
+      border-color: #b9d6ff;
+      border-radius: 4px;
+      padding: 0 7px;
+      background: #fff;
+      color: #175cd3;
+      font-size: 12px;
+    }
+
+    .action-link:hover {
+      border-color: #bfdbfe;
+      background: #eff6ff;
+      color: #1249a3;
+    }
+
+    .action-link.primary-choice { border-color: #a6e3c5; color: #078653; }
+    .action-link.auxiliary-choice { border-color: #d2bcff; color: var(--purple); }
+
+    .selection-status {
+      min-height: 22px;
+      padding: 1px 7px;
+      font-size: 11px;
     }
 
     .pager {
       display: flex;
       align-items: center;
-      justify-content: flex-end;
+      justify-content: center;
       gap: 10px;
-      min-height: 46px;
-      padding: 10px 14px;
+      min-height: 42px;
+      padding: 7px 14px;
       color: var(--muted);
       background: #fff;
     }
 
     .selection-card {
-      grid-column: 2;
-      position: sticky;
-      top: 18px;
-      max-height: calc(100vh - 36px);
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
     .selection-body {
-      padding: 12px 14px;
+      padding: 11px;
       overflow: auto;
       display: grid;
-      gap: 14px;
-    }
-
-    .selection-footer {
-      border-top: 1px solid var(--line);
-      padding: 12px 14px;
-      background: #fff;
-      display: grid;
-      gap: 10px;
+      gap: 13px;
     }
 
     .selected-head {
@@ -384,47 +475,63 @@
 
     .selected-list {
       display: grid;
-      gap: 8px;
+      gap: 7px;
     }
 
-    .selected-item {
-      position: relative;
+    .selected-material-card {
+      min-width: 0;
       display: grid;
-      gap: 5px;
-      padding: 10px;
-      border: 1px solid var(--line);
-      border-radius: 7px;
-      background: #fff;
+      grid-template-columns: 28px minmax(0, 1fr) 20px;
+      align-items: start;
+      gap: 8px;
+      padding: 10px 8px;
+      border: 1px solid #e0e7f1;
+      border-radius: 6px;
+      background: #fbfcfe;
     }
 
-    .selected-item.primary {
-      border-color: #7dd3e8;
-      border-left: 4px solid var(--brand);
-      background: #f2fbfd;
+    .selected-index {
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      border-radius: 5px;
+      background: var(--brand-soft);
+      color: var(--brand-dark);
+      font-size: 11px;
+      font-weight: 800;
     }
 
-    .selected-item.auxiliary { background: #fcfcfd; }
+    .selected-material-card.auxiliary .selected-index {
+      background: var(--purple-soft);
+      color: var(--purple);
+    }
 
     .selected-title {
-      padding-right: 30px;
       color: #101828;
-      font-weight: 750;
-      line-height: 1.45;
-      display: -webkit-box;
-      -webkit-line-clamp: 3;
-      -webkit-box-orient: vertical;
+      font-weight: 650;
+      line-height: 1.35;
       overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      white-space: normal;
     }
 
     .selected-meta {
+      margin-top: 2px;
       color: #667085;
       font-size: 11px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .empty-card {
       display: grid;
       place-items: center;
-      min-height: 72px;
+      min-height: 64px;
       padding: 12px;
       border: 1px dashed var(--line-strong);
       border-radius: 7px;
@@ -434,12 +541,98 @@
       font-size: 12px;
     }
 
+    .memory-module {
+      display: grid;
+      gap: 10px;
+      padding: 12px;
+      border: 1px solid #b9d8ff;
+      border-radius: 9px;
+      background: linear-gradient(145deg, #f5f9ff, #edf5ff);
+    }
+
+    .memory-module-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .memory-module-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: #1249a3;
+      font-weight: 800;
+    }
+
+    .memory-module-icon {
+      width: 30px;
+      height: 30px;
+      display: grid;
+      place-items: center;
+      border-radius: 7px;
+      background: #1677ff;
+      color: #fff;
+      font-size: 15px;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-flex;
+      width: 38px;
+      height: 22px;
+      flex: 0 0 auto;
+    }
+
+    .switch input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .switch-track {
+      width: 100%;
+      height: 100%;
+      border-radius: 999px;
+      background: #cbd5e1;
+      transition: background .18s ease;
+    }
+
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 1px 4px rgba(15, 23, 42, .25);
+      transition: transform .18s ease;
+    }
+
+    .switch input:checked + .switch-track { background: #1677ff; }
+    .switch input:checked + .switch-track::after { transform: translateX(16px); }
+
+    .memory-manage-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 32px;
+      border: 1px solid #93c5fd;
+      border-radius: 6px;
+      background: rgba(255,255,255,.72);
+      color: #175cd3;
+      font-weight: 700;
+    }
+
+    .memory-manage-link:hover {
+      background: #fff;
+      text-decoration: none;
+    }
+
     .detail-card {
-      grid-column: 3;
-      grid-row: 1 / 4;
-      position: sticky;
-      top: 18px;
-      max-height: calc(100vh - 36px);
+      min-width: 0;
       display: flex;
       flex-direction: column;
       overflow: hidden;
@@ -447,17 +640,17 @@
 
     .detail-body {
       overflow: auto;
-      padding: 14px 16px;
+      padding: 11px 12px;
       display: grid;
       gap: 14px;
     }
 
     .detail-grid {
       display: grid;
-      grid-template-columns: 70px minmax(0, 1fr);
-      row-gap: 10px;
-      column-gap: 12px;
-      font-size: 12px;
+      grid-template-columns: 62px minmax(0, 1fr);
+      row-gap: 8px;
+      column-gap: 8px;
+      font-size: 11px;
     }
 
     .detail-grid dt {
@@ -475,7 +668,7 @@
     .detail-title {
       margin: 0;
       color: #101828;
-      font-size: 15px;
+      font-size: 13px;
       line-height: 1.55;
       font-weight: 800;
     }
@@ -501,7 +694,7 @@
     }
 
     .content-preview {
-      max-height: 215px;
+      max-height: 190px;
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: 7px;
@@ -540,6 +733,72 @@
       padding: 14px 16px;
       border-top: 1px solid var(--line);
       background: #fff;
+    }
+
+    .bottom-action-bar {
+      position: fixed;
+      left: 24px;
+      right: 24px;
+      bottom: 8px;
+      z-index: 40;
+      min-height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      max-width: 1672px;
+      margin: 0 auto;
+      padding: 10px 14px 10px 18px;
+      border: 1px solid #dce3ee;
+      border-radius: 9px;
+      background: rgba(255,255,255,.96);
+      box-shadow: 0 12px 34px rgba(15, 23, 42, .14);
+      backdrop-filter: blur(12px);
+    }
+
+    .bottom-summary,
+    .bottom-actions {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+
+    .bottom-stat {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: #475467;
+      white-space: nowrap;
+    }
+
+    .bottom-stat-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 3px;
+      background: var(--brand);
+    }
+
+    .bottom-stat.auxiliary .bottom-stat-dot { background: var(--purple); }
+    .bottom-stat.memory .bottom-stat-dot { background: #1677ff; }
+    .bottom-stat b { color: #101828; }
+    .bottom-stat.memory b.enabled { color: var(--green); }
+
+    .bottom-actions button {
+      height: 40px;
+      min-width: 150px;
+      font-weight: 750;
+    }
+
+    .bottom-actions .generate-button {
+      min-width: 210px;
+      background: #1677ff;
+      border-color: #1677ff;
+      box-shadow: 0 4px 12px rgba(22, 119, 255, .2);
+    }
+
+    .bottom-actions .generate-button:hover {
+      background: #1264d6;
+      border-color: #1264d6;
     }
 
     .loading {
@@ -778,20 +1037,38 @@
     .toast.error { border-color: #fecdca; background: var(--danger-soft); color: var(--danger); }
     .toast.success { border-color: #abefc6; background: var(--green-soft); color: #067647; }
 
-    @media (max-width: 1280px) {
-      body { min-width: 0; }
-      .workspace {
-        grid-template-columns: minmax(0, 1fr) 300px;
-      }
-      .hero-card,
-      .filter-card { grid-column: 1 / 3; }
-      .detail-card {
-        grid-column: 1 / 3;
-        grid-row: auto;
+    @media (max-width: 1240px) {
+      body { min-width: 1024px; }
+      .workspace-grid { grid-template-columns: minmax(600px, 1fr) 272px; }
+      .detail-card { display: none; }
+    }
+
+    @media (max-width: 860px) {
+      body { padding-bottom: 144px; }
+      .page { padding: 10px; }
+      .app-header { margin: -10px -10px 0; padding: 0 12px; }
+      .workspace-grid { display: block; }
+      .result-card, .selection-card { margin-bottom: 10px; }
+      .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .selection-card {
         position: static;
         max-height: none;
       }
-      .selection-card { grid-column: 2; }
+      .bottom-action-bar {
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        display: grid;
+        gap: 9px;
+      }
+      .bottom-summary {
+        justify-content: space-between;
+        gap: 8px;
+        overflow-x: auto;
+      }
+      .bottom-actions { gap: 8px; }
+      .bottom-actions button { min-width: 0; flex: 1; }
+      .bottom-actions .generate-button { min-width: 0; }
     }
   </style>
 </head>
@@ -800,20 +1077,19 @@
 
   <main class="page">
     <div class="workspace">
-      <section class="card hero-card">
-        <div class="hero-title">
-          <div class="hero-icon" aria-hidden="true">▣</div>
-          <div>
-            <h1>数据库文章选材</h1>
-            <p>从数据库中选择主要分析材料和辅助分析材料，用于后续生成医药集采政策分析报告。</p>
+      <header class="app-header">
+        <div class="brand-block">
+          <div class="brand-shield" aria-hidden="true">+</div>
+          <div class="brand-copy">
+            <strong>医疗政策 / 通知分析系统</strong>
+            <span>智能解析 · 精准洞察 · 高效生成</span>
           </div>
         </div>
-        <div class="hero-badges">
-          <span class="badge green" id="resultBadge">结果 0 条</span>
-          <span class="badge blue" id="primaryBadge">主材料 0/3</span>
-          <span class="badge purple" id="auxiliaryBadge">辅助材料 0/10</span>
+        <div class="header-tools">
+          <span>ⓘ 帮助中心</span>
+          <span class="user-chip"><span class="user-avatar">医</span> 医保分析员⌄</span>
         </div>
-      </section>
+      </header>
 
       <section class="card filter-card" aria-label="搜索筛选">
         <form class="filters" id="filters">
@@ -843,7 +1119,23 @@
         </form>
       </section>
 
-      <section class="card result-card" aria-labelledby="resultTitle">
+      <nav class="workflow-steps" aria-label="报告生成步骤">
+        <div class="workflow-step active">
+          <span class="step-number">1</span>
+          <span>选择材料</span>
+        </div>
+        <div class="workflow-step">
+          <span class="step-number">2</span>
+          <span>配置生成</span>
+        </div>
+        <div class="workflow-step">
+          <span class="step-number">3</span>
+          <span>查看报告</span>
+        </div>
+      </nav>
+
+      <div class="workspace-grid">
+        <section class="card result-card" aria-labelledby="resultTitle">
         <div class="card-head">
           <div>
             <h2 class="section-title" id="resultTitle">检索结果 <span class="muted" id="resultSummary">共 0 条</span></h2>
@@ -876,52 +1168,83 @@
           <button class="secondary small" type="button" id="prevPage">上一页</button>
           <button class="secondary small" type="button" id="nextPage">下一页</button>
         </div>
-      </section>
+        </section>
 
-      <aside class="card selection-card" aria-labelledby="selectionTitle">
+        <aside class="card selection-card" aria-labelledby="selectionTitle">
         <div class="card-head">
           <h2 class="section-title" id="selectionTitle">已选材料</h2>
-          <span title="滚动页面时保持可见">⌖</span>
+          <button class="ghost small" type="button" id="clearSelectionBtn">清空</button>
         </div>
         <div class="selection-body">
           <section>
             <div class="selected-head">
-              <span>主分析材料</span>
+              <span>主材料</span>
               <span id="primaryCount">0/3</span>
             </div>
             <div class="selected-list" id="primaryList"></div>
           </section>
           <section>
             <div class="selected-head">
-              <span>辅助分析材料</span>
+              <span>辅助材料</span>
               <span id="auxiliaryCount">0/10</span>
             </div>
             <div class="selected-list" id="auxiliaryList"></div>
           </section>
-        </div>
-        <div class="selection-footer">
-          <button class="primary" id="confirmBtn" type="button">确认选材</button>
-          <button class="secondary" id="reparseAttachmentsBtn" type="button">重新解析附件并生成证据包</button>
-          <span class="muted">确认选材默认复用附件解析缓存；只有重新解析按钮会刷新 .doc、Excel、PDF 等附件解析结果。</span>
+          <section class="memory-module" aria-labelledby="memoryModuleTitle">
+            <div class="memory-module-head">
+              <div class="memory-module-title" id="memoryModuleTitle">
+                <span class="memory-module-icon" aria-hidden="true">▤</span>
+                <span>报告记忆库</span>
+              </div>
+              <label class="switch" title="启用报告记忆库">
+                <input id="useReportMemory" type="checkbox" checked aria-label="启用报告记忆库">
+                <span class="switch-track"></span>
+              </label>
+            </div>
+            <span class="muted">用于参考历史分析经验、写作规则和常用表达，不会覆盖当前公告事实。</span>
+            <a class="memory-manage-link" href="/memory-ui">管理记忆库</a>
+          </section>
           <div class="preview-box" id="previewResult"></div>
         </div>
-      </aside>
+        </aside>
 
-      <aside class="card detail-card" aria-labelledby="detailHeading">
-        <div class="card-head">
-          <h2 class="section-title" id="detailHeading">文章详情</h2>
-          <button class="ghost small" type="button" id="clearDetailBtn" title="清空详情">×</button>
-        </div>
-        <div class="detail-body" id="detailBody">
-          <div class="empty-card">点击左侧“详情”，可在这里预览文章、摘要、正文和附件列表。</div>
-        </div>
-        <div class="detail-footer">
-          <button class="primary" type="button" id="detailPrimaryBtn" disabled>设为主材料</button>
-          <button class="secondary" type="button" id="detailAuxBtn" disabled>设为辅助材料</button>
-        </div>
-      </aside>
+        <aside class="card detail-card" aria-labelledby="detailHeading">
+          <div class="card-head">
+            <h2 class="section-title" id="detailHeading">文章详情</h2>
+            <span class="muted">•••</span>
+          </div>
+          <div class="detail-body" id="detailBody">
+            <div class="empty-card">请选择文章查看详情。</div>
+          </div>
+          <div class="detail-footer">
+            <button class="primary" type="button" id="detailPrimaryBtn" disabled>设为主材料</button>
+            <button class="secondary" type="button" id="detailAuxBtn" disabled>设为辅助材料</button>
+          </div>
+        </aside>
+      </div>
     </div>
   </main>
+
+  <footer class="bottom-action-bar" aria-label="选材操作栏">
+    <div class="bottom-summary">
+      <span class="bottom-stat">
+        <span class="bottom-stat-dot"></span>
+        已选主材 <b id="bottomPrimaryCount">0/3</b>
+      </span>
+      <span class="bottom-stat auxiliary">
+        <span class="bottom-stat-dot"></span>
+        辅助材料 <b id="bottomAuxiliaryCount">0/10</b>
+      </span>
+      <span class="bottom-stat memory">
+        <span class="bottom-stat-dot"></span>
+        报告记忆库 <b id="bottomMemoryStatus" class="enabled">已开启</b>
+      </span>
+    </div>
+    <div class="bottom-actions">
+      <button class="secondary" id="reparseAttachmentsBtn" type="button">↻ 重新解析附件</button>
+      <button class="primary generate-button" id="confirmBtn" type="button">生成分析报告</button>
+    </div>
+  </footer>
 
   <dialog class="pack-dialog" id="packDialog">
     <div class="pack-dialog-head">
@@ -1094,7 +1417,6 @@
         state.records = [];
         renderRecords();
         $('resultSummary').textContent = '读取失败';
-        $('resultBadge').textContent = '结果 0 条';
         showToast(`列表读取失败：${error.message}`, 'error');
       } finally {
         setLoading(false);
@@ -1106,7 +1428,6 @@
       const totalPages = state.totalPages || 1;
       $('pageInfo').textContent = `第 ${page} / ${totalPages} 页`;
       $('resultSummary').textContent = `共 ${state.total} 条`;
-      $('resultBadge').textContent = `结果 ${state.total} 条`;
       $('prevPage').disabled = state.page <= 1;
       $('nextPage').disabled = state.totalPages === 0 || state.page >= state.totalPages;
     }
@@ -1127,6 +1448,7 @@
         return `
           <tr class="${active ? 'active' : ''}">
             <td class="title-cell">
+              <span class="row-selector" aria-hidden="true"></span>
               <div class="record-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
               <div class="record-meta" title="${escapeHtml([item.source, item.menu_name || item.menu_code, item.publicorg].filter(Boolean).join(' / '))}">
                 <span>来源：${escapeHtml(item.source || '-')}</span>
@@ -1141,9 +1463,13 @@
             <td>${tag(`附件 ${item.attachment_count}`, 'gray')}</td>
             <td>
               <div class="row-actions">
-                <button class="ghost small" type="button" data-action="detail" data-menu-code="${escapeHtml(item.menu_code)}" data-articleid="${escapeHtml(item.articleid)}">详情</button>
-                <button class="primary small" type="button" data-action="primary" data-key="${escapeHtml(key)}" ${selected ? 'disabled' : ''}>${selected === 'primary' ? '已为主材料' : '设为主材料'}</button>
-                <button class="secondary small" type="button" data-action="auxiliary" data-key="${escapeHtml(key)}" ${selected ? 'disabled' : ''}>${selected === 'auxiliary' ? '已为辅助' : '设为辅助材料'}</button>
+                <button class="action-link" type="button" data-action="detail" data-menu-code="${escapeHtml(item.menu_code)}" data-articleid="${escapeHtml(item.articleid)}">详情</button>
+                ${selected
+                  ? `<span class="tag selection-status ${selected === 'primary' ? 'green' : 'purple'}">${selected === 'primary' ? '已选主材' : '已选辅助'}</span>`
+                  : `
+                    <button class="action-link primary-choice" type="button" data-action="primary" data-key="${escapeHtml(key)}">主材</button>
+                    <button class="action-link auxiliary-choice" type="button" data-action="auxiliary" data-key="${escapeHtml(key)}">辅助</button>
+                  `}
               </div>
             </td>
           </tr>
@@ -1196,29 +1522,45 @@
       updateDetailButtons();
     }
 
-    function selectedItemHtml(item, type) {
+    function clearSelection() {
+      state.primary = [];
+      state.auxiliary = [];
+      state.lastPrepareResult = null;
+      state.lastRunResult = null;
+      $('previewResult').classList.remove('show');
+      $('previewResult').textContent = '';
+      renderSelected();
+      renderRecords();
+      updateDetailButtons();
+    }
+
+    function selectedItemHtml(item, type, index) {
       return `
-        <article class="selected-item ${type}">
-          <button class="remove" type="button" title="移除" data-action="remove" data-type="${type}" data-key="${escapeHtml(keyOf(item))}">移除</button>
-          <div class="selected-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
-          <div class="selected-meta">${escapeHtml(item.areaname || '-')} · ${escapeHtml(shortDate(item.audittime))} · 附件 ${escapeHtml(item.attachment_count)}</div>
+        <article class="selected-material-card ${type}">
+          <span class="selected-index">${index + 1}</span>
+          <div>
+            <div class="selected-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
+            <div class="selected-meta">${escapeHtml(item.areaname || '-')} · ${escapeHtml(shortDate(item.audittime))}</div>
+          </div>
+          <button class="remove" type="button" title="移除" aria-label="移除${escapeHtml(item.title)}" data-action="remove" data-type="${type}" data-key="${escapeHtml(keyOf(item))}">×</button>
         </article>
       `;
     }
 
     function renderSelected() {
       $('primaryList').innerHTML = state.primary.length
-        ? state.primary.map((item) => selectedItemHtml(item, 'primary')).join('')
-        : '<div class="empty-card">请选择 1-3 条核心公告作为主分析材料。</div>';
+        ? state.primary.map((item, index) => selectedItemHtml(item, 'primary', index)).join('')
+        : '<div class="empty-card">请选择 1-3 条核心公告作为主材料。</div>';
 
       $('auxiliaryList').innerHTML = state.auxiliary.length
-        ? state.auxiliary.map((item) => selectedItemHtml(item, 'auxiliary')).join('')
+        ? state.auxiliary.map((item, index) => selectedItemHtml(item, 'auxiliary', index)).join('')
         : '<div class="empty-card">可选择历史项目、政策解读或相关公告作为辅助材料。</div>';
 
       $('primaryCount').textContent = `${state.primary.length}/3`;
       $('auxiliaryCount').textContent = `${state.auxiliary.length}/10`;
-      $('primaryBadge').textContent = `主材料 ${state.primary.length}/3`;
-      $('auxiliaryBadge').textContent = `辅助材料 ${state.auxiliary.length}/10`;
+      $('bottomPrimaryCount').textContent = `${state.primary.length}/3`;
+      $('bottomAuxiliaryCount').textContent = `${state.auxiliary.length}/10`;
+      $('confirmBtn').disabled = state.primary.length < 1;
     }
 
     async function showDetail(menuCode, articleId) {
@@ -1241,7 +1583,7 @@
     function renderDetail() {
       const item = state.detailRecord;
       if (!item) {
-        $('detailBody').innerHTML = '<div class="empty-card">点击左侧“详情”，可在这里预览文章、摘要、正文和附件列表。</div>';
+        $('detailBody').innerHTML = '<div class="empty-card">请选择文章查看详情。</div>';
         updateDetailButtons();
         return;
       }
@@ -1331,10 +1673,9 @@
             <button class="secondary small" type="button" data-action="copy-pack-id">复制 pack_id</button>
             <button class="secondary small" type="button" data-action="view-pack-summary">查看证据包摘要</button>
             <button class="secondary small" type="button" data-action="view-pack-diagnostics">查看证据包诊断</button>
-            <button class="primary small wide" type="button" data-action="run-analysis-report">生成分析报告</button>
             <button class="ghost small wide" type="button" data-action="view-pack-debug">开发调试：查看完整 JSON</button>
           </div>
-          <div class="muted">报告生成会通过后端代理调用 Dify；点击生成后将进入报告生成详情页。</div>
+          <div class="muted">证据包已就绪，可通过页面底部固定操作栏生成分析报告。</div>
         </div>
       `;
       loadPackDiagnosticsMini(data.pack_id);
@@ -1437,17 +1778,28 @@
       return qualityCheck.passed ? '通过' : '未通过';
     }
 
+    function isExportBlocked(qualityCheck, qualityGate, status) {
+      const gateStatus = String(qualityGate?.deliverable_status || '').toLowerCase();
+      const runStatus = String(status || '').toLowerCase();
+      if (qualityCheck?.passed === false) return true;
+      if (['needs_manual_review', 'failed', 'block', 'blocked', 'needs_fix'].includes(gateStatus)) return true;
+      return ['failed', 'needs_manual_review'].includes(runStatus) && qualityCheck?.passed !== true;
+    }
+
     function renderRunResult(runData, reportData = null) {
       state.lastRunResult = { run: runData, report: reportData };
       const warnings = reportData?.warnings || runData?.warnings || [];
       const remainingIssues = reportData?.remaining_issues || runData?.remaining_issues || [];
       const qualityCheck = reportData?.quality_check || runData?.quality_check || {};
+      const qualityGate = reportData?.quality_gate || runData?.quality_gate || {};
+      const exportBlocked = isExportBlocked(qualityCheck, qualityGate, runData?.status);
+      const downloadAttrs = exportBlocked ? ' disabled title="质量门禁未通过，暂不可下载 Word"' : '';
       const reportHtml = reportData ? `
         <div class="report-preview">
           <strong>${escapeHtml(reportData.report_title || runData.report_title || '分析报告')}</strong>
           <div class="muted">质检：${escapeHtml(qualityText(qualityCheck))} · 版本：${escapeHtml(reportData.version || runData.version || 1)}</div>
           <div class="report-actions">
-            <button class="primary small" type="button" data-action="download-run-report" data-run-id="${escapeHtml(runData.run_id || '')}">下载 Word</button>
+            <button class="primary small" type="button" data-action="download-run-report" data-run-id="${escapeHtml(runData.run_id || '')}"${downloadAttrs}>下载 Word</button>
             <button class="secondary small" type="button" data-action="copy-report-markdown">复制 Markdown</button>
           </div>
           <div class="report-markdown">${renderMarkdown(reportData.report_markdown || '')}</div>
@@ -1489,19 +1841,20 @@
     async function runAnalysisReport() {
       const packId = state.lastPrepareResult?.pack_id || '';
       if (!packId) {
-        showToast('请先确认选材并生成 pack_id。', 'warning');
+        showToast('请先选择主材料并生成证据包。', 'warning');
         return;
       }
-      const button = $('previewResult').querySelector('button[data-action="run-analysis-report"]');
-      if (button) {
-        button.disabled = true;
-        button.textContent = '生成中...';
-      }
+      const button = $('confirmBtn');
+      button.disabled = true;
+      button.textContent = '报告生成中...';
       try {
         const response = await fetch('/analysis/run', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pack_id: packId }),
+          body: JSON.stringify({
+            pack_id: packId,
+            use_report_memory: $('useReportMemory')?.checked === true,
+          }),
         });
         if (!response.ok) throw new Error(await readError(response));
         const runData = await response.json();
@@ -1513,14 +1866,12 @@
       } catch (error) {
         showToast(`报告生成失败：${error.message}`, 'error');
       } finally {
-        if (button) {
-          button.disabled = false;
-          button.textContent = '生成分析报告';
-        }
+        button.disabled = state.primary.length < 1;
+        button.textContent = '生成分析报告';
       }
     }
 
-    async function confirmSelection(forceRefresh = false) {
+    async function confirmSelection(forceRefresh = false, runAfterPrepare = false) {
       if (state.primary.length < 1) {
         showToast('请至少选择 1 条主分析材料。', 'warning');
         return;
@@ -1536,7 +1887,7 @@
       $('reparseAttachmentsBtn').disabled = true;
       const targetButton = forceRefresh ? $('reparseAttachmentsBtn') : $('confirmBtn');
       const originalText = targetButton.textContent;
-      targetButton.textContent = forceRefresh ? '重新解析中...' : '生成中...';
+      targetButton.textContent = forceRefresh ? '重新解析中...' : '准备证据包...';
       try {
         const response = await fetch('/analysis/prepare', {
           method: 'POST',
@@ -1546,11 +1897,12 @@
         if (!response.ok) throw new Error(await readError(response));
         const data = await response.json();
         renderPrepareResult(data, forceRefresh);
-        showToast('证据包已生成，已返回 pack_id。', 'success');
+        showToast(forceRefresh ? '附件已重新解析，证据包已更新。' : '证据包已生成。', 'success');
+        if (runAfterPrepare) await runAnalysisReport();
       } catch (error) {
         showToast(`证据包生成失败：${error.message}`, 'error');
       } finally {
-        $('confirmBtn').disabled = false;
+        $('confirmBtn').disabled = state.primary.length < 1;
         $('reparseAttachmentsBtn').disabled = false;
         targetButton.textContent = originalText;
       }
@@ -1600,6 +1952,7 @@
 
     $('primaryList').addEventListener('click', handleRemoveClick);
     $('auxiliaryList').addEventListener('click', handleRemoveClick);
+    $('clearSelectionBtn').addEventListener('click', clearSelection);
 
     function handleRemoveClick(event) {
       const button = event.target.closest('button[data-action="remove"]');
@@ -1607,7 +1960,7 @@
       removeMaterial(button.dataset.type, button.dataset.key);
     }
 
-    $('confirmBtn').addEventListener('click', () => confirmSelection(false));
+    $('confirmBtn').addEventListener('click', () => confirmSelection(false, true));
     $('reparseAttachmentsBtn').addEventListener('click', () => confirmSelection(true));
     $('previewResult').addEventListener('click', (event) => {
       const button = event.target.closest('button');
@@ -1627,10 +1980,10 @@
     $('detailAuxBtn').addEventListener('click', () => {
       if (state.detailRecord) addMaterial('auxiliary', state.detailRecord);
     });
-    $('clearDetailBtn').addEventListener('click', () => {
-      state.detailRecord = null;
-      renderDetail();
-      renderRecords();
+    $('useReportMemory').addEventListener('change', () => {
+      const enabled = $('useReportMemory').checked;
+      $('bottomMemoryStatus').textContent = enabled ? '已开启' : '未开启';
+      $('bottomMemoryStatus').classList.toggle('enabled', enabled);
     });
 
     renderSelected();

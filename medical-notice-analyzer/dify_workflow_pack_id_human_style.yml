@@ -301,7 +301,19 @@ workflow:
           required: true
           type: text-input
           variable: pack_id
-      height: 89
+        - label: use_report_memory
+          max_length: 8
+          options: []
+          required: false
+          type: text-input
+          variable: use_report_memory
+        - label: report_memory
+          max_length: 15000
+          options: []
+          required: false
+          type: paragraph
+          variable: report_memory
+      height: 141
       id: start_node
       position:
         x: 0
@@ -542,6 +554,8 @@ workflow:
             - 必要时生成 Markdown 表格，例如：\n  | 事项 | 规则/要求 | 企业关注点 |\n  | --- | --- | --- |\n  | 产品范围 | evidence_pack 明确披露的产品或类别\
             \ | <blue>基于该范围判断企业需核对自身产品是否纳入。</blue> |\n- 企业关注点：用列表或短段落说明企业、医疗机构或平台应关注事项。\n- 不要在正文末尾额外生成材料说明或声明；相关限制只放入 generation_warnings。\n\n禁止事项：\n- 不要编造附件中的企业名单、产品清单、价格、中选结果。\n- 不要把“附件未解析”“仅元数据”等技术提示随机写入正文分析段落。\n-\
             \ 不要输出 Markdown 代码围栏或 JSON 之外的文字。"
+        - role: user
+          text: "长期记忆输入（仅在 use_report_memory 为 true 且 report_memory 非空时使用）：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，完全忽略长期记忆。\n- report_memory 只能作为写作规则、分析口径、常见错误、附件处理、表格规则和质检规则使用。\n- 不得使用 report_memory 覆盖当前公告事实，不得把 report_memory 当作 evidence_pack。\n- 当前公告事实只能来自 evidence_pack；如 report_memory 与 evidence_pack 冲突，以 evidence_pack 为准。"
         retry_config:
           enabled: false
           exponential_backoff:
@@ -700,6 +714,8 @@ workflow:
             \      \"severity\": \"high\",\n      \"problem_type\": \"unsupported_claim\",\n      \"report_text\": \"\",\n\
             \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ],\n  \"revision_instruction\": \"请只修订\
             \ issues 指出的问题，不要重写无问题段落。\"\n}\n"
+        - role: user
+          text: "长期记忆质检边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，不按长期记忆检查报告。\n- report_memory 只能用于写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实；如报告把 report_memory 当作当前公告事实来源，应列为 unsupported_claim 或 over_inference。"
         retry_config:
           enabled: false
           exponential_backoff:
@@ -885,6 +901,8 @@ workflow:
             - 如缺少主材料核心规则或附件表格摘要，应在合适章节补充，但只能使用 evidence_pack 明确披露的信息。\n- 不要在 report_markdown 中生成额外材料说明或声明；材料限制只放入 warnings。\n- 不要编造未解析附件中的企业、产品、价格、中选结果。\n\
             - 不要把 JSON、质检过程、调试信息写入 report_markdown。\n\n返回 JSON：\n{\n  \"version\": 2,\n  \"report_title\": \"\",\n  \"report_markdown\"\
             : \"\",\n  \"fixed_issue_ids\": [],\n  \"revision_notes\": \"\"\n}\n"
+        - role: user
+          text: "长期记忆修订边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，完全忽略长期记忆。\n- report_memory 只能用于修订写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实，不得新增 evidence_pack 中没有的事实、日期、价格、企业、产品或规则。"
         retry_config:
           enabled: false
           exponential_backoff:
@@ -1038,6 +1056,8 @@ workflow:
             \      \"severity\": \"high\",\n      \"problem_type\": \"unsupported_claim\",\n      \"report_text\": \"\",\n\
             \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ],\n  \"revision_instruction\": \"请只修订\
             \ issues 指出的问题，不要重写无问题段落。\"\n}\n"
+        - role: user
+          text: "长期记忆质检边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，不按长期记忆检查报告。\n- report_memory 只能用于写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实；如修订稿把 report_memory 当作当前公告事实来源，应列为 unsupported_claim 或 over_inference。"
         retry_config:
           enabled: false
           exponential_backoff:

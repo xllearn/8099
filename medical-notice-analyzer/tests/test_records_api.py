@@ -148,6 +148,11 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("/analysis/prepare", response.text)
         self.assertIn("/analysis/run", response.text)
         self.assertIn("run-analysis-report", response.text)
+        self.assertIn("useReportMemory", response.text)
+        self.assertIn("报告记忆库", response.text)
+        self.assertIn("不会覆盖当前公告事实", response.text)
+        self.assertIn('id="useReportMemory" type="checkbox" checked', response.text)
+        self.assertIn('href="/memory-ui"', response.text)
         self.assertNotIn("enableAttachmentDownload", response.text)
         self.assertNotIn("attachmentCookie", response.text)
         self.assertNotIn("attachmentHeadersJson", response.text)
@@ -319,6 +324,8 @@ class RecordsApiTests(unittest.TestCase):
             pack_response = self.client.get(f"/analysis/packs/{body['pack_id']}")
             self.assertEqual(pack_response.status_code, 200)
             self.assertEqual(pack_response.json()["pack_id"], body["pack_id"])
+            self.assertNotIn("report_memory", json.dumps(pack_response.json(), ensure_ascii=False))
+            self.assertNotIn("memory_candidates", json.dumps(pack_response.json(), ensure_ascii=False))
 
             summary_response = self.client.get(f"/analysis/packs/{body['pack_id']}/summary")
             self.assertEqual(summary_response.status_code, 200)
@@ -1512,6 +1519,12 @@ class RecordsApiTests(unittest.TestCase):
             "remaining_issues": [],
             "created_at": "2026-06-12 10:01:00",
             "updated_at": "2026-06-12 10:02:00",
+            "use_report_memory": True,
+            "report_memory_applied": True,
+            "report_memory_chars": 1234,
+            "report_memory_hash": "abcdef123456",
+            "memory_read_failed": False,
+            "report_memory_truncated": False,
         }
         with tempfile.TemporaryDirectory() as tmpdir:
             root = main_module.Path(tmpdir)
@@ -1532,6 +1545,12 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("Dify 输入策略诊断", page_response.text)
         self.assertIn('data-key="input_strategy"', page_response.text)
         self.assertIn('data-key="final_dify_input_chars"', page_response.text)
+        self.assertIn('data-key="use_report_memory"', page_response.text)
+        self.assertIn('data-key="report_memory_applied"', page_response.text)
+        self.assertIn('data-key="memory_read_failed"', page_response.text)
+        self.assertIn('class="app-header"', page_response.text)
+        self.assertIn('class="brand-shield"', page_response.text)
+        self.assertIn("page-heading-card", page_response.text)
         self.assertEqual(status_response.status_code, 200)
         self.assertEqual(status_response.json()["progress"]["percent"], 100)
         self.assertEqual(diagnostics_response.status_code, 200)
@@ -1543,6 +1562,13 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("raw_total_content_chars", evidence)
         self.assertIn("dify_compact_pack_chars", evidence)
         self.assertIn("primary_attachment_summary_chars", evidence)
+        report_memory = diagnostics_response.json()["diagnostics"]["report_memory"]
+        self.assertTrue(report_memory["requested"])
+        self.assertTrue(report_memory["applied"])
+        self.assertEqual(report_memory["chars"], 1234)
+        self.assertEqual(report_memory["hash_prefix"], "abcdef123456")
+        self.assertFalse(report_memory["read_failed"])
+        self.assertNotIn("content", report_memory)
 
     def test_run_diagnostics_reports_missing_material_coverage_items(self) -> None:
         pack = {
@@ -2101,6 +2127,226 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(result["workflow_run_id"], "wf-retry")
         self.assertEqual(result["report_title"], "retry report")
 
+    def test_call_dify_workflow_sends_memory_as_independent_start_variables(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "workflow_run_id": "wf-memory-payload",
+                    "data": {
+                        "status": "succeeded",
+                        "outputs": {
+                            "report_markdown": "## 导语\npayload report",
+                            "report_title": "payload report",
+                        },
+                    },
+                }
+
+        class FakeClient:
+            def __init__(self, timeout: float):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def post(self, url: str, **kwargs):
+                captured["url"] = url
+                captured["json"] = kwargs["json"]
+                return FakeResponse()
+
+        config = {
+            "base_url": "http://dify.local/v1",
+            "api_key": "test-key",
+            "endpoint": "/workflows/run",
+            "response_mode": "blocking",
+            "user": "test",
+            "timeout_seconds": 1,
+            "max_attempts": 1,
+            "retry_backoff_seconds": 0,
+        }
+
+        with patch.object(main_module, "_dify_config", return_value=config), patch.object(main_module.httpx, "Client", FakeClient):
+            main_module._call_dify_workflow(
+                "pack_payload",
+                "run_payload",
+                report_memory="# Report Memory\n\nrule",
+                use_report_memory=True,
+            )
+
+        payload = captured["json"]
+        self.assertEqual(payload["inputs"]["pack_id"], "pack_payload")
+        self.assertEqual(payload["inputs"]["use_report_memory"], "true")
+        self.assertEqual(payload["inputs"]["report_memory"], "# Report Memory\n\nrule")
+        self.assertNotIn("evidence_pack", payload["inputs"])
+        self.assertNotIn("evidence_pack_json", payload["inputs"])
+
+    def test_call_dify_workflow_uses_legacy_payload_when_memory_is_disabled(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "workflow_run_id": "wf-legacy-payload",
+                    "data": {
+                        "status": "succeeded",
+                        "outputs": {
+                            "report_markdown": "## 导语\nlegacy report",
+                            "report_title": "legacy report",
+                        },
+                    },
+                }
+
+        class FakeClient:
+            def __init__(self, timeout: float):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def post(self, url: str, **kwargs):
+                captured["json"] = kwargs["json"]
+                return FakeResponse()
+
+        config = {
+            "base_url": "http://dify.local/v1",
+            "api_key": "test-key",
+            "endpoint": "/workflows/run",
+            "response_mode": "blocking",
+            "user": "test",
+            "timeout_seconds": 1,
+            "max_attempts": 1,
+            "retry_backoff_seconds": 0,
+        }
+
+        with patch.object(main_module, "_dify_config", return_value=config), patch.object(main_module.httpx, "Client", FakeClient):
+            main_module._call_dify_workflow("pack_payload", "run_payload")
+
+        payload = captured["json"]
+        self.assertEqual(payload["inputs"], {"pack_id": "pack_payload"})
+
+    def test_call_dify_workflow_keeps_requested_memory_flag_when_memory_is_empty(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "workflow_run_id": "wf-memory-empty",
+                    "data": {
+                        "status": "succeeded",
+                        "outputs": {
+                            "report_markdown": "## 导语\npayload report",
+                            "report_title": "payload report",
+                        },
+                    },
+                }
+
+        class FakeClient:
+            def __init__(self, timeout: float):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def post(self, url: str, **kwargs):
+                captured["json"] = kwargs["json"]
+                return FakeResponse()
+
+        config = {
+            "base_url": "http://dify.local/v1",
+            "api_key": "test-key",
+            "endpoint": "/workflows/run",
+            "response_mode": "blocking",
+            "user": "test",
+            "timeout_seconds": 1,
+            "max_attempts": 1,
+            "retry_backoff_seconds": 0,
+        }
+
+        with patch.object(main_module, "_dify_config", return_value=config), patch.object(main_module.httpx, "Client", FakeClient):
+            main_module._call_dify_workflow("pack_payload", "run_payload", report_memory="", use_report_memory=True)
+
+        payload = captured["json"]
+        self.assertEqual(payload["inputs"]["use_report_memory"], "true")
+        self.assertEqual(payload["inputs"]["report_memory"], "")
+
+    def test_call_dify_revision_workflow_omits_memory_fields_when_disabled(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> dict:
+                return {
+                    "workflow_run_id": "wf-revision-legacy",
+                    "data": {
+                        "status": "succeeded",
+                        "outputs": {
+                            "report_markdown": "## 导语\nrevision report",
+                            "report_title": "revision report",
+                        },
+                    },
+                }
+
+        class FakeClient:
+            def __init__(self, timeout: float):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def post(self, url: str, **kwargs):
+                captured["json"] = kwargs["json"]
+                return FakeResponse()
+
+        config = {
+            "base_url": "http://dify.local/v1",
+            "api_key": "test-key",
+            "endpoint": "/workflows/run",
+            "response_mode": "blocking",
+            "user": "test",
+            "timeout_seconds": 1,
+            "max_attempts": 1,
+            "retry_backoff_seconds": 0,
+        }
+
+        with patch.object(main_module, "_dify_config", return_value=config), patch.object(main_module.httpx, "Client", FakeClient):
+            main_module._call_dify_revision_workflow(
+                pack_id="pack_payload",
+                run_id="run_payload",
+                feedback="fix",
+                current_report="old report",
+                evidence_pack={"pack_id": "pack_payload"},
+                analysis_highlight=True,
+            )
+
+        inputs = captured["json"]["inputs"]
+        self.assertNotIn("use_report_memory", inputs)
+        self.assertNotIn("report_memory", inputs)
+        self.assertEqual(inputs["pack_id"], "pack_payload")
+
     def test_call_dify_workflow_caps_staged_generation_timeout_and_attempts(self) -> None:
         calls = {"count": 0, "timeouts": []}
 
@@ -2180,7 +2426,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 1.8)
 
     def test_analysis_run_calls_dify_and_persists_report(self) -> None:
-        calls: list[tuple[str, str]] = []
+        calls: list[tuple[str, str, str]] = []
         report_markdown = "\n\n".join(
             [
                 "# Report title",
@@ -2195,8 +2441,8 @@ class RecordsApiTests(unittest.TestCase):
             ]
         )
 
-        def fake_call(pack_id: str, run_id: str, pack: dict | None = None):
-            calls.append((pack_id, run_id))
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            calls.append((pack_id, run_id, report_memory, use_report_memory))
             return {
                 "workflow_run_id": "wf-run-1",
                 "status": "finished",
@@ -2223,12 +2469,24 @@ class RecordsApiTests(unittest.TestCase):
             self.assertEqual(body["status"], "running")
 
             wait_until(lambda: self.client.get(f"/analysis/runs/{body['run_id']}").json().get("status") == "finished")
-            self.assertEqual(calls, [("pack_20260612_abcdef1234", body["run_id"])])
+            self.assertEqual(calls, [("pack_20260612_abcdef1234", body["run_id"], "", False)])
 
             status_response = self.client.get(f"/analysis/runs/{body['run_id']}")
             self.assertEqual(status_response.status_code, 200)
-            self.assertEqual(status_response.json()["workflow_run_id"], "wf-run-1")
-            self.assertEqual(status_response.json()["status"], "finished")
+            status_body = status_response.json()
+            self.assertEqual(status_body["workflow_run_id"], "wf-run-1")
+            self.assertEqual(status_body["status"], "finished")
+            self.assertEqual(status_body["backend"], "dify_legacy")
+            self.assertEqual(status_body["workflow_backend"], "dify_legacy")
+            self.assertEqual(status_body["nodes"][0]["name"], "dify_legacy_workflow")
+            self.assertEqual(status_body["nodes"][0]["status"], "finished")
+            self.assertGreaterEqual(status_body["nodes"][0]["elapsed_ms"], 0)
+            self.assertFalse(status_body["use_report_memory"])
+            self.assertFalse(status_body["report_memory_applied"])
+            self.assertEqual(status_body["report_memory_chars"], 0)
+            self.assertEqual(status_body["report_memory_hash"], "")
+            self.assertFalse(status_body["memory_read_failed"])
+            self.assertFalse(status_body["report_memory_truncated"])
 
             report_response = self.client.get(f"/analysis/runs/{body['run_id']}/report")
             self.assertEqual(report_response.status_code, 200)
@@ -2236,6 +2494,183 @@ class RecordsApiTests(unittest.TestCase):
             self.assertEqual(report_body["report_markdown"], report_markdown)
             self.assertTrue(report_body["quality_check"]["passed"])
             self.assertIn("quality_gate", report_body)
+            self.assertNotIn("report_memory", report_body)
+
+    def test_analysis_run_uses_local_engine_when_configured(self) -> None:
+        fixture_path = main_module.Path(__file__).resolve().parent / "fixtures" / "synthetic_evidence_pack_basic.json"
+        pack = main_module.json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            main_module.os.environ, {"WORKFLOW_BACKEND": "local_engine"}, clear=False
+        ), patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value=pack, create=True
+        ), patch.object(
+            main_module, "_call_dify_workflow", side_effect=AssertionError("local_engine must not call Dify"), create=True
+        ):
+            response = self.client.post("/analysis/run", json={"pack_id": pack["pack_id"]})
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            run_id = body["run_id"]
+
+            wait_until(lambda: self.client.get(f"/analysis/runs/{run_id}").json().get("status") == "finished")
+            status_response = self.client.get(f"/analysis/runs/{run_id}")
+            report_response = self.client.get(f"/analysis/runs/{run_id}/report")
+
+        self.assertEqual(status_response.status_code, 200)
+        status_body = status_response.json()
+        self.assertEqual(status_body["backend"], "local_engine")
+        self.assertEqual(status_body["workflow_backend"], "local_engine")
+        self.assertEqual([node["name"] for node in status_body["nodes"]], ["prepare", "generate", "render", "qa", "final"])
+        self.assertTrue(all(node["status"] == "finished" for node in status_body["nodes"]))
+        self.assertEqual(status_body["workflow_run_id"], f"local-{run_id}")
+        self.assertIn("Synthetic medical consumables procurement notice", status_body["report_title"])
+        self.assertEqual(status_body["llm_provider"], "mock")
+        self.assertEqual(status_body["llm_model"], "mock-local-report-v1")
+        self.assertEqual(status_body["prompt_ref"], "local_report_generation:v1")
+        self.assertEqual(len(status_body["prompt_sha256"]), 64)
+        self.assertEqual(status_body["prompt_refs"][0]["sha256"], status_body["prompt_sha256"])
+        self.assertEqual(status_body["model_calls"][0]["provider"], "mock")
+        self.assertEqual(status_body["model_calls"][0]["prompt_sha256"], status_body["prompt_sha256"])
+
+        self.assertEqual(report_response.status_code, 200)
+        report_body = report_response.json()
+        self.assertIn("Synthetic medical consumables procurement notice", report_body["report_markdown"])
+        self.assertTrue(report_body["quality_check"]["passed"])
+
+    def test_analysis_run_with_memory_explicitly_false_keeps_legacy_dify_behavior(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            captured["pack_id"] = pack_id
+            captured["report_memory"] = report_memory
+            captured["use_report_memory"] = use_report_memory
+            return {
+                "workflow_run_id": "wf-run-memory-off",
+                "status": "finished",
+                "report_title": "Memory off report",
+                "report_markdown": "# Memory off report\n\n## 导语\n\nReport body with enough structure and length to avoid fragment repair. " * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_memory_off"}, create=True
+        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True), patch.dict(
+            main_module.os.environ, {"MEMORY_DIR": str(main_module.Path(tmpdir) / "memory")}, clear=False
+        ):
+            (main_module.Path(tmpdir) / "runs").mkdir()
+            (main_module.Path(tmpdir) / "memory").mkdir()
+            (main_module.Path(tmpdir) / "memory" / "report_memory.md").write_text("# Report Memory\n\nshould not be read", encoding="utf-8")
+            response = self.client.post("/analysis/run", json={"pack_id": "pack_memory_off", "use_report_memory": False})
+            self.assertEqual(response.status_code, 200)
+            run_id = response.json()["run_id"]
+            wait_until(lambda: self.client.get(f"/analysis/runs/{run_id}").json().get("status") == "finished")
+            status_body = self.client.get(f"/analysis/runs/{run_id}").json()
+
+        self.assertEqual(captured["report_memory"], "")
+        self.assertFalse(captured["use_report_memory"])
+        self.assertFalse(status_body["use_report_memory"])
+        self.assertFalse(status_body["report_memory_applied"])
+        self.assertEqual(status_body["report_memory_chars"], 0)
+        self.assertEqual(status_body["report_memory_hash"], "")
+
+    def test_analysis_run_passes_formal_memory_to_dify_when_requested(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            captured["pack_id"] = pack_id
+            captured["run_id"] = run_id
+            captured["report_memory"] = report_memory
+            captured["use_report_memory"] = use_report_memory
+            return {
+                "workflow_run_id": "wf-memory",
+                "status": "finished",
+                "report_title": "Memory report",
+                "report_markdown": "# Memory report\n\n## 导语\n\nReport body with enough structure and length to avoid fragment repair. "
+                * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        memory_content = "# Report Memory\n\nUse conservative report wording."
+        candidate_marker = "candidate-only-marker"
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_memory"}, create=True
+        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True), patch.dict(
+            main_module.os.environ, {"MEMORY_DIR": str(main_module.Path(tmpdir) / "memory")}, clear=False
+        ):
+            (main_module.Path(tmpdir) / "runs").mkdir()
+            from app.report_memory import MemoryKind, save_memory
+
+            save_memory(MemoryKind.REPORT, memory_content)
+            save_memory(MemoryKind.CANDIDATES, f"# Memory Candidates\n\n{candidate_marker}")
+            response = self.client.post("/analysis/run", json={"pack_id": "pack_memory", "use_report_memory": True})
+            self.assertEqual(response.status_code, 200)
+            run_id = response.json()["run_id"]
+            wait_until(lambda: self.client.get(f"/analysis/runs/{run_id}").json().get("status") == "finished")
+            status_body = self.client.get(f"/analysis/runs/{run_id}").json()
+
+        self.assertEqual(captured["report_memory"], memory_content)
+        self.assertTrue(captured["use_report_memory"])
+        self.assertNotIn(candidate_marker, str(captured["report_memory"]))
+        self.assertTrue(status_body["use_report_memory"])
+        self.assertTrue(status_body["report_memory_applied"])
+        self.assertEqual(status_body["report_memory_chars"], len(memory_content))
+        self.assertEqual(len(status_body["report_memory_hash"]), 12)
+        self.assertFalse(status_body["memory_read_failed"])
+        self.assertFalse(status_body["report_memory_truncated"])
+
+    def test_analysis_run_truncates_oversized_existing_memory_without_blocking_generation(self) -> None:
+        captured: dict[str, str] = {}
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            captured["report_memory"] = report_memory
+            captured["use_report_memory"] = use_report_memory
+            return {
+                "workflow_run_id": "wf-memory-truncated",
+                "status": "finished",
+                "report_title": "Truncated memory report",
+                "report_markdown": "# Truncated memory report\n\n## 导语\n\nReport body with enough structure and length. " * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_memory_long"}, create=True
+        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True), patch.dict(
+            main_module.os.environ, {"MEMORY_DIR": str(main_module.Path(tmpdir) / "memory"), "REPORT_MEMORY_MAX_CHARS": "15000"}, clear=False
+        ):
+            run_dir = main_module.Path(tmpdir) / "runs"
+            memory_dir = main_module.Path(tmpdir) / "memory"
+            run_dir.mkdir()
+            memory_dir.mkdir()
+            (memory_dir / "report_memory.md").write_text("x" * 16000, encoding="utf-8")
+            response = self.client.post("/analysis/run", json={"pack_id": "pack_memory_long", "use_report_memory": True})
+            self.assertEqual(response.status_code, 200)
+            run_id = response.json()["run_id"]
+            wait_until(lambda: self.client.get(f"/analysis/runs/{run_id}").json().get("status") == "finished")
+            status_body = self.client.get(f"/analysis/runs/{run_id}").json()
+
+        self.assertEqual(len(captured["report_memory"]), 15000)
+        self.assertTrue(captured["use_report_memory"])
+        self.assertTrue(status_body["report_memory_applied"])
+        self.assertEqual(status_body["report_memory_chars"], 15000)
+        self.assertTrue(status_body["report_memory_truncated"])
+        self.assertIn("长期记忆超过 15000 字符", "\n".join(status_body["warnings"]))
 
     def test_analysis_run_download_exports_markdown_docx(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2478,6 +2913,72 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"]["code"], "REPORT_NOT_READY")
+
+    def test_analysis_run_download_blocks_failed_quality_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_qafail123",
+                        "pack_id": "pack_test",
+                        "status": "needs_manual_review",
+                        "report_title": "qa failed report",
+                        "report_markdown": "# qa failed report\n\nbody",
+                        "version": 1,
+                        "quality_check": {
+                            "passed": False,
+                            "issues": [{"issue_id": "Q_BLOCK", "fix_instruction": "repair before export"}],
+                        },
+                        "remaining_issues": [{"issue_id": "Q_BLOCK"}],
+                    }
+                )
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
+                main_module, "REPORT_DIR", report_dir
+            ):
+                response = self.client.get("/analysis/runs/run_qafail123/download")
+
+        self.assertEqual(response.status_code, 409)
+        body = response.json()
+        self.assertEqual(body["error"]["code"], "QUALITY_GATE_BLOCKED")
+        self.assertIn("Q_BLOCK", body["error"]["detail"])
+        self.assertFalse(report_dir.exists())
+
+    def test_analysis_run_download_blocks_quality_gate_manual_review(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_gateblock1",
+                        "pack_id": "pack_test",
+                        "status": "finished",
+                        "report_title": "gate blocked report",
+                        "report_markdown": "# gate blocked report\n\nbody",
+                        "version": 1,
+                        "quality_check": {"passed": True, "issues": []},
+                        "quality_gate": {
+                            "deliverable_status": "needs_manual_review",
+                            "blocking_issues": [{"code": "SUMMARY_ONLY_REPORT", "message": "summary only"}],
+                        },
+                    }
+                )
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
+                main_module, "REPORT_DIR", report_dir
+            ):
+                response = self.client.get("/analysis/runs/run_gateblock1/download")
+
+        self.assertEqual(response.status_code, 409)
+        body = response.json()
+        self.assertEqual(body["error"]["code"], "QUALITY_GATE_BLOCKED")
+        self.assertIn("SUMMARY_ONLY_REPORT", body["error"]["detail"])
+        self.assertFalse(report_dir.exists())
 
     def test_normalize_dify_result_parses_json_string_fields(self) -> None:
         result = main_module._normalize_dify_result(
@@ -2727,17 +3228,31 @@ class RecordsApiTests(unittest.TestCase):
                         "quality_check": {"passed": True, "issues": []},
                         "created_at": "2026-06-15 09:00:00",
                         "updated_at": "2026-06-15 09:01:00",
+                        "use_report_memory": True,
+                        "report_memory_applied": True,
+                        "report_memory_chars": 16,
+                        "report_memory_hash": "oldhash123456",
+                        "memory_read_failed": False,
+                        "report_memory_truncated": False,
                     }
                 )
 
                 def fake_revision(*args, **kwargs):
+                    self.assertEqual(kwargs.get("report_memory"), "# Report Memory\n\ncurrent revision rule")
+                    self.assertTrue(kwargs.get("use_report_memory"))
                     return {
                         "report_title": "新标题",
                         "report_markdown": '<span class="analysis-highlight">新增企业影响分析。</span>',
                         "warnings": [],
                     }
 
-                with patch.object(main_module, "_call_dify_revision_workflow", fake_revision, create=True):
+                from app.report_memory import MemoryKind, save_memory
+
+                with patch.dict(main_module.os.environ, {"MEMORY_DIR": str(root / "memory")}, clear=False):
+                    save_memory(MemoryKind.REPORT, "# Report Memory\n\ncurrent revision rule")
+                with patch.object(main_module, "_call_dify_revision_workflow", fake_revision, create=True), patch.dict(
+                    main_module.os.environ, {"MEMORY_DIR": str(root / "memory")}, clear=False
+                ):
                     response = self.client.post(
                         "/analysis/runs/run_20260615_revise1/revise",
                         json={"feedback": "增加企业影响分析", "analysis_highlight": True},
@@ -2750,6 +3265,10 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("analysis-highlight", response.json()["report_markdown"])
         self.assertEqual(report_response.json()["version"], 2)
         self.assertEqual(record["report_versions"][0]["version"], 1)
+        self.assertTrue(record["revisions"][0]["report_memory_applied"])
+        self.assertEqual(record["revisions"][0]["report_memory_chars"], len("# Report Memory\n\ncurrent revision rule"))
+        self.assertNotEqual(record["revisions"][0]["report_memory_hash"], "oldhash123456")
+        self.assertTrue(record["revisions"][0]["report_memory_hash_changed"])
         self.assertEqual(record["revisions"][0]["feedback"], "增加企业影响分析")
 
     def test_records_ui_defaults_to_cached_prepare_and_has_reparse_button(self) -> None:
@@ -2760,6 +3279,27 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("\u91cd\u65b0\u89e3\u6790\u9644\u4ef6\u5e76\u751f\u6210\u8bc1\u636e\u5305", html)
         self.assertIn(".doc", html)
         self.assertNotIn("force_refresh_attachments: true,\n      };", html)
+
+    def test_records_ui_matches_three_column_reference_layout(self) -> None:
+        html = (main_module.Path(main_module.__file__).resolve().parent / "static" / "records.html").read_text(encoding="utf-8")
+
+        self.assertIn('class="app-header"', html)
+        self.assertIn('class="workflow-steps"', html)
+        self.assertIn('class="workspace-grid"', html)
+        self.assertIn('id="clearSelectionBtn"', html)
+        self.assertIn('class="bottom-action-bar"', html)
+        self.assertIn('id="bottomPrimaryCount"', html)
+        self.assertIn('id="bottomAuxiliaryCount"', html)
+        self.assertIn('id="bottomMemoryStatus"', html)
+        self.assertIn('class="card detail-card"', html)
+        self.assertIn('class="selected-material-card', html)
+        self.assertIn("报告记忆库", html)
+        self.assertIn("管理记忆库", html)
+        self.assertIn('id="useReportMemory" type="checkbox" checked', html)
+        self.assertIn('id="bottomMemoryStatus" class="enabled">已开启', html)
+        self.assertNotIn("长期记忆管理", html)
+        self.assertNotIn('class="detail-drawer"', html)
+        self.assertNotIn('id="detailDrawerBackdrop"', html)
 
     def test_analysis_run_rejects_missing_pack(self) -> None:
         with patch.object(

@@ -1204,6 +1204,14 @@ def build_run_diagnostics(record: dict[str, Any], pack: dict[str, Any] | None = 
         "versions": versions,
         "coverage": coverage,
         "quality_gate": quality_gate,
+        "report_memory": {
+            "requested": bool(record.get("use_report_memory")),
+            "applied": bool(record.get("report_memory_applied")),
+            "chars": int(record.get("report_memory_chars") or 0),
+            "hash_prefix": str(record.get("report_memory_hash") or "")[:12],
+            "read_failed": bool(record.get("memory_read_failed")),
+            "truncated": bool(record.get("report_memory_truncated")),
+        },
         "diagnosis": diagnosis,
     }
 

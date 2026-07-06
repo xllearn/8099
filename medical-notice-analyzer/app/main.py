@@ -42,7 +42,19 @@ from pypdf import PdfReader
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
+from app.core.quality import analysis_run_export_precheck
+from app.core.workflow.engine import run_local_workflow
+from app.core.workflow.state import WorkflowBackend, make_workflow_node
+from app.core.workflow.store import WorkflowRunStore, WorkflowRunStoreError
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
+from app.report_memory import (
+    MemoryContentError,
+    MemoryKind,
+    MemoryTokenError,
+    read_memory,
+    require_write_token,
+    save_memory,
+)
 
 try:
     import pdfplumber  # type: ignore[import-not-found]
@@ -373,6 +385,7 @@ class AnalysisPrepareResponse(BaseModel):
 
 class AnalysisRunRequest(BaseModel):
     pack_id: str = Field(min_length=1)
+    use_report_memory: bool = False
 
 
 class AnalysisRunResponse(BaseModel):
@@ -416,6 +429,23 @@ class AnalysisRunReviseResponse(BaseModel):
     report_markdown: str = ""
     quality_check: dict[str, Any] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str = ""
+
+
+class MemoryResponse(BaseModel):
+    success: bool = True
+    kind: str
+    content: str
+    chars: int
+    max_chars: int
+    updated_at: str
+    sha256: str
+    write_protection_enabled: bool
+    backup_name: str = ""
+    warning: str = ""
 
 
 @dataclass
@@ -1802,16 +1832,110 @@ def _analysis_run_path(run_id: str) -> Path:
     return _analysis_run_dir() / f"{_safe_run_id(run_id)}.json"
 
 
+def _analysis_run_store() -> WorkflowRunStore:
+    return WorkflowRunStore(_analysis_run_dir())
+
+
 def _make_analysis_run_id(pack_id: str) -> str:
     digest = hashlib.sha256(f"{pack_id}:{datetime.now().isoformat()}:{uuid.uuid4().hex}".encode("utf-8")).hexdigest()[:10]
     return f"run_{datetime.now().strftime('%Y%m%d')}_{digest}"
 
 
+def _selected_workflow_backend() -> WorkflowBackend:
+    value = (os.getenv("WORKFLOW_BACKEND") or WorkflowBackend.DIFY_LEGACY.value).strip().lower()
+    if value == WorkflowBackend.LOCAL_ENGINE.value:
+        return WorkflowBackend.LOCAL_ENGINE
+    if value and value != WorkflowBackend.DIFY_LEGACY.value:
+        logger.warning("unsupported_workflow_backend_configured value=%s fallback=%s", value, WorkflowBackend.DIFY_LEGACY.value)
+    return WorkflowBackend.DIFY_LEGACY
+
+
+def _workflow_node_status_from_run_status(status: str) -> str:
+    if status in {"finished", "needs_manual_review"}:
+        return "finished"
+    if status == "failed":
+        return "failed"
+    if status == "cancelled":
+        return "cancelled"
+    if status == "running":
+        return "running"
+    return status or "pending"
+
+
+def _analysis_elapsed_ms(started_at: Any, finished_at: Any) -> int:
+    start = _parse_analysis_timestamp(started_at)
+    finish = _parse_analysis_timestamp(finished_at)
+    if not start or not finish:
+        return 0
+    return max(0, int((finish - start).total_seconds() * 1000))
+
+
+def _ensure_workflow_run_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    status = str(record.get("status") or "running")
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    backend = str(record.get("workflow_backend") or record.get("backend") or WorkflowBackend.DIFY_LEGACY.value)
+    record["backend"] = backend
+    record["workflow_backend"] = backend
+    record.setdefault("created_at", now)
+    record.setdefault("started_at", record.get("created_at") or now)
+    record.setdefault("finished_at", "")
+    if status in {"finished", "needs_manual_review", "failed", "cancelled"} and not record.get("finished_at"):
+        record["finished_at"] = str(record.get("updated_at") or now)
+    record["elapsed_ms"] = _analysis_elapsed_ms(record.get("started_at"), record.get("finished_at"))
+    record.setdefault("error", str(record.get("error_message") or record.get("error_detail") or ""))
+    record.setdefault(
+        "artifacts",
+        {
+            "report_markdown_path": "",
+            "report_ir_path": "",
+            "qa_result_path": "",
+        },
+    )
+
+    nodes = record.get("nodes") if isinstance(record.get("nodes"), list) else []
+    if backend == WorkflowBackend.LOCAL_ENGINE.value and nodes:
+        record["nodes"] = nodes
+        return record
+    node_status = _workflow_node_status_from_run_status(status)
+    node_error = str(record.get("error_message") or record.get("error_detail") or "") if node_status == "failed" else ""
+    node_started_at = str(record.get("started_at") or record.get("created_at") or now)
+    node_finished_at = str(record.get("finished_at") or "")
+    node_elapsed_ms = _analysis_elapsed_ms(node_started_at, node_finished_at)
+    node_name = "local_engine_workflow" if backend == WorkflowBackend.LOCAL_ENGINE.value else "dify_legacy_workflow"
+    legacy_node = make_workflow_node(
+        node_name,
+        status=node_status,
+        started_at=node_started_at,
+        finished_at=node_finished_at,
+        elapsed_ms=node_elapsed_ms,
+        error=node_error,
+    )
+    if nodes:
+        updated = False
+        for index, node in enumerate(nodes):
+            if isinstance(node, dict) and node.get("name") == node_name:
+                merged = dict(node)
+                merged.update(legacy_node)
+                nodes[index] = merged
+                updated = True
+                break
+        if not updated:
+            nodes.insert(0, legacy_node)
+    else:
+        nodes = [legacy_node]
+    record["nodes"] = nodes
+    return record
+
+
 def _write_analysis_run(record: dict[str, Any]) -> None:
     run_id = str(record.get("run_id") or "")
     path = _analysis_run_path(run_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    record = _ensure_workflow_run_metadata(record)
+    try:
+        _analysis_run_store().write_run(record)
+    except WorkflowRunStoreError as exc:
+        logger.warning("analysis_run_write_failed run_id=%s code=%s", run_id, exc.code)
+        raise HTTPException(status_code=500, detail="analysis run write failed") from exc
     logger.info(
         "analysis_run_saved run_id=%s pack_id=%s status=%s path=%s",
         run_id,
@@ -1822,14 +1946,13 @@ def _write_analysis_run(record: dict[str, Any]) -> None:
 
 
 def _read_analysis_run(run_id: str) -> dict[str, Any]:
-    path = _analysis_run_path(run_id)
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="analysis run not found")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("analysis_run_read_failed run_id=%s error_type=%s", run_id, exc.__class__.__name__)
-        raise HTTPException(status_code=500, detail="analysis run read failed") from exc
+        return _analysis_run_store().read_run(_safe_run_id(run_id))
+    except WorkflowRunStoreError as exc:
+        logger.warning("analysis_run_read_failed run_id=%s code=%s", run_id, exc.code)
+        if exc.code == "RUN_NOT_FOUND":
+            raise HTTPException(status_code=404, detail="analysis run not found") from exc
+        raise HTTPException(status_code=500, detail=f"analysis run read failed: {exc.code}") from exc
 
 
 class DifyWorkflowError(Exception):
@@ -2315,24 +2438,75 @@ def _fallback_result_from_dify_error(
     return result
 
 
-def _call_dify_workflow(pack_id: str, run_id: str, pack: dict[str, Any] | None = None) -> dict[str, Any]:
+def _resolve_report_memory_snapshot(requested: bool) -> tuple[str, dict[str, Any], list[str]]:
+    metadata = {
+        "use_report_memory": bool(requested),
+        "report_memory_applied": False,
+        "report_memory_chars": 0,
+        "report_memory_hash": "",
+        "memory_read_failed": False,
+        "report_memory_truncated": False,
+    }
+    if not requested:
+        return "", metadata, []
+    try:
+        document = read_memory(MemoryKind.REPORT)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("report_memory_read_failed error_type=%s", exc.__class__.__name__)
+        metadata["memory_read_failed"] = True
+        return "", metadata, ["长期记忆读取失败，本次报告已按未使用长期记忆继续生成。"]
+
+    content = document.content
+    max_chars = int(document.max_chars or 15000)
+    if len(content) > max_chars:
+        content = content[:max_chars]
+        metadata["report_memory_truncated"] = True
+    metadata.update(
+        {
+            "report_memory_applied": bool(content.strip()),
+            "report_memory_chars": len(content),
+            "report_memory_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:12] if content else "",
+        }
+    )
+    warnings = []
+    if metadata["report_memory_truncated"]:
+        warnings.append(f"长期记忆超过 {max_chars} 字符，已截断后传入 Dify，请在 /memory-ui 精简。")
+    return content, metadata, warnings
+
+
+def _call_dify_workflow(
+    pack_id: str,
+    run_id: str,
+    pack: dict[str, Any] | None = None,
+    report_memory: str = "",
+    use_report_memory: bool = False,
+) -> dict[str, Any]:
     config = _dify_config()
     policy = _dify_request_policy(config, pack)
     url = _dify_workflow_url(config)
+    inputs = {"pack_id": pack_id}
+    if use_report_memory:
+        inputs.update(
+            {
+                "use_report_memory": "true",
+                "report_memory": report_memory or "",
+            }
+        )
     payload = {
-        "inputs": {"pack_id": pack_id},
+        "inputs": inputs,
         "response_mode": config["response_mode"],
         "user": config["user"],
     }
     started = time.perf_counter()
     logger.info(
-        "dify_workflow_call_started run_id=%s pack_id=%s url=%s input_strategy=%s timeout_seconds=%s max_attempts=%s",
+        "dify_workflow_call_started run_id=%s pack_id=%s url=%s input_strategy=%s timeout_seconds=%s max_attempts=%s report_memory_chars=%s",
         run_id,
         pack_id,
         url,
         policy.get("input_strategy") or "",
         policy["timeout_seconds"],
         policy["max_attempts"],
+        len(report_memory or ""),
     )
     attempts = int(policy["max_attempts"])
     backoff = float(policy["retry_backoff_seconds"])
@@ -2397,24 +2571,40 @@ def _call_dify_revision_workflow(
     current_report: str,
     evidence_pack: dict[str, Any],
     analysis_highlight: bool,
+    report_memory: str = "",
+    use_report_memory: bool = False,
 ) -> dict[str, Any]:
     config = _dify_config()
     url = _dify_workflow_url(config)
+    inputs = {
+        "mode": "user_feedback_revision",
+        "pack_id": pack_id,
+        "run_id": run_id,
+        "feedback": feedback,
+        "current_report": current_report,
+        "evidence_pack": evidence_pack,
+        "analysis_highlight": analysis_highlight,
+    }
+    if use_report_memory:
+        inputs.update(
+            {
+                "use_report_memory": "true",
+                "report_memory": report_memory or "",
+            }
+        )
     payload = {
-        "inputs": {
-            "mode": "user_feedback_revision",
-            "pack_id": pack_id,
-            "run_id": run_id,
-            "feedback": feedback,
-            "current_report": current_report,
-            "evidence_pack": evidence_pack,
-            "analysis_highlight": analysis_highlight,
-        },
+        "inputs": inputs,
         "response_mode": config["response_mode"],
         "user": config["user"],
     }
     started = time.perf_counter()
-    logger.info("dify_revision_call_started run_id=%s pack_id=%s feedback_chars=%s", run_id, pack_id, len(feedback))
+    logger.info(
+        "dify_revision_call_started run_id=%s pack_id=%s feedback_chars=%s report_memory_chars=%s",
+        run_id,
+        pack_id,
+        len(feedback),
+        len(report_memory or ""),
+    )
     try:
         with httpx.Client(timeout=float(config["timeout_seconds"])) as client:
             response = client.post(
@@ -2977,6 +3167,82 @@ def analysis_run_ui(run_id: str):
     return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
+@app.get("/memory-ui")
+def memory_ui():
+    path = Path(__file__).resolve().parent / "static" / "memory.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="memory UI not found")
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
+def _memory_response(document, *, backup_name: str = "", warning: str = "") -> MemoryResponse:
+    return MemoryResponse(
+        success=True,
+        kind=document.kind.value,
+        content=document.content,
+        chars=document.chars,
+        max_chars=document.max_chars,
+        updated_at=document.updated_at,
+        sha256=document.sha256,
+        write_protection_enabled=document.write_protection_enabled,
+        backup_name=backup_name,
+        warning=warning,
+    )
+
+
+def _memory_error(exc: MemoryContentError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "success": False,
+            "error": {
+                "code": exc.code,
+                "message": exc.message,
+                "chars": exc.chars,
+                "max_chars": exc.max_chars,
+            },
+        },
+    )
+
+
+def _memory_token_error(exc: MemoryTokenError) -> JSONResponse:
+    return JSONResponse(status_code=401, content={"success": False, "error": {"code": exc.code, "message": exc.message}})
+
+
+@app.get("/memory/report", response_model=MemoryResponse)
+def get_report_memory() -> MemoryResponse:
+    return _memory_response(read_memory(MemoryKind.REPORT))
+
+
+@app.put("/memory/report", response_model=MemoryResponse)
+def put_report_memory(req: MemoryUpdateRequest, request: Request):
+    try:
+        require_write_token(request.headers.get("X-Memory-Write-Token"))
+        result = save_memory(MemoryKind.REPORT, req.content)
+    except MemoryTokenError as exc:
+        return _memory_token_error(exc)
+    except MemoryContentError as exc:
+        return _memory_error(exc)
+    return _memory_response(result.document, backup_name=result.backup_name)
+
+
+@app.get("/memory/candidates", response_model=MemoryResponse)
+def get_candidate_memory() -> MemoryResponse:
+    return _memory_response(read_memory(MemoryKind.CANDIDATES))
+
+
+@app.put("/memory/candidates", response_model=MemoryResponse)
+def put_candidate_memory(req: MemoryUpdateRequest, request: Request):
+    try:
+        require_write_token(request.headers.get("X-Memory-Write-Token"))
+        result = save_memory(MemoryKind.CANDIDATES, req.content)
+    except MemoryTokenError as exc:
+        return _memory_token_error(exc)
+    except MemoryContentError as exc:
+        return _memory_error(exc)
+    return _memory_response(result.document, backup_name=result.backup_name)
+
+
 @app.get("/records", response_model=RecordListResponse)
 def list_records(
     keyword: str = "",
@@ -3249,7 +3515,12 @@ def _maybe_finalize_timed_out_analysis_run(record: dict[str, Any]) -> dict[str, 
         return record
 
 
-def _execute_analysis_run_background(pack_id: str, run_id: str) -> None:
+def _execute_analysis_run_background(
+    pack_id: str,
+    run_id: str,
+    report_memory_snapshot: str = "",
+    use_report_memory: bool = False,
+) -> None:
     try:
         record = _read_analysis_run(run_id)
     except HTTPException as exc:
@@ -3257,11 +3528,40 @@ def _execute_analysis_run_background(pack_id: str, run_id: str) -> None:
         return
 
     logger.info("analysis_run_background_started run_id=%s pack_id=%s", run_id, pack_id)
+    backend = str(record.get("workflow_backend") or record.get("backend") or WorkflowBackend.DIFY_LEGACY.value)
     pack_for_policy: dict[str, Any] | None = None
     try:
         pack_for_policy = _read_database_evidence_pack(pack_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis_run_pack_preread_failed run_id=%s pack_id=%s error_type=%s", run_id, pack_id, exc.__class__.__name__)
+    if backend == WorkflowBackend.LOCAL_ENGINE.value:
+        try:
+            pack = pack_for_policy or _read_database_evidence_pack(pack_id)
+            result = run_local_workflow(pack, run_id)
+            record.update(result)
+            record["success"] = True
+            record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+            _write_analysis_run(record)
+            logger.info(
+                "analysis_run_local_finished run_id=%s pack_id=%s workflow_run_id=%s status=%s",
+                run_id,
+                pack_id,
+                record.get("workflow_run_id") or "",
+                record.get("status") or "",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record.update(
+                {
+                    "success": False,
+                    "status": "failed",
+                    "updated_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+                    "error_message": "本地工作流生成失败",
+                    "error_detail": exc.__class__.__name__,
+                }
+            )
+            _write_analysis_run(record)
+            logger.exception("analysis_run_local_failed run_id=%s pack_id=%s", run_id, pack_id)
+        return
     watchdog: threading.Timer | None = None
     watchdog_timeout = _analysis_watchdog_timeout_seconds(pack_for_policy)
     if watchdog_timeout > 0:
@@ -3269,7 +3569,18 @@ def _execute_analysis_run_background(pack_id: str, run_id: str) -> None:
         watchdog.daemon = True
         watchdog.start()
     try:
-        result = _call_dify_workflow(pack_id, run_id, pack_for_policy)
+        try:
+            result = _call_dify_workflow(
+                pack_id,
+                run_id,
+                pack_for_policy,
+                report_memory_snapshot,
+                use_report_memory=use_report_memory,
+            )
+        except TypeError as exc:
+            if "positional" not in str(exc) and "argument" not in str(exc):
+                raise
+            result = _call_dify_workflow(pack_id, run_id, pack_for_policy)
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
             result = _repair_unusable_dify_result(result, pack)
@@ -3385,6 +3696,8 @@ def run_analysis(req: AnalysisRunRequest):
             return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
         return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
 
+    report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(req.use_report_memory)
+    backend = _selected_workflow_backend()
     run_id = _make_analysis_run_id(pack_id)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     record: dict[str, Any] = {
@@ -3392,22 +3705,37 @@ def run_analysis(req: AnalysisRunRequest):
         "run_id": run_id,
         "pack_id": pack_id,
         "status": "running",
+        "backend": backend.value,
+        "workflow_backend": backend.value,
         "workflow_run_id": "",
         "report_title": "",
         "report_markdown": "",
         "quality_check": {"passed": None, "issues": []},
         "generation_warnings": [],
-        "warnings": [],
+        "warnings": memory_warnings,
         "remaining_issues": [],
         "version": 1,
         "created_at": now,
         "updated_at": now,
         "error_message": "",
+        **memory_metadata,
     }
     _write_analysis_run(record)
-    logger.info("analysis_run_started run_id=%s pack_id=%s", run_id, pack_id)
+    logger.info(
+        "analysis_run_started run_id=%s pack_id=%s use_report_memory=%s report_memory_applied=%s report_memory_chars=%s memory_read_failed=%s",
+        run_id,
+        pack_id,
+        record["use_report_memory"],
+        record["report_memory_applied"],
+        record["report_memory_chars"],
+        record["memory_read_failed"],
+    )
 
-    threading.Thread(target=_execute_analysis_run_background, args=(pack_id, run_id), daemon=True).start()
+    threading.Thread(
+        target=_execute_analysis_run_background,
+        args=(pack_id, run_id, report_memory_snapshot, bool(req.use_report_memory)),
+        daemon=True,
+    ).start()
     return AnalysisRunResponse(
         success=True,
         run_id=run_id,
@@ -3510,6 +3838,10 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
 
     analysis_highlight = req.analysis_highlight if req.analysis_highlight is not None else _env_bool("ENABLE_ANALYSIS_HIGHLIGHT", True)
     revision_id = _make_revision_id(run_id)
+    revision_memory_snapshot, revision_memory_metadata, revision_memory_warnings = _resolve_report_memory_snapshot(bool(record.get("use_report_memory")))
+    original_memory_hash = str(record.get("report_memory_hash") or "")
+    revision_memory_hash = str(revision_memory_metadata.get("report_memory_hash") or "")
+    revision_memory_hash_changed = bool(original_memory_hash and revision_memory_hash and original_memory_hash != revision_memory_hash)
     try:
         result = _call_dify_revision_workflow(
             pack_id=pack_id,
@@ -3518,6 +3850,8 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
             current_report=current_report,
             evidence_pack=pack,
             analysis_highlight=bool(analysis_highlight),
+            report_memory=revision_memory_snapshot,
+            use_report_memory=bool(revision_memory_metadata.get("use_report_memory")),
         )
     except DifyWorkflowError as exc:
         logger.warning("analysis_revision_failed run_id=%s pack_id=%s code=%s detail=%s", run_id, pack_id, exc.code, _truncate(exc.detail, 200))
@@ -3537,7 +3871,9 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
     report_title = str(result.get("report_title") or record.get("report_title") or "")
     report_markdown = _clean_model_output(str(result.get("report_markdown") or current_report))
     quality_check = result.get("quality_check") if isinstance(result.get("quality_check"), dict) else {"passed": None, "issues": []}
-    warnings = list(result.get("warnings") or result.get("generation_warnings") or [])
+    warnings = [*revision_memory_warnings, *list(result.get("warnings") or result.get("generation_warnings") or [])]
+    if revision_memory_hash_changed:
+        warnings.append("修订时长期记忆版本与初稿不同，本次已按当前正式记忆执行。")
     revision_record = {
         "revision_id": revision_id,
         "run_id": run_id,
@@ -3550,6 +3886,13 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
         "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
         "quality_check": quality_check,
         "warnings": warnings,
+        "use_report_memory": bool(revision_memory_metadata.get("use_report_memory")),
+        "report_memory_applied": bool(revision_memory_metadata.get("report_memory_applied")),
+        "report_memory_chars": int(revision_memory_metadata.get("report_memory_chars") or 0),
+        "report_memory_hash": revision_memory_hash,
+        "memory_read_failed": bool(revision_memory_metadata.get("memory_read_failed")),
+        "report_memory_truncated": bool(revision_memory_metadata.get("report_memory_truncated")),
+        "report_memory_hash_changed": revision_memory_hash_changed,
     }
     record.update(
         {
@@ -3594,6 +3937,21 @@ def download_analysis_run_report(run_id: str):
     if not report_markdown:
         return _analysis_error(409, "REPORT_NOT_READY", "报告尚未生成完成")
 
+    precheck = _analysis_run_export_precheck(record)
+    if not precheck.get("allowed"):
+        logger.warning(
+            "analysis_run_report_download_blocked run_id=%s code=%s blocking_issues=%s",
+            run_id,
+            precheck.get("code"),
+            len(precheck.get("blocking_issues") or []),
+        )
+        return _analysis_error(
+            409,
+            str(precheck.get("code") or "QUALITY_GATE_BLOCKED"),
+            str(precheck.get("message") or "报告未通过质量门禁，暂不可下载 Word"),
+            str(precheck.get("detail") or ""),
+        )
+
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
     title = str(record.get("report_title") or "分析报告").strip() or "分析报告"
@@ -3611,6 +3969,21 @@ def download_analysis_run_report(run_id: str):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}"},
     )
+
+
+def _analysis_run_export_precheck(record: dict[str, Any]) -> dict[str, Any]:
+    pack_id = str(record.get("pack_id") or "")
+    quality_gate = record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {}
+    if pack_id:
+        try:
+            pack = _read_database_evidence_pack(pack_id)
+            diagnostics = build_run_diagnostics(record, pack, _compact_evidence_pack_for_dify(pack))
+            diagnostic_gate = diagnostics.get("quality_gate") if isinstance(diagnostics.get("quality_gate"), dict) else {}
+            if diagnostic_gate:
+                quality_gate = diagnostic_gate
+        except HTTPException as exc:
+            logger.info("analysis_run_export_precheck_pack_unavailable pack_id=%s detail=%s", pack_id, exc.detail)
+    return analysis_run_export_precheck(record, quality_gate)
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)

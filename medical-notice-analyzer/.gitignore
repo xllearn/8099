@@ -8,10 +8,12 @@ __pycache__/
 reports/
 site-cache/
 dify-db-backups/
+data/memory/
 
 *.log
 *.tmp
 *.bak
+*.bak.md
 tmp_*.json
 last-*.json
 test-report-download.docx

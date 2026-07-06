@@ -12,16 +12,16 @@
       --line-strong: #d8dee9;
       --text: #172033;
       --muted: #667085;
-      --brand: #0788a8;
-      --brand-dark: #056d88;
-      --brand-soft: #e8f7fb;
+      --brand: #246bdf;
+      --brand-dark: #1758c5;
+      --brand-soft: #edf4ff;
       --green: #079455;
       --green-soft: #ecfdf3;
       --orange: #dc6803;
       --orange-soft: #fff4e5;
       --danger: #d92d20;
       --danger-soft: #fff1f3;
-      --shadow: 0 8px 28px rgba(16, 24, 40, .06);
+      --shadow: 0 4px 18px rgba(25, 57, 104, .055);
     }
     * { box-sizing: border-box; }
     body {
@@ -53,16 +53,61 @@
     button.ghost { border-color: transparent; background: transparent; color: var(--brand); }
     a { color: var(--brand); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    .page { padding: 22px; }
+    .app-header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid #e8edf5;
+      background: linear-gradient(90deg, #fff, #f8fbff);
+    }
+    .brand-block, .header-tools { display: flex; align-items: center; }
+    .brand-block { gap: 10px; }
+    .header-tools { gap: 18px; color: #667085; font-size: 12px; }
+    .brand-shield {
+      width: 30px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px 8px 11px 11px;
+      background: linear-gradient(145deg, #3a84f7, #1f65db);
+      color: #fff;
+      font-size: 20px;
+      font-weight: 800;
+      box-shadow: 0 5px 12px rgba(36, 107, 223, .22);
+    }
+    .brand-copy strong { display: block; color: #102044; font-size: 16px; line-height: 1.25; }
+    .brand-copy span { display: block; margin-top: 2px; color: #98a2b3; font-size: 10px; }
+    .user-chip { display: flex; align-items: center; gap: 7px; color: #475467; }
+    .user-avatar {
+      width: 25px;
+      height: 25px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: #2d71e8;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 800;
+    }
+    .page { max-width: 1720px; margin: 0 auto; padding: 16px 22px 28px; }
     .topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 18px;
-      margin-bottom: 16px;
+      margin-bottom: 14px;
+    }
+    .page-heading-card {
+      padding: 15px 18px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
     }
     .breadcrumb { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-    h1 { margin: 0; font-size: 24px; letter-spacing: 0; }
+    h1 { margin: 0; color: #102044; font-size: 22px; letter-spacing: 0; }
     .title-row { display: flex; align-items: center; gap: 10px; }
     .badge {
       display: inline-flex;
@@ -79,7 +124,7 @@
     .card {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 10px;
+      border-radius: 8px;
       box-shadow: var(--shadow);
     }
     .summary {
@@ -87,7 +132,7 @@
       grid-template-columns: repeat(7, minmax(0, 1fr)) auto;
       gap: 0;
       align-items: center;
-      padding: 16px;
+      padding: 14px 16px;
       margin-bottom: 14px;
     }
     .metric {
@@ -107,7 +152,7 @@
     .copy-id { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
     .copy-icon { height: 24px; padding: 0 6px; font-size: 12px; }
     .actions { display: flex; align-items: center; gap: 9px; padding-left: 14px; }
-    .progress-card { padding: 18px 20px; margin-bottom: 14px; }
+    .progress-card { padding: 16px 20px; margin-bottom: 14px; }
     .progress-head {
       display: flex;
       justify-content: space-between;
@@ -209,7 +254,7 @@
     }
     .muted { color: var(--muted); }
     .side { display: grid; gap: 14px; }
-    .side-card { padding: 16px; }
+    .side-card { padding: 15px; }
     .side-card h3 { margin: 0 0 12px; font-size: 15px; }
     .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
     .quick-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
@@ -320,8 +365,21 @@
   </style>
 </head>
 <body>
+  <header class="app-header">
+    <div class="brand-block">
+      <div class="brand-shield" aria-hidden="true">+</div>
+      <div class="brand-copy">
+        <strong>医疗政策 / 通知分析系统</strong>
+        <span>智能解析 · 精准洞察 · 高效生成</span>
+      </div>
+    </div>
+    <div class="header-tools">
+      <span>ⓘ 帮助中心</span>
+      <span class="user-chip"><span class="user-avatar">医</span> 医保分析员⌄</span>
+    </div>
+  </header>
   <main class="page">
-    <div class="topbar">
+    <div class="topbar page-heading-card">
       <div>
         <div class="breadcrumb">数据库文章选材 / 报告生成详情</div>
         <div class="title-row">
@@ -435,6 +493,18 @@
           </div>
           <div class="hint" id="difyStrategyNotes"></div>
           <div id="omittedContentList" class="omitted-list"></div>
+        </section>
+        <section class="card side-card">
+          <h3>报告记忆库状态</h3>
+          <div class="kv" id="reportMemoryStatus">
+            <div data-key="use_report_memory">use_report_memory</div><div>-</div>
+            <div data-key="report_memory_applied">report_memory_applied</div><div>-</div>
+            <div data-key="report_memory_chars">report_memory_chars</div><div>-</div>
+            <div data-key="report_memory_hash">report_memory_hash</div><div>-</div>
+            <div data-key="memory_read_failed">memory_read_failed</div><div>-</div>
+            <div data-key="report_memory_truncated">report_memory_truncated</div><div>-</div>
+          </div>
+          <div class="hint" id="reportMemoryHint"></div>
         </section>
         <section class="card side-card">
           <h3>附件解析状态</h3>
@@ -744,6 +814,8 @@
       const reportDiag = diag.report || {};
       const evidence = diag.evidence || {};
       const status = run.status || 'running';
+      const qualityGate = report.quality_gate || diag.quality_gate || {};
+      const exportBlocked = isExportBlocked(report.quality_check || {}, qualityGate, status);
       $('statusBadge').className = `badge ${statusClass(status)}`;
       $('statusBadge').textContent = statusLabel(status);
       $('statusText').textContent = `${statusLabel(status)} / ${status || '-'}`;
@@ -754,12 +826,21 @@
       $('charsText').textContent = reportDiag.report_markdown_chars ? `${reportDiag.report_markdown_chars} 字` : (report.report_markdown ? `${report.report_markdown.length} 字` : '-');
       $('suggestLengthText').textContent = evidence.suggested_report_length || '-';
       $('updatedAtText').textContent = run.updated_at ? `报告生成时间：${formatLocalDateTime(run.updated_at)}` : '';
-      $('downloadBtn').disabled = !report.report_markdown;
+      $('downloadBtn').disabled = !report.report_markdown || exportBlocked;
+      $('downloadBtn').title = exportBlocked ? '质量门禁未通过，暂不可下载 Word' : '';
       $('copyMarkdownBtn').disabled = !report.report_markdown;
       $('submitRevisionBtn').disabled = !report.report_markdown;
       $('downloadBtn').onclick = () => {
         if (state.runId) location.href = `/analysis/runs/${encodeURIComponent(state.runId)}/download`;
       };
+    }
+
+    function isExportBlocked(qualityCheck, qualityGate, status) {
+      const gateStatus = String(qualityGate?.deliverable_status || '').toLowerCase();
+      const runStatus = String(status || '').toLowerCase();
+      if (qualityCheck?.passed === false) return true;
+      if (['needs_manual_review', 'failed', 'block', 'blocked', 'needs_fix'].includes(gateStatus)) return true;
+      return ['failed', 'needs_manual_review'].includes(runStatus) && qualityCheck?.passed !== true;
     }
 
     function renderDiagnosis() {
@@ -802,6 +883,18 @@
         <div>缺失覆盖项</div><div>${escapeHtml(missingItems.map((item) => item.label).slice(0, 4).join('、') || '无')}</div>
         <div>统计说明</div><div>建议报告长度根据主材料正文、附件摘要、辅助材料相关片段等加权估算。未解析附件和低相关辅助材料不会作为主要依据。</div>
       `;
+      const memory = diag.report_memory || {};
+      $('reportMemoryStatus').innerHTML = `
+        <div data-key="use_report_memory">use_report_memory</div><div>${escapeHtml(yesNo(memory.requested))}</div>
+        <div data-key="report_memory_applied">report_memory_applied</div><div>${escapeHtml(yesNo(memory.applied))}</div>
+        <div data-key="report_memory_chars">report_memory_chars</div><div>${escapeHtml(memory.chars ?? 0)}</div>
+        <div data-key="report_memory_hash">report_memory_hash</div><div>${escapeHtml(memory.hash_prefix || '-')}</div>
+        <div data-key="memory_read_failed">memory_read_failed</div><div>${escapeHtml(yesNo(memory.read_failed))}</div>
+        <div data-key="report_memory_truncated">report_memory_truncated</div><div>${escapeHtml(yesNo(memory.truncated))}</div>
+      `;
+      $('reportMemoryHint').textContent = memory.read_failed
+        ? '报告记忆库读取失败，本次报告已按未使用记忆库继续生成。'
+        : (memory.truncated ? '报告记忆库超过长度限制，本次已截断后使用。' : '');
       const pack = state.packDiagnostics || {};
       const finalInputChars = pack.final_dify_input_chars ?? pack.compact_pack_chars ?? pack.dify_compact_pack_chars ?? '-';
       const statusClassName = strategyStatusClass(pack);
