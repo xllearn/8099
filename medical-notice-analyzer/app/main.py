@@ -2209,6 +2209,22 @@ def _fallback_text_snippet(text: str, limit: int = 380) -> str:
     return f"{clean[:limit].rstrip()}..."
 
 
+def _fallback_key_fact_text(item: Any) -> str:
+    if isinstance(item, dict):
+        name = _clean_inline_text(item.get("name") or item.get("label") or item.get("field") or "")
+        value = _clean_inline_text(
+            item.get("value")
+            or item.get("text")
+            or item.get("summary")
+            or item.get("content")
+            or ""
+        )
+        if name and value:
+            return f"{name}：{value}"
+        return value or name
+    return _clean_inline_text(str(item))
+
+
 def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str]]:
     primary = [item for item in pack.get("primary_materials") or [] if isinstance(item, dict)]
     auxiliary = [item for item in pack.get("auxiliary_materials") or [] if isinstance(item, dict)]
@@ -2275,10 +2291,14 @@ def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str
             if summary_text:
                 lines.append(f"- {filename}：{_fallback_text_snippet(summary_text, 900)}")
                 attachment_detail_added = True
-            key_facts = [str(item).strip() for item in attachment.get("key_facts") or [] if str(item).strip()]
+            key_facts = [
+                fact
+                for fact in (_fallback_key_fact_text(item) for item in attachment.get("key_facts") or [])
+                if fact
+            ]
             if key_facts:
                 lines.append("  其中可关注事实包括：")
-                lines.extend([f"  - {fact}" for fact in key_facts[:10]])
+                lines.extend([f"  - {_fallback_text_snippet(fact, 260)}" for fact in key_facts[:10]])
                 attachment_detail_added = True
             sections = [item for item in attachment.get("important_sections") or [] if isinstance(item, dict)]
             if sections:

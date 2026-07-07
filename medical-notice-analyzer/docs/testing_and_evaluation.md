@@ -220,13 +220,13 @@ Result: Ran 177 tests, OK.
 
 ## P0-4 Test Plan
 
-**Stage:** Quality gate blocks export
+**Stage:** Quality gate marks manual-review export
 
 **Automated commands planned:**
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest tests.test_report_export tests.test_report_quality -v
-.\.venv\Scripts\python.exe -m unittest tests.test_records_api.RecordsApiTests.test_analysis_run_download_blocks_failed_quality_check tests.test_records_api.RecordsApiTests.test_analysis_run_download_blocks_quality_gate_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_exports_markdown_docx tests.test_records_api.RecordsApiTests.test_analysis_run_download_reuses_existing_docx_for_same_run_version tests.test_records_api.RecordsApiTests.test_analysis_run_uses_local_engine_when_configured -v
+.\.venv\Scripts\python.exe -m unittest tests.test_records_api.RecordsApiTests.test_analysis_run_download_allows_failed_quality_check_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_allows_quality_gate_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_exports_markdown_docx tests.test_records_api.RecordsApiTests.test_analysis_run_download_reuses_existing_docx_for_same_run_version tests.test_records_api.RecordsApiTests.test_analysis_run_uses_local_engine_when_configured -v
 .\.venv\Scripts\python.exe -m unittest tests.test_16case_regression_script -v
 .\.venv\Scripts\python.exe -m unittest tests.test_records_api -v
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -271,8 +271,13 @@ Result: Ran 177 tests, OK.
 
 **Export precheck regression:**
 
-- P0-4 expectation: failed QA and manual-review quality gates return HTTP 409 `QUALITY_GATE_BLOCKED` before Word file creation.
-- Result: passed. The focused download run returned 409 for both blocked cases and 200 for QA-passed explicit download cases.
+- Original P0-4 expectation: failed QA and manual-review quality gates returned HTTP 409 `QUALITY_GATE_BLOCKED` before Word file creation.
+- Revised 2026-07-06 expectation after real-environment smoke feedback: failed QA and manual-review quality gates keep diagnostics visible but return HTTP 200 on explicit Word download when report Markdown exists. Not-ready reports still return 409.
+- Revised result:
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_records_api.RecordsApiTests.test_analysis_run_download_allows_failed_quality_check_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_allows_quality_gate_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_rejects_not_ready_report -v` -> Ran 3 tests, OK.
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_records_api.RecordsApiTests.test_analysis_run_download_allows_failed_quality_check_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_allows_quality_gate_manual_review tests.test_records_api.RecordsApiTests.test_analysis_run_download_exports_markdown_docx tests.test_records_api.RecordsApiTests.test_analysis_run_download_reuses_existing_docx_for_same_run_version tests.test_records_api.RecordsApiTests.test_analysis_run_download_rejects_not_ready_report tests.test_records_api.RecordsApiTests.test_records_ui_serves_static_page tests.test_records_api.RecordsApiTests.test_records_ui_matches_three_column_reference_layout tests.test_records_api.RecordsApiTests.test_fallback_attachment_key_fact_dicts_render_as_named_values -v` -> Ran 8 tests, OK.
+  - `.\.venv\Scripts\python.exe -m unittest tests.test_records_api -v` -> Ran 91 tests, OK.
+  - `.\.venv\Scripts\python.exe -m unittest discover -s tests -v` -> Ran 180 tests, OK.
 
 **Existing checked export regression:**
 

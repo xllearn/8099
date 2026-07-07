@@ -62,7 +62,7 @@
 
 **Limitations:** P0-1 does not implement the export gate; it records the decision for later stages.
 
-**Evolution:** P0-4 enforces export blocking based on QA state.
+**Evolution:** P0-4 initially enforced export blocking based on QA state. After standby-port smoke testing on 2026-07-06, the product decision changed: QA/manual-review state must remain visible, but users may still explicitly download Word for manual review.
 
 **P0-4 result:** `/analysis/runs/{run_id}/download` now runs a quality export precheck before creating a docx. QA-passed reports are still not auto-exported; users must explicitly call the download action.
 
@@ -180,16 +180,16 @@
 
 **Evolution:** P0-4 can treat this issue as an export-blocking quality gate condition.
 
-## TD-013: Word Export Is Blocked At The Download Boundary
+## TD-013: Word Export Keeps Quality State But Allows Manual-Review Download
 
 **Background:** Before P0-4, the analysis-run download endpoint created a Word file whenever `report_markdown` existed, even if `quality_check.passed` was false or the run carried a manual-review quality gate.
 
-**Decision:** Add a reusable `analysis_run_export_precheck` under `app/core/quality` and call it from `/analysis/runs/{run_id}/download` before report file creation. The precheck blocks failed QA and manual-review quality gates with `QUALITY_GATE_BLOCKED`.
+**Decision:** Keep a reusable `analysis_run_export_precheck` under `app/core/quality` and call it from `/analysis/runs/{run_id}/download` before report file creation. The precheck blocks only not-ready reports that have no exportable body. Reports in `needs_manual_review`, including failed QA or manual-review quality-gate results, remain downloadable by explicit user action.
 
-**Why:** The download endpoint is the last shared path before a report becomes a formal Word deliverable. Blocking there protects both direct API calls and static UI clicks.
+**Why:** Real-environment smoke testing showed operators still need a Word artifact for manual review and offline correction, even when diagnostics mark the report as unsafe for direct delivery. Keeping diagnostics/status visible while allowing explicit download matches that workflow better than hard blocking.
 
-**Rejected alternatives:** Only disabling frontend buttons would not protect API callers. Rewriting the entire QA system would exceed P0-4 scope. Auto-exporting after QA pass would violate the explicit user-action boundary.
+**Rejected alternatives:** Auto-exporting after QA pass would violate the explicit user-action boundary. Hiding quality warnings in the Word path would make low-quality reports look safe. Rewriting the entire QA system would exceed P0-4 scope.
 
-**Limitations:** Historical run records without a stored quality gate and without a readable evidence pack can only be checked by their stored `quality_check`. Live server behavior was not exercised in P0-4.
+**Limitations:** Word download availability no longer means report quality passed. Users must treat `needs_manual_review`, failed QA issues, and diagnostics as delivery warnings rather than export blockers.
 
-**Evolution:** P1/P2 stages can enrich the quality gate inputs and add operational diagnostics, while keeping the download boundary as the final export guard.
+**Evolution:** P1/P2 stages can enrich the quality gate inputs and add operational diagnostics, while keeping Word export as an explicit user action rather than an automatic delivery signal.

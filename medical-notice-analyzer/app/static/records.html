@@ -1779,11 +1779,7 @@
     }
 
     function isExportBlocked(qualityCheck, qualityGate, status) {
-      const gateStatus = String(qualityGate?.deliverable_status || '').toLowerCase();
-      const runStatus = String(status || '').toLowerCase();
-      if (qualityCheck?.passed === false) return true;
-      if (['needs_manual_review', 'failed', 'block', 'blocked', 'needs_fix'].includes(gateStatus)) return true;
-      return ['failed', 'needs_manual_review'].includes(runStatus) && qualityCheck?.passed !== true;
+      return false;
     }
 
     function renderRunResult(runData, reportData = null) {

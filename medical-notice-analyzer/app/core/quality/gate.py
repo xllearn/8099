@@ -4,29 +4,14 @@ import json
 from typing import Any
 
 
-BLOCKING_RUN_STATUSES = {"failed", "needs_manual_review"}
-BLOCKING_GATE_STATUSES = {"failed", "needs_manual_review", "block", "blocked", "needs_fix"}
-PASS_GATE_STATUSES = {"deliverable", "pass", "passed", "export_ready"}
-
-
 def analysis_run_export_precheck(record: dict[str, Any], quality_gate: dict[str, Any] | None = None) -> dict[str, Any]:
     report_markdown = str(record.get("report_markdown") or "").strip()
     if not report_markdown:
-        return _blocked("REPORT_NOT_READY", "报告尚未生成完成")
+        return _blocked("REPORT_NOT_READY", "report is not ready")
 
     effective_gate = quality_gate if isinstance(quality_gate, dict) else _dict_value(record, "quality_gate")
     quality_check = _dict_value(record, "quality_check")
     blocking_issues = _collect_blocking_issues(record, quality_check, effective_gate)
-    run_status = str(record.get("status") or "").strip().lower()
-    gate_status = str(effective_gate.get("deliverable_status") or "").strip().lower()
-
-    if quality_check.get("passed") is False:
-        return _blocked("QUALITY_GATE_BLOCKED", "报告未通过质量门禁，暂不可下载 Word", blocking_issues, effective_gate)
-    if gate_status in BLOCKING_GATE_STATUSES:
-        return _blocked("QUALITY_GATE_BLOCKED", "报告未通过质量门禁，暂不可下载 Word", blocking_issues, effective_gate)
-    if run_status in BLOCKING_RUN_STATUSES and quality_check.get("passed") is not True:
-        return _blocked("QUALITY_GATE_BLOCKED", "报告仍需人工复核，暂不可下载 Word", blocking_issues, effective_gate)
-
     return {
         "allowed": True,
         "code": "",

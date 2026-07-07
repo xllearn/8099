@@ -2914,7 +2914,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"]["code"], "REPORT_NOT_READY")
 
-    def test_analysis_run_download_blocks_failed_quality_check(self) -> None:
+    def test_analysis_run_download_allows_failed_quality_check_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             report_dir = main_module.Path(tmpdir) / "reports"
@@ -2941,13 +2941,14 @@ class RecordsApiTests(unittest.TestCase):
             ):
                 response = self.client.get("/analysis/runs/run_qafail123/download")
 
-        self.assertEqual(response.status_code, 409)
-        body = response.json()
-        self.assertEqual(body["error"]["code"], "QUALITY_GATE_BLOCKED")
-        self.assertIn("Q_BLOCK", body["error"]["detail"])
-        self.assertFalse(report_dir.exists())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            response.headers["content-type"],
+        )
+        self.assertGreater(len(response.content), 1000)
 
-    def test_analysis_run_download_blocks_quality_gate_manual_review(self) -> None:
+    def test_analysis_run_download_allows_quality_gate_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             report_dir = main_module.Path(tmpdir) / "reports"
@@ -2974,11 +2975,12 @@ class RecordsApiTests(unittest.TestCase):
             ):
                 response = self.client.get("/analysis/runs/run_gateblock1/download")
 
-        self.assertEqual(response.status_code, 409)
-        body = response.json()
-        self.assertEqual(body["error"]["code"], "QUALITY_GATE_BLOCKED")
-        self.assertIn("SUMMARY_ONLY_REPORT", body["error"]["detail"])
-        self.assertFalse(report_dir.exists())
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            response.headers["content-type"],
+        )
+        self.assertGreater(len(response.content), 1000)
 
     def test_normalize_dify_result_parses_json_string_fields(self) -> None:
         result = main_module._normalize_dify_result(
@@ -3170,6 +3172,37 @@ class RecordsApiTests(unittest.TestCase):
         self.assertNotIn("evidence_pack", repaired["report_markdown"])
         self.assertNotIn("Dify", repaired["report_markdown"])
         self.assertNotIn("\u5143\u6570\u636e", repaired["report_markdown"])
+
+    def test_fallback_attachment_key_fact_dicts_render_as_named_values(self) -> None:
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "\u6cb3\u6e90\u5e02\u9ebb\u9189\u7c7b\u7b49\u533b\u7597\u670d\u52a1\u9879\u76ee\u4ef7\u683c\u516c\u793a",
+                    "content_text": "\u8be6\u60c5\u8bf7\u89c1\u9644\u4ef6\u3002",
+                    "attachments": [
+                        {
+                            "filename": "\u5f81\u6c42\u610f\u89c1\u7a3f.pdf",
+                            "summary": "\u9644\u4ef6\u8bf4\u660e\u533b\u7597\u670d\u52a1\u9879\u76ee\u4ef7\u683c\u7ba1\u7406\u548c\u652f\u4ed8\u89c4\u5219\u3002",
+                            "key_facts": [
+                                {"name": "\u65f6\u95f4", "value": "2026\u5e745\u670828\u65e5"},
+                                {
+                                    "name": "\u4ef7\u683c/\u652f\u4ed8\u89c4\u5219",
+                                    "value": "\u4e0d\u5f97\u4e0a\u6d6e\u3001\u4e0b\u6d6e",
+                                },
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+
+        _, markdown, _ = main_module._fallback_report_from_pack(pack)
+
+        self.assertIn("\u65f6\u95f4\uff1a2026\u5e745\u670828\u65e5", markdown)
+        self.assertIn("\u4ef7\u683c/\u652f\u4ed8\u89c4\u5219\uff1a\u4e0d\u5f97\u4e0a\u6d6e\u3001\u4e0b\u6d6e", markdown)
+        self.assertNotIn("{'name':", markdown)
+        self.assertNotIn("'value':", markdown)
 
     def test_report_starting_from_second_section_is_treated_as_fragment(self) -> None:
         pack = {
