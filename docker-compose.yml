@@ -4,6 +4,7 @@ services:
     container_name: medical-notice-analyzer
     environment:
       FIRECRAWL_API_KEY: ${FIRECRAWL_API_KEY:-}
+      ENABLE_URL_ANALYZE: ${ENABLE_URL_ANALYZE:-false}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://192.168.34.88:8099}
       DB_HOST: ${DB_HOST:-192.168.36.36}
       DB_PORT: ${DB_PORT:-3306}

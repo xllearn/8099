@@ -495,6 +495,8 @@ app = FastAPI(title="Medical Notice Analyzer", version="0.1.0")
 REPORT_DIR = Path(os.getenv("REPORT_DIR", "/tmp/medical-notice-reports"))
 SITE_CACHE_DIR = Path(os.getenv("SITE_CACHE_DIR", "/app/site-cache"))
 DEFAULT_PUBLIC_BASE_URL = "http://192.168.34.88:8099"
+URL_ANALYZE_DISABLED_CODE = "URL_ANALYZE_DISABLED"
+URL_ANALYZE_DISABLED_MESSAGE = "URL 输入分析已下线，请从数据库选材页面选择材料生成 pack_id。"
 
 
 @app.on_event("startup")
@@ -619,6 +621,28 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in {"1", "true", "yes", "on"}
+
+
+def _url_analyze_enabled() -> bool:
+    return _env_bool("ENABLE_URL_ANALYZE", False)
+
+
+def _url_analyze_disabled_response(endpoint: str, raw_url: str) -> JSONResponse:
+    logger.warning(
+        "url_analyze_disabled_endpoint_access endpoint=%s url=%s",
+        endpoint,
+        _safe_url_for_log(raw_url),
+    )
+    return JSONResponse(
+        status_code=410,
+        content={
+            "success": False,
+            "error": {
+                "code": URL_ANALYZE_DISABLED_CODE,
+                "message": URL_ANALYZE_DISABLED_MESSAGE,
+            },
+        },
+    )
 
 
 def _db_connect():
@@ -4501,6 +4525,8 @@ def download_analysis_run_report(run_id: str):
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     original_url = str(req.url)
+    if not _url_analyze_enabled():
+        return _url_analyze_disabled_response("/analyze", original_url)
     url, url_warnings = _normalize_notice_url(original_url)
     _validate_url(url)
     started = time.perf_counter()
@@ -4659,6 +4685,8 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
 @app.post("/analyze_v2", response_model=AnalyzeV2Response)
 async def analyze_v2(req: AnalyzeV2Request) -> AnalyzeV2Response:
     original_url = str(req.url)
+    if not _url_analyze_enabled():
+        return _url_analyze_disabled_response("/analyze_v2", original_url)
     url, url_warnings = _normalize_notice_url(original_url)
     _validate_url(url)
 

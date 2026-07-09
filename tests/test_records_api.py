@@ -160,6 +160,32 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("查看证据包摘要", response.text)
         self.assertNotIn("查看完整 evidence_pack</a>", response.text)
 
+    def test_url_analyze_endpoints_are_soft_disabled_by_default(self) -> None:
+        client = TestClient(main_module.app, raise_server_exceptions=False)
+
+        async def forbidden_fetch(_: str) -> dict[str, str]:
+            raise AssertionError("disabled URL analyze endpoint must not fetch pages")
+
+        original_fetch = main_module._fetch_page
+        try:
+            main_module._fetch_page = forbidden_fetch
+            with patch.dict(main_module.os.environ, {}, clear=False):
+                main_module.os.environ.pop("ENABLE_URL_ANALYZE", None)
+                with self.assertLogs("medical_notice_analyzer", level="WARNING") as logs:
+                    analyze_response = client.post("/analyze", json={"url": "https://example.com/notice"})
+                    analyze_v2_response = client.post("/analyze_v2", json={"url": "https://example.com/notice"})
+        finally:
+            main_module._fetch_page = original_fetch
+
+        for response in (analyze_response, analyze_v2_response):
+            self.assertEqual(response.status_code, 410)
+            body = response.json()
+            self.assertFalse(body["success"])
+            self.assertEqual(body["error"]["code"], "URL_ANALYZE_DISABLED")
+            self.assertEqual(body["error"]["message"], "URL 输入分析已下线，请从数据库选材页面选择材料生成 pack_id。")
+        self.assertIn("url_analyze_disabled_endpoint_access endpoint=/analyze", "\n".join(logs.output))
+        self.assertIn("url_analyze_disabled_endpoint_access endpoint=/analyze_v2", "\n".join(logs.output))
+
     def test_records_list_tolerates_nullable_optional_fields(self) -> None:
         with patch.object(main_module, "_db_fetch_one", return_value={"total": 1}, create=True), patch.object(
             main_module,

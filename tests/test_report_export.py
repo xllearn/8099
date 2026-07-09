@@ -110,9 +110,10 @@ class EvidencePackV2Tests(unittest.IsolatedAsyncioTestCase):
             main_module._fetch_page = fake_fetch
             main_module._try_known_site_detail = no_site_detail
             main_module._try_firecrawl = no_firecrawl
-            response = await main_module.analyze_v2(
-                AnalyzeV2Request(url="https://example.com/notice", max_attachments=0)
-            )
+            with patch.dict(main_module.os.environ, {"ENABLE_URL_ANALYZE": "true"}):
+                response = await main_module.analyze_v2(
+                    AnalyzeV2Request(url="https://example.com/notice", max_attachments=0)
+                )
         finally:
             main_module._fetch_page = original_fetch
             main_module._try_known_site_detail = original_site_detail
@@ -146,9 +147,10 @@ class EvidencePackV2Tests(unittest.IsolatedAsyncioTestCase):
             main_module._try_known_site_detail = no_site_detail
             main_module._try_firecrawl = no_firecrawl
             main_module._load_cached_page = lambda *_: None
-            response = await main_module.analyze_v2(
-                AnalyzeV2Request(url="https://example.com/blocked", max_attachments=0)
-            )
+            with patch.dict(main_module.os.environ, {"ENABLE_URL_ANALYZE": "true"}):
+                response = await main_module.analyze_v2(
+                    AnalyzeV2Request(url="https://example.com/blocked", max_attachments=0)
+                )
         finally:
             main_module._fetch_page = original_fetch
             main_module._try_known_site_detail = original_site_detail
@@ -190,9 +192,10 @@ class EvidencePackV2Tests(unittest.IsolatedAsyncioTestCase):
             main_module._try_firecrawl = no_firecrawl
             main_module._download_attachment = fake_download
             main_module._discover_attachment_links = lambda *_: [{"url": "https://example.com/large.csv", "text": "large"}]
-            response = await main_module.analyze_v2(
-                AnalyzeV2Request(url="https://example.com/notice", max_attachments=1, max_combined_chars=20_000)
-            )
+            with patch.dict(main_module.os.environ, {"ENABLE_URL_ANALYZE": "true"}):
+                response = await main_module.analyze_v2(
+                    AnalyzeV2Request(url="https://example.com/notice", max_attachments=1, max_combined_chars=20_000)
+                )
         finally:
             main_module._fetch_page = original_fetch
             main_module._try_known_site_detail = original_site_detail
