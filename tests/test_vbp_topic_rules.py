@@ -10,8 +10,12 @@ from unittest.mock import patch
 class VbpTopicRulesTests(unittest.TestCase):
     def test_feature_flags_are_documented_in_env_and_compose(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        env_example = (root / ".env.example").read_text(encoding="utf-8")
-        compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+        env_path = root / ".env.example"
+        compose_path = root / "docker-compose.yml"
+        if not env_path.exists() or not compose_path.exists():
+            self.skipTest("repository root config files are not packaged in this runtime image")
+        env_example = env_path.read_text(encoding="utf-8")
+        compose = compose_path.read_text(encoding="utf-8")
 
         for name in (
             "ENABLE_VBP_PROJECT_OPTIMIZATION",
