@@ -1,0 +1,1585 @@
+app:
+  description: 基于 pack_id/evidence_pack 的医药公告采购分析报告生成工作流，强化人工报告风格、覆盖度和资料说明边界。
+  icon: DOC
+  icon_background: '#E0F2FE'
+  mode: workflow
+  name: 医药公告采购分析报告_pack_id_人工风格
+  use_icon_as_answer_icon: false
+dependencies:
+- current_identifier: null
+  type: marketplace
+  value:
+    marketplace_plugin_unique_identifier: langgenius/deepseek:0.0.17@f7a5c1d222d17ee419b17a80d6e4923838fe93788dc724a3af73fbc6990b3a32
+kind: app
+version: 0.1.5
+workflow:
+  conversation_variables: []
+  environment_variables: []
+  features:
+    file_upload:
+      allowed_file_extensions:
+      - .JPG
+      - .JPEG
+      - .PNG
+      - .GIF
+      - .WEBP
+      - .SVG
+      allowed_file_types:
+      - image
+      allowed_file_upload_methods:
+      - local_file
+      - remote_url
+      enabled: false
+      fileUploadConfig:
+        audio_file_size_limit: 50
+        batch_count_limit: 5
+        file_size_limit: 15
+        image_file_size_limit: 10
+        video_file_size_limit: 100
+        workflow_file_upload_limit: 10
+      image:
+        enabled: false
+        number_limits: 3
+        transfer_methods:
+        - local_file
+        - remote_url
+      number_limits: 3
+    opening_statement: ''
+    retriever_resource:
+      enabled: false
+    sensitive_word_avoidance:
+      enabled: false
+    speech_to_text:
+      enabled: false
+    suggested_questions: []
+    suggested_questions_after_answer:
+      enabled: false
+    text_to_speech:
+      enabled: false
+      language: ''
+      voice: ''
+  graph:
+    edges:
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: start
+        targetType: http-request
+      id: start-to-fetch-pack
+      source: start_node
+      sourceHandle: source
+      target: fetch_evidence_pack
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: http-request
+        targetType: code
+      id: fetch-pack-to-parse
+      source: fetch_evidence_pack
+      sourceHandle: source
+      target: parse_evidence_pack
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: if-else
+      id: parse-pack-to-gate
+      source: parse_evidence_pack
+      sourceHandle: source
+      target: pack_fetch_gate
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: if-else
+        targetType: llm
+      id: pack-ok-to-generate
+      source: pack_fetch_gate
+      sourceHandle: ok
+      target: generate_report
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: if-else
+        targetType: code
+      id: pack-error-to-result
+      source: pack_fetch_gate
+      sourceHandle: 'false'
+      target: error_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: llm
+        targetType: code
+      id: generate-to-parse-generation
+      source: generate_report
+      sourceHandle: source
+      target: parse_generation_json
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: llm
+      id: parse-generation-to-qa
+      source: parse_generation_json
+      sourceHandle: source
+      target: qa_report_first
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: llm
+        targetType: code
+      id: qa-to-parse-quality
+      source: qa_report_first
+      sourceHandle: source
+      target: parse_quality_json
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: if-else
+      id: parse-quality-to-gate
+      source: parse_quality_json
+      sourceHandle: source
+      target: quality_gate
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: if-else
+        targetType: code
+      id: quality-passed-to-final
+      source: quality_gate
+      sourceHandle: passed
+      target: final_initial_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: if-else
+        targetType: llm
+      id: quality-revise-to-revise
+      source: quality_gate
+      sourceHandle: revise
+      target: revise_report
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: if-else
+        targetType: code
+      id: quality-minor-to-final
+      source: quality_gate
+      sourceHandle: 'false'
+      target: final_initial_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: llm
+        targetType: code
+      id: revise-to-parse-revision
+      source: revise_report
+      sourceHandle: source
+      target: parse_revision_json
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: llm
+      id: parse-revision-to-qa2
+      source: parse_revision_json
+      sourceHandle: source
+      target: qa_revised_report
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: llm
+        targetType: code
+      id: qa2-to-parse-quality2
+      source: qa_revised_report
+      sourceHandle: source
+      target: parse_revised_quality_json
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: code
+      id: parse-quality2-to-final-revised
+      source: parse_revised_quality_json
+      sourceHandle: source
+      target: final_revised_result
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: end
+      id: final-initial-to-end
+      source: final_initial_result
+      sourceHandle: source
+      target: end_initial
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: end
+      id: final-revised-to-end
+      source: final_revised_result
+      sourceHandle: source
+      target: end_revised
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    - data:
+        isInIteration: false
+        isInLoop: false
+        sourceType: code
+        targetType: end
+      id: error-to-end
+      source: error_result
+      sourceHandle: source
+      target: end_error
+      targetHandle: target
+      type: custom
+      zIndex: 0
+    nodes:
+    - data:
+        desc: ''
+        selected: false
+        title: Start
+        type: start
+        variables:
+        - label: pack_id
+          max_length: 128
+          options: []
+          required: true
+          type: text-input
+          variable: pack_id
+        - label: use_report_memory
+          max_length: 8
+          options: []
+          required: false
+          type: text-input
+          variable: use_report_memory
+        - label: report_memory
+          max_length: 15000
+          options: []
+          required: false
+          type: paragraph
+          variable: report_memory
+      height: 141
+      id: start_node
+      position:
+        x: 0
+        y: 260
+      positionAbsolute:
+        x: 0
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        authorization:
+          config: null
+          type: no-auth
+        body:
+          data: []
+          type: none
+        desc: ''
+        headers: ''
+        method: get
+        params: ''
+        retry_config:
+          enabled: true
+          exponential_backoff:
+            enabled: true
+            max_interval: 10000
+            multiplier: 2
+          max_retries: 2
+          retry_interval: 1000
+        selected: false
+        ssl_verify: true
+        timeout:
+          connect: 10
+          read: 60
+          write: 10
+        title: Fetch Evidence Pack
+        type: http-request
+        url: http://192.168.34.88:8099/analysis/packs/{{#start_node.pack_id#}}
+        variables: []
+      height: 128
+      id: fetch_evidence_pack
+      position:
+        x: 300
+        y: 260
+      positionAbsolute:
+        x: 300
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(fetch_body: str, pack_id: str) -> dict:\n    import json\n\n    raw = fetch_body or \"\"\n    try:\n\
+          \        pack = json.loads(raw or \"{}\")\n    except Exception as exc:\n        return {\n            \"pack_ok\"\
+          : \"false\",\n            \"pack_error\": \"evidence_pack response is not valid JSON: \" + str(exc),\n         \
+          \   \"evidence_pack_json\": raw,\n            \"primary_count\": \"0\",\n            \"auxiliary_count\": \"0\"\
+          ,\n        }\n\n    if not isinstance(pack, dict):\n        return {\n            \"pack_ok\": \"false\",\n    \
+          \        \"pack_error\": \"evidence_pack is not a JSON object\",\n            \"evidence_pack_json\": raw,\n   \
+          \         \"primary_count\": \"0\",\n            \"auxiliary_count\": \"0\",\n        }\n\n    primary = pack.get(\"\
+          primary_materials\") or []\n    auxiliary = pack.get(\"auxiliary_materials\") or []\n    if not primary:\n     \
+          \   return {\n            \"pack_ok\": \"false\",\n            \"pack_error\": \"evidence_pack has no primary_materials\"\
+          ,\n            \"evidence_pack_json\": json.dumps(pack, ensure_ascii=False),\n            \"primary_count\": \"\
+          0\",\n            \"auxiliary_count\": str(len(auxiliary)),\n        }\n\n    if pack_id and pack.get(\"pack_id\"\
+          ) and str(pack.get(\"pack_id\")) != str(pack_id):\n        return {\n            \"pack_ok\": \"false\",\n     \
+          \       \"pack_error\": \"input pack_id does not match evidence_pack.pack_id\",\n            \"evidence_pack_json\"\
+          : json.dumps(pack, ensure_ascii=False),\n            \"primary_count\": str(len(primary)),\n            \"auxiliary_count\"\
+          : str(len(auxiliary)),\n        }\n\n    return {\n        \"pack_ok\": \"true\",\n        \"pack_error\": \"\"\
+          ,\n        \"evidence_pack_json\": json.dumps(pack, ensure_ascii=False),\n        \"primary_count\": str(len(primary)),\n\
+          \        \"auxiliary_count\": str(len(auxiliary)),\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          auxiliary_count:
+            children: null
+            type: string
+          evidence_pack_json:
+            children: null
+            type: string
+          pack_error:
+            children: null
+            type: string
+          pack_ok:
+            children: null
+            type: string
+          primary_count:
+            children: null
+            type: string
+        selected: false
+        title: Parse Evidence Pack
+        type: code
+        variables:
+        - value_selector:
+          - fetch_evidence_pack
+          - body
+          variable: fetch_body
+        - value_selector:
+          - start_node
+          - pack_id
+          variable: pack_id
+      height: 53
+      id: parse_evidence_pack
+      position:
+        x: 600
+        y: 260
+      positionAbsolute:
+        x: 600
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        cases:
+        - case_id: ok
+          conditions:
+          - comparison_operator: is
+            id: pack-ok-condition
+            value: 'true'
+            varType: string
+            variable_selector:
+            - parse_evidence_pack
+            - pack_ok
+          id: ok
+          logical_operator: and
+        desc: ''
+        selected: false
+        title: Evidence Pack OK?
+        type: if-else
+      height: 125
+      id: pack_fetch_gate
+      position:
+        x: 900
+        y: 260
+      positionAbsolute:
+        x: 900
+        y: 260
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        memory:
+          enabled: false
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 50
+        model:
+          completion_params:
+            max_tokens: 8192
+            reasoning_effort: high
+            response_format: json_object
+            temperature: 0.1
+            thinking: true
+          mode: chat
+          name: deepseek-v4-pro
+          provider: langgenius/deepseek/deepseek
+        prompt_template:
+        - id: 982ab882-acc9-45c1-bc10-ceea99f78768
+          role: system
+          text: '你是医药公告采购政策分析报告撰写助手。请严格基于 evidence_pack 生成中文行业分析报告，只输出一个合法 JSON 对象，不要输出思考过程、分析草稿、调试信息、Markdown 代码围栏或 JSON
+            之外的解释文字。
+
+
+            写作目标：生成接近人工报告的医药公告采购分析稿，而不是简单摘要。人工报告通常具备短标题、导语、主题化规则拆解、必要 Markdown 表格、企业关注点和清晰的企业执行影响。
+            必须遵守 evidence_pack.generation_guidance 中的 input_strategy、target_report_length、detail_policy、generation_mode、mandatory_sections 和 detail_instruction。
+            如果 input_strategy=full_input，说明输入证据量较小，不要主动压缩正文、附件摘要、附件表格摘要、产品/价格字段或操作步骤；报告篇幅应来自事实覆盖和证据支撑型分析。
+            如果 input_strategy=light_compact，只能压缩重复模板和低价值噪声，仍要保留核心规则、操作步骤、表格列名、产品范围和价格字段。
+            如果 input_strategy=staged_generation，需要先按每个主材料和核心附件拆解，再综合成最终报告；辅助材料只作背景，不能覆盖主材料结论。
+
+
+            证据使用规则：
+
+            1. primary_materials 是主材料，决定报告主题、主体结构、主要规则和核心分析。
+
+            2. auxiliary_materials 只能用于历史对比、背景补充、同类项目参照，不能覆盖或替代主材料。
+
+            3. 不得编造 evidence_pack 中不存在的事实、数字、时间、主体名称、价格规则、中选结果或企业影响。
+
+            4. 附件 parse_status 为 metadata_only、network_unreachable、download_failed、unsupported、parse_failed 时，不能假装读取附件正文或表格。
+
+            5. 已解析附件只能引用 summary、key_facts、important_sections、table_summaries 中明确给出的内容，不得补写附件未披露的企业、产品、价格、中选状态。
+
+            6. evidence_pack.warnings 和 generation_guidance.do_not_use_as_basis 必须遵守。
+
+            7. 如主材料正文较短但核心附件已解析，并且 evidence_source_type 为 attachment_led_primary，说明公告正文只是发布说明，附件摘要、附件关键事实和附件表格摘要才是主体依据。此时必须围绕附件中的范围、项目、价格、医保支付类别、企业/产品字段或执行规则展开，不得因为正文短而写成空泛短稿。
+
+
+            人工报告风格要求：
+
+            1. report_title 使用短标题，突出地区、政策动作和企业影响。
+
+            2. 开头 1-2 段说明公告背景、核心事项、执行影响。
+
+            3. 正文按主题拆解，不要按数据库字段机械罗列。优先围绕范围对象、挂网/申报规则、价格规则、时间节点、企业操作、医疗机构/平台要求、暂停/撤销/信用风险、延伸对比展开。
+
+            4. 有规则、价格、产品清单、挂网状态、处置规则、时间节点时，优先生成 Markdown 表格。表格列名和单元格必须来自 evidence_pack 明确事实。
+
+            5. 如果证据只给出类别清单，只能生成“序号/类别”或“类别”表，不得自行增加“涵盖内容”“影响分析”“适用产品”等列。
+
+            6. 每个重点段落采用：分析观点 + 材料依据 + 影响说明。分析观点必须克制，使用“可能”“有助于”“意味着”“需要关注”等表达。分析观点必须能回扣 evidence_pack 中的原文、附件摘要、key_facts、important_sections 或 table_summaries；不能使用常识、行业经验或外部信息补足证据。
+
+            7. 企业关注点必须基于主材料规则和已解析附件摘要，不能泛泛而谈。报告必须至少包含一处“影响分析/风险提示/企业建议/企业关注点”类分析内容；但每条分析都要写清对应材料依据，不能只写摘要，也不能脱离原文自由发挥。
+            8. 附件中有 table_summaries 时，必须在正文中描述表格用途、关键列、适用产品/企业、价格或申报字段；涉及系统操作时，必须写清操作路径、申报/维护/核验动作、截止时间和主体责任。
+
+            9. 不要在 report_markdown 中生成额外材料说明、声明、资料限制小节或系统限制提示。材料完整性限制只写入 generation_warnings，由前端诊断区和 Word 导出模板处理。
+            10. 字数控制必须证据驱动：短正文无附件可以较短但要完整覆盖事实；短正文但附件为主时必须根据附件内容展开；普通 1+0/1+n 应覆盖规则、附件和企业影响；复杂 2+n 应按主材料分段并允许更多表格。不得为了凑字数写 evidence_pack 不支持的结论。
+
+
+            标注规则：
+
+            1. 关键事实或风险可用 <red>...</red> 或 <blue>...</blue> 标注。红色仅用于风险、处罚、暂停/撤销挂网、申报截止、价格联动、强制执行事项。蓝色用于重要关注点、流程节点、政策变化或企业应关注事项。
+
+            2. 分析性内容如 evidence_pack.generation_guidance.analysis_highlight_enabled 为 true，可用 <span class="analysis-highlight">...</span>
+            标注；事实、数字、日期、价格本身不要整段标黄。
+
+            3. 不要让标注改变事实含义。
+
+
+            输出要求：report_markdown 中可以包含 Markdown 标题、列表、Markdown 表格、<red>/<blue>/<span class="analysis-highlight"> 标记；不得包含 JSON、质检过程、调试信息或模型思考。'
+        - id: 8fbf5ae7-f0ec-49e8-b715-8834df8cb01d
+          role: user
+          text: "请根据以下 evidence_pack 生成中文医药器械采购分析报告。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\n只返回以下\
+            \ JSON 结构，字段名不得变化：\n{\n  \"version\": 1,\n  \"report_title\": \"\",\n  \"report_markdown\": \"\",\n  \"primary_material_ids\"\
+            : [],\n  \"auxiliary_material_ids\": [],\n  \"used_key_facts\": [],\n  \"generation_warnings\": []\n}\n\nreport_markdown\
+            \ 建议结构：\n- 标题由 report_title 承担，正文从导语开始。\n- 导语：1-2 段，说明公告背景、核心事项和执行影响。\n- 主题章节：围绕范围对象、挂网/申报规则、价格规则、时间节点、企业操作、医疗机构/平台要求、风险后果、辅助材料对比展开。\n\
+            - 必要时生成 Markdown 表格，例如：\n  | 事项 | 规则/要求 | 企业关注点 |\n  | --- | --- | --- |\n  | 产品范围 | evidence_pack 明确披露的产品或类别\
+            \ | <blue>基于该范围判断企业需核对自身产品是否纳入。</blue> |\n- 企业关注点：用列表或短段落说明企业、医疗机构或平台应关注事项。\n- 不要在正文末尾额外生成材料说明或声明；相关限制只放入 generation_warnings。\n\n禁止事项：\n- 不要编造附件中的企业名单、产品清单、价格、中选结果。\n- 不要把“附件未解析”“仅元数据”等技术提示随机写入正文分析段落。\n-\
+            \ 不要输出 Markdown 代码围栏或 JSON 之外的文字。"
+        - role: user
+          text: "长期记忆输入（仅在 use_report_memory 为 true 且 report_memory 非空时使用）：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，完全忽略长期记忆。\n- report_memory 只能作为写作规则、分析口径、常见错误、附件处理、表格规则和质检规则使用。\n- 不得使用 report_memory 覆盖当前公告事实，不得把 report_memory 当作 evidence_pack。\n- 当前公告事实只能来自 evidence_pack；如 report_memory 与 evidence_pack 冲突，以 evidence_pack 为准。"
+        retry_config:
+          enabled: false
+          exponential_backoff:
+            enabled: false
+            max_interval: 10000
+            multiplier: 2
+          max_retries: 2
+          retry_interval: 1000
+        selected: false
+        structured_output:
+          enabled: true
+          schema:
+            type: object
+            properties:
+              version:
+                type: integer
+              report_title:
+                type: string
+              report_markdown:
+                type: string
+              primary_material_ids:
+                type: array
+                items:
+                  type: string
+              auxiliary_material_ids:
+                type: array
+                items:
+                  type: string
+              used_key_facts:
+                type: array
+                items:
+                  type: string
+              generation_warnings:
+                type: array
+                items:
+                  type: string
+            required:
+            - version
+            - report_title
+            - report_markdown
+            - primary_material_ids
+            - auxiliary_material_ids
+            - used_key_facts
+            - generation_warnings
+        title: Generate Report JSON
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 89
+      id: generate_report
+      position:
+        x: 1200
+        y: 180
+      positionAbsolute:
+        x: 1200
+        y: 180
+      selected: true
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(generation_text: str) -> dict:\n    import json\n    import re\n\n    def extract_json(text):\n  \
+          \      text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\s*\", \"\", text)\n        text =\
+          \ re.sub(r\"\\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if start < 0:\n            return\
+          \ {}\n        depth = 0\n        in_string = False\n        escape = False\n        for index in range(start, len(text)):\n\
+          \            char = text[index]\n            if in_string:\n                if escape:\n                    escape\
+          \ = False\n                elif char == \"\\\\\":\n                    escape = True\n                elif char\
+          \ == '\"':\n                    in_string = False\n                continue\n            if char == '\"':\n    \
+          \            in_string = True\n            elif char == \"{\":\n                depth += 1\n            elif char\
+          \ == \"}\":\n                depth -= 1\n                if depth == 0:\n                    return json.loads(text[start:index\
+          \ + 1])\n        return json.loads(text[start:])\n    try:\n        data = extract_json(generation_text)\n    except\
+          \ Exception as exc:\n        data = {\n            \"version\": 1,\n            \"report_title\": \"Report generation\
+          \ failed\",\n            \"report_markdown\": \"Generation node did not return valid JSON: \" + str(exc),\n    \
+          \        \"primary_material_ids\": [],\n            \"auxiliary_material_ids\": [],\n            \"used_key_facts\"\
+          : [],\n            \"generation_warnings\": [\"generation_json_parse_failed\"],\n        }\n\n    if not isinstance(data,\
+          \ dict):\n        data = {}\n    data.setdefault(\"version\", 1)\n    data.setdefault(\"report_title\", \"\")\n\
+          \    data.setdefault(\"report_markdown\", \"\")\n    data.setdefault(\"primary_material_ids\", [])\n    data.setdefault(\"\
+          auxiliary_material_ids\", [])\n    data.setdefault(\"used_key_facts\", [])\n    data.setdefault(\"generation_warnings\"\
+          , [])\n    return {\n        \"generation_json\": json.dumps(data, ensure_ascii=False),\n        \"report_title\"\
+          : str(data.get(\"report_title\") or \"\"),\n        \"report_markdown\": str(data.get(\"report_markdown\") or \"\
+          \"),\n        \"generation_warnings_json\": json.dumps(data.get(\"generation_warnings\") or [], ensure_ascii=False),\n\
+          \        \"version\": str(data.get(\"version\") or 1),\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          generation_json:
+            children: null
+            type: string
+          generation_warnings_json:
+            children: null
+            type: string
+          report_markdown:
+            children: null
+            type: string
+          report_title:
+            children: null
+            type: string
+          version:
+            children: null
+            type: string
+        selected: false
+        title: Parse Generation JSON
+        type: code
+        variables:
+        - value_selector:
+          - generate_report
+          - text
+          variable: generation_text
+      height: 53
+      id: parse_generation_json
+      position:
+        x: 1500
+        y: 180
+      positionAbsolute:
+        x: 1500
+        y: 180
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        memory:
+          enabled: false
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 50
+        model:
+          completion_params:
+            max_tokens: 4096
+            response_format: json_object
+            temperature: 0
+            thinking: false
+          mode: chat
+          name: deepseek-v4-flash
+          provider: langgenius/deepseek/deepseek
+        prompt_template:
+        - role: user
+          text: "你是中文医药器械政策分析报告质检助手。请核对报告是否忠实于 evidence_pack。不要输出思考过程，只返回一个合法 JSON 对象，不要使用 Markdown 代码围栏。\n\n质检重点：\n1. 是否存在\
+            \ evidence_pack 中没有依据的事实。\n2. 日期、数字、价格、主体名称、项目阶段、适用范围是否错误。\n3. 是否混淆主材料和辅助材料，辅助材料是否反客为主。\n4. 是否把 metadata_only、network_unreachable、download_failed、unsupported、parse_failed\
+            \ 附件当作已读取全文。\n5. 是否遗漏主材料核心规则，包括范围对象、挂网/申报规则、价格规则、执行时间、企业要求、医疗机构/平台要求、暂停/撤销/信用风险。\n6. 是否遗漏附件表格摘要中的关键字段，例如企业、产品、注册证号、医保编码、价格、中选状态、采购量。\n\
+            7. 是否把附件未解析、仅元数据、下载失败等材料完整性提示、声明或资料说明写入 report_markdown；这类内容只能进入 generation_warnings、warnings 或诊断中。\n8. 是否缺少必要 Markdown 表格；如果证据存在明显规则清单、状态表、价格/产品/中选结果结构信息而报告完全不用表格，应列为\
+            \ major。\n9. 是否只有摘要、缺少影响分析、风险提示、企业建议或企业关注点；若缺少有原文支撑的分析内容，应列为 major，problem_type 使用 summary_only。\n10. 是否存在分析判断但不能从 evidence_pack 原文、附件摘要、key_facts、important_sections 或 table_summaries 推出；此类问题应列为 unsupported_claim 或 over_inference。\n11. 是否存在过度推断、绝对化表述或营销化语言。\n12. report_markdown 是否混入 JSON、调试信息、提示词或模型思考过程。\n13. 红色/蓝色/黄色标注是否基于 evidence_pack，是否改变事实含义。\n\
+            \nseverity 只能使用 fatal、high、major、minor。只有 fatal/high/major 需要自动修订，minor 不触发自动修订。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\
+            \ngeneration_warnings:\n{{#parse_generation_json.generation_warnings_json#}}\n\nreport_markdown:\n{{#parse_generation_json.report_markdown#}}\n\
+            \n返回 JSON：\n{\n  \"passed\": false,\n  \"round\": 1,\n  \"issues\": [\n    {\n      \"issue_id\": \"Q001\",\n\
+            \      \"severity\": \"high\",\n      \"problem_type\": \"unsupported_claim\",\n      \"report_text\": \"\",\n\
+            \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ],\n  \"revision_instruction\": \"请只修订\
+            \ issues 指出的问题，不要重写无问题段落。\"\n}\n"
+        - role: user
+          text: "长期记忆质检边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，不按长期记忆检查报告。\n- report_memory 只能用于写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实；如报告把 report_memory 当作当前公告事实来源，应列为 unsupported_claim 或 over_inference。"
+        retry_config:
+          enabled: false
+          exponential_backoff:
+            enabled: false
+            max_interval: 10000
+            multiplier: 2
+          max_retries: 2
+          retry_interval: 1000
+        selected: false
+        structured_output:
+          enabled: true
+          schema:
+            type: object
+            properties:
+              passed:
+                type: boolean
+              round:
+                type: integer
+              issues:
+                type: array
+                items:
+                  type: object
+              revision_instruction:
+                type: string
+            required:
+            - passed
+            - round
+            - issues
+            - revision_instruction
+        title: Quality Check Round 1
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 89
+      id: qa_report_first
+      position:
+        x: 1800
+        y: 180
+      positionAbsolute:
+        x: 1800
+        y: 180
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(quality_text: str) -> dict:\n    import json\n    import re\n\n    def extract_json(text):\n     \
+          \   text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\s*\", \"\", text)\n        text = re.sub(r\"\
+          \\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if start < 0:\n            return {}\n      \
+          \  depth = 0\n        in_string = False\n        escape = False\n        for index in range(start, len(text)):\n\
+          \            char = text[index]\n            if in_string:\n                if escape:\n                    escape\
+          \ = False\n                elif char == \"\\\\\":\n                    escape = True\n                elif char\
+          \ == '\"':\n                    in_string = False\n                continue\n            if char == '\"':\n    \
+          \            in_string = True\n            elif char == \"{\":\n                depth += 1\n            elif char\
+          \ == \"}\":\n                depth -= 1\n                if depth == 0:\n                    return json.loads(text[start:index\
+          \ + 1])\n        return json.loads(text[start:])\n    try:\n        data = extract_json(quality_text)\n    except\
+          \ Exception as exc:\n        data = {\n            \"passed\": False,\n            \"round\": 1,\n            \"\
+          issues\": [{\"issue_id\": \"Q_PARSE\", \"severity\": \"fatal\", \"problem_type\": \"quality_json_parse_failed\"\
+          , \"report_text\": \"\", \"source_basis\": \"\", \"fix_instruction\": str(exc)}],\n            \"revision_instruction\"\
+          : \"Quality node did not return valid JSON. Revise or review manually.\",\n        }\n    issues = data.get(\"issues\"\
+          ) if isinstance(data, dict) else []\n    if not isinstance(issues, list):\n        issues = []\n    severe = []\n\
+          \    for issue in issues:\n        if not isinstance(issue, dict):\n            continue\n        severity = str(issue.get(\"\
+          severity\") or \"\").lower()\n        if severity in {\"fatal\", \"high\", \"major\"}:\n            severe.append(issue)\n\
+          \    passed = bool(data.get(\"passed\")) if isinstance(data, dict) else False\n    if passed:\n        route = \"\
+          passed\"\n    elif severe:\n        route = \"revise\"\n    else:\n        route = \"minor_only\"\n    if isinstance(data,\
+          \ dict):\n        data[\"issues\"] = issues\n    return {\n        \"quality_json\": json.dumps(data if isinstance(data,\
+          \ dict) else {}, ensure_ascii=False),\n        \"issues_json\": json.dumps(issues, ensure_ascii=False),\n      \
+          \  \"severe_issues_json\": json.dumps(severe, ensure_ascii=False),\n        \"revision_instruction\": str(data.get(\"\
+          revision_instruction\") or \"\") if isinstance(data, dict) else \"\",\n        \"route\": route,\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          issues_json:
+            children: null
+            type: string
+          quality_json:
+            children: null
+            type: string
+          revision_instruction:
+            children: null
+            type: string
+          route:
+            children: null
+            type: string
+          severe_issues_json:
+            children: null
+            type: string
+        selected: false
+        title: Parse Quality JSON
+        type: code
+        variables:
+        - value_selector:
+          - qa_report_first
+          - text
+          variable: quality_text
+      height: 53
+      id: parse_quality_json
+      position:
+        x: 2100
+        y: 180
+      positionAbsolute:
+        x: 2100
+        y: 180
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        cases:
+        - case_id: passed
+          conditions:
+          - comparison_operator: is
+            id: quality-passed-condition
+            value: passed
+            varType: string
+            variable_selector:
+            - parse_quality_json
+            - route
+          id: passed
+          logical_operator: and
+        - case_id: revise
+          conditions:
+          - comparison_operator: is
+            id: quality-revise-condition
+            value: revise
+            varType: string
+            variable_selector:
+            - parse_quality_json
+            - route
+          id: revise
+          logical_operator: and
+        desc: ''
+        selected: false
+        title: Quality Gate
+        type: if-else
+      height: 173
+      id: quality_gate
+      position:
+        x: 2400
+        y: 180
+      positionAbsolute:
+        x: 2400
+        y: 180
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        memory:
+          enabled: false
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 50
+        model:
+          completion_params:
+            max_tokens: 8192
+            reasoning_effort: high
+            response_format: json_object
+            temperature: 0
+            thinking: true
+          mode: chat
+          name: deepseek-v4-pro
+          provider: langgenius/deepseek/deepseek
+        prompt_template:
+        - id: cea1292b-c511-4663-a313-f9c4d7dbe8db
+          role: user
+          text: "你是中文医药器械政策分析报告修订助手。请只补齐缺失项和修复 quality_check.issues 指出的问题，不要重写无问题段落，不要新增 evidence_pack 中不存在的内容。不要输出思考过程，只返回一个合法\
+            \ JSON 对象，不要使用 Markdown 代码围栏。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\nprevious report_title:\n\
+            {{#parse_generation_json.report_title#}}\n\nprevious report_markdown:\n{{#parse_generation_json.report_markdown#}}\n\
+            \nquality_check.issues:\n{{#parse_quality_json.issues_json#}}\n\nrevision_instruction:\n{{#parse_quality_json.revision_instruction#}}\n\
+            \n修订要求：\n- 输出完整修订后的 report_markdown，不要只输出片段。\n- 保持人工报告风格：导语、主题化规则拆解、必要 Markdown 表格、企业关注点。\n- 只补齐缺失项、删除无依据内容、删除 report_markdown 中的额外材料说明或声明，不重写无问题段落。\n\
+            - 如缺少主材料核心规则或附件表格摘要，应在合适章节补充，但只能使用 evidence_pack 明确披露的信息。\n- 不要在 report_markdown 中生成额外材料说明或声明；材料限制只放入 warnings。\n- 不要编造未解析附件中的企业、产品、价格、中选结果。\n\
+            - 不要把 JSON、质检过程、调试信息写入 report_markdown。\n\n返回 JSON：\n{\n  \"version\": 2,\n  \"report_title\": \"\",\n  \"report_markdown\"\
+            : \"\",\n  \"fixed_issue_ids\": [],\n  \"revision_notes\": \"\"\n}\n"
+        - role: user
+          text: "长期记忆修订边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，完全忽略长期记忆。\n- report_memory 只能用于修订写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实，不得新增 evidence_pack 中没有的事实、日期、价格、企业、产品或规则。"
+        retry_config:
+          enabled: false
+          exponential_backoff:
+            enabled: false
+            max_interval: 10000
+            multiplier: 2
+          max_retries: 2
+          retry_interval: 1000
+        selected: false
+        structured_output:
+          enabled: true
+          schema:
+            type: object
+            properties:
+              version:
+                type: integer
+              report_title:
+                type: string
+              report_markdown:
+                type: string
+              fixed_issue_ids:
+                type: array
+                items:
+                  type: string
+              revision_notes:
+                type: string
+            required:
+            - version
+            - report_title
+            - report_markdown
+            - fixed_issue_ids
+            - revision_notes
+        title: Revise Report JSON
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 89
+      id: revise_report
+      position:
+        x: 2700
+        y: 300
+      positionAbsolute:
+        x: 2700
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(revision_text: str, previous_title: str, previous_report: str) -> dict:\n    import json\n    import\
+          \ re\n\n    def extract_json(text):\n        text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\\
+          s*\", \"\", text)\n        text = re.sub(r\"\\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if\
+          \ start < 0:\n            return {}\n        depth = 0\n        in_string = False\n        escape = False\n    \
+          \    for index in range(start, len(text)):\n            char = text[index]\n            if in_string:\n        \
+          \        if escape:\n                    escape = False\n                elif char == \"\\\\\":\n              \
+          \      escape = True\n                elif char == '\"':\n                    in_string = False\n              \
+          \  continue\n            if char == '\"':\n                in_string = True\n            elif char == \"{\":\n \
+          \               depth += 1\n            elif char == \"}\":\n                depth -= 1\n                if depth\
+          \ == 0:\n                    return json.loads(text[start:index + 1])\n        return json.loads(text[start:])\n\
+          \    try:\n        data = extract_json(revision_text)\n    except Exception as exc:\n        data = {\n        \
+          \    \"version\": 2,\n            \"report_title\": previous_title or \"\",\n            \"report_markdown\": previous_report\
+          \ or \"\",\n            \"fixed_issue_ids\": [],\n            \"revision_notes\": \"Revision node did not return\
+          \ valid JSON; kept previous report: \" + str(exc),\n        }\n    if not isinstance(data, dict):\n        data\
+          \ = {}\n    data.setdefault(\"version\", 2)\n    data.setdefault(\"report_title\", previous_title or \"\")\n   \
+          \ data.setdefault(\"report_markdown\", previous_report or \"\")\n    data.setdefault(\"fixed_issue_ids\", [])\n\
+          \    data.setdefault(\"revision_notes\", \"\")\n    return {\n        \"revision_json\": json.dumps(data, ensure_ascii=False),\n\
+          \        \"report_title\": str(data.get(\"report_title\") or \"\"),\n        \"report_markdown\": str(data.get(\"\
+          report_markdown\") or \"\"),\n        \"version\": str(data.get(\"version\") or 2),\n        \"fixed_issue_ids_json\"\
+          : json.dumps(data.get(\"fixed_issue_ids\") or [], ensure_ascii=False),\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          fixed_issue_ids_json:
+            children: null
+            type: string
+          report_markdown:
+            children: null
+            type: string
+          report_title:
+            children: null
+            type: string
+          revision_json:
+            children: null
+            type: string
+          version:
+            children: null
+            type: string
+        selected: false
+        title: Parse Revision JSON
+        type: code
+        variables:
+        - value_selector:
+          - revise_report
+          - text
+          variable: revision_text
+        - value_selector:
+          - parse_generation_json
+          - report_title
+          variable: previous_title
+        - value_selector:
+          - parse_generation_json
+          - report_markdown
+          variable: previous_report
+      height: 53
+      id: parse_revision_json
+      position:
+        x: 3000
+        y: 300
+      positionAbsolute:
+        x: 3000
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        context:
+          enabled: false
+          variable_selector: []
+        desc: ''
+        memory:
+          enabled: false
+          role_prefix:
+            assistant: ''
+            user: ''
+          window:
+            enabled: false
+            size: 50
+        model:
+          completion_params:
+            max_tokens: 4096
+            response_format: json_object
+            temperature: 0
+            thinking: false
+          mode: chat
+          name: deepseek-v4-flash
+          provider: langgenius/deepseek/deepseek
+        prompt_template:
+        - role: user
+          text: "你是中文医药器械政策分析报告质检助手。请核对报告是否忠实于 evidence_pack。不要输出思考过程，只返回一个合法 JSON 对象，不要使用 Markdown 代码围栏。\n\n质检重点：\n1. 是否存在\
+            \ evidence_pack 中没有依据的事实。\n2. 日期、数字、价格、主体名称、项目阶段、适用范围是否错误。\n3. 是否混淆主材料和辅助材料，辅助材料是否反客为主。\n4. 是否把 metadata_only、network_unreachable、download_failed、unsupported、parse_failed\
+            \ 附件当作已读取全文。\n5. 是否遗漏主材料核心规则，包括范围对象、挂网/申报规则、价格规则、执行时间、企业要求、医疗机构/平台要求、暂停/撤销/信用风险。\n6. 是否遗漏附件表格摘要中的关键字段，例如企业、产品、注册证号、医保编码、价格、中选状态、采购量。\n\
+            7. 是否把附件未解析、仅元数据、下载失败等材料完整性提示、声明或资料说明写入 report_markdown；这类内容只能进入 generation_warnings、warnings 或诊断中。\n8. 是否缺少必要 Markdown 表格；如果证据存在明显规则清单、状态表、价格/产品/中选结果结构信息而报告完全不用表格，应列为\
+            \ major。\n9. 是否只有摘要、缺少影响分析、风险提示、企业建议或企业关注点；若缺少有原文支撑的分析内容，应列为 major，problem_type 使用 summary_only。\n10. 是否存在分析判断但不能从 evidence_pack 原文、附件摘要、key_facts、important_sections 或 table_summaries 推出；此类问题应列为 unsupported_claim 或 over_inference。\n11. 是否存在过度推断、绝对化表述或营销化语言。\n12. report_markdown 是否混入 JSON、调试信息、提示词或模型思考过程。\n13. 红色/蓝色/黄色标注是否基于 evidence_pack，是否改变事实含义。\n\
+            \nseverity 只能使用 fatal、high、major、minor。只有 fatal/high/major 需要自动修订，minor 不触发自动修订。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\
+            \ngeneration_warnings:\n{{#parse_generation_json.generation_warnings_json#}}\n\nreport_markdown:\n{{#parse_revision_json.report_markdown#}}\n\
+            \n返回 JSON：\n{\n  \"passed\": false,\n  \"round\": 2,\n  \"issues\": [\n    {\n      \"issue_id\": \"Q001\",\n\
+            \      \"severity\": \"high\",\n      \"problem_type\": \"unsupported_claim\",\n      \"report_text\": \"\",\n\
+            \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ],\n  \"revision_instruction\": \"请只修订\
+            \ issues 指出的问题，不要重写无问题段落。\"\n}\n"
+        - role: user
+          text: "长期记忆质检边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，不按长期记忆检查报告。\n- report_memory 只能用于写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实；如修订稿把 report_memory 当作当前公告事实来源，应列为 unsupported_claim 或 over_inference。"
+        retry_config:
+          enabled: false
+          exponential_backoff:
+            enabled: false
+            max_interval: 10000
+            multiplier: 2
+          max_retries: 2
+          retry_interval: 1000
+        selected: false
+        structured_output:
+          enabled: true
+          schema:
+            type: object
+            properties:
+              passed:
+                type: boolean
+              round:
+                type: integer
+              issues:
+                type: array
+                items:
+                  type: object
+              revision_instruction:
+                type: string
+            required:
+            - passed
+            - round
+            - issues
+            - revision_instruction
+        title: Quality Check Round 2
+        type: llm
+        variables: []
+        vision:
+          enabled: false
+      height: 89
+      id: qa_revised_report
+      position:
+        x: 3300
+        y: 300
+      positionAbsolute:
+        x: 3300
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(quality_text: str) -> dict:\n    import json\n    import re\n\n    def extract_json(text):\n     \
+          \   text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\s*\", \"\", text)\n        text = re.sub(r\"\
+          \\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if start < 0:\n            return {}\n      \
+          \  depth = 0\n        in_string = False\n        escape = False\n        for index in range(start, len(text)):\n\
+          \            char = text[index]\n            if in_string:\n                if escape:\n                    escape\
+          \ = False\n                elif char == \"\\\\\":\n                    escape = True\n                elif char\
+          \ == '\"':\n                    in_string = False\n                continue\n            if char == '\"':\n    \
+          \            in_string = True\n            elif char == \"{\":\n                depth += 1\n            elif char\
+          \ == \"}\":\n                depth -= 1\n                if depth == 0:\n                    return json.loads(text[start:index\
+          \ + 1])\n        return json.loads(text[start:])\n    try:\n        data = extract_json(quality_text)\n    except\
+          \ Exception as exc:\n        data = {\n            \"passed\": False,\n            \"round\": 2,\n            \"\
+          issues\": [{\"issue_id\": \"Q_PARSE\", \"severity\": \"fatal\", \"problem_type\": \"quality_json_parse_failed\"\
+          , \"report_text\": \"\", \"source_basis\": \"\", \"fix_instruction\": str(exc)}],\n            \"revision_instruction\"\
+          : \"Quality node did not return valid JSON. Revise or review manually.\",\n        }\n    issues = data.get(\"issues\"\
+          ) if isinstance(data, dict) else []\n    if not isinstance(issues, list):\n        issues = []\n    severe = []\n\
+          \    for issue in issues:\n        if not isinstance(issue, dict):\n            continue\n        severity = str(issue.get(\"\
+          severity\") or \"\").lower()\n        if severity in {\"fatal\", \"high\", \"major\"}:\n            severe.append(issue)\n\
+          \    passed = bool(data.get(\"passed\")) if isinstance(data, dict) else False\n    if passed:\n        route = \"\
+          passed\"\n    elif severe:\n        route = \"revise\"\n    else:\n        route = \"minor_only\"\n    if isinstance(data,\
+          \ dict):\n        data[\"issues\"] = issues\n    return {\n        \"quality_json\": json.dumps(data if isinstance(data,\
+          \ dict) else {}, ensure_ascii=False),\n        \"issues_json\": json.dumps(issues, ensure_ascii=False),\n      \
+          \  \"severe_issues_json\": json.dumps(severe, ensure_ascii=False),\n        \"revision_instruction\": str(data.get(\"\
+          revision_instruction\") or \"\") if isinstance(data, dict) else \"\",\n        \"route\": route,\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          issues_json:
+            children: null
+            type: string
+          quality_json:
+            children: null
+            type: string
+          revision_instruction:
+            children: null
+            type: string
+          route:
+            children: null
+            type: string
+          severe_issues_json:
+            children: null
+            type: string
+        selected: false
+        title: Parse Revised Quality JSON
+        type: code
+        variables:
+        - value_selector:
+          - qa_revised_report
+          - text
+          variable: quality_text
+      height: 53
+      id: parse_revised_quality_json
+      position:
+        x: 3600
+        y: 300
+      positionAbsolute:
+        x: 3600
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(pack_id: str, generation_json: str, quality_json: str) -> dict:\n    import json\n    try:\n     \
+          \   generation = json.loads(generation_json or \"{}\")\n    except Exception:\n        generation = {}\n    try:\n\
+          \        quality = json.loads(quality_json or \"{}\")\n    except Exception:\n        quality = {\"passed\": False,\
+          \ \"issues\": []}\n    issues = quality.get(\"issues\") if isinstance(quality, dict) else []\n    if not isinstance(issues,\
+          \ list):\n        issues = []\n    remaining = [] if quality.get(\"passed\") else [i for i in issues if isinstance(i,\
+          \ dict) and str(i.get(\"severity\") or \"\").lower() == \"minor\"]\n    result = {\n        \"status\": \"finished\"\
+          ,\n        \"pack_id\": pack_id,\n        \"report_title\": generation.get(\"report_title\") or \"\",\n        \"\
+          report_markdown\": generation.get(\"report_markdown\") or \"\",\n        \"version\": int(generation.get(\"version\"\
+          ) or 1),\n        \"quality_check\": quality,\n        \"generation_warnings\": generation.get(\"generation_warnings\"\
+          ) or [],\n        \"remaining_issues\": remaining,\n    }\n    return {\n        \"result\": json.dumps(result,\
+          \ ensure_ascii=False),\n        \"status\": result[\"status\"],\n        \"pack_id\": pack_id,\n        \"report_title\"\
+          : result[\"report_title\"],\n        \"report_markdown\": result[\"report_markdown\"],\n        \"version\": str(result[\"\
+          version\"]),\n        \"quality_check\": json.dumps(quality, ensure_ascii=False),\n        \"generation_warnings\"\
+          : json.dumps(result[\"generation_warnings\"], ensure_ascii=False),\n        \"remaining_issues\": json.dumps(remaining,\
+          \ ensure_ascii=False),\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          generation_warnings:
+            children: null
+            type: string
+          pack_id:
+            children: null
+            type: string
+          quality_check:
+            children: null
+            type: string
+          remaining_issues:
+            children: null
+            type: string
+          report_markdown:
+            children: null
+            type: string
+          report_title:
+            children: null
+            type: string
+          result:
+            children: null
+            type: string
+          status:
+            children: null
+            type: string
+          version:
+            children: null
+            type: string
+        selected: false
+        title: Final Result
+        type: code
+        variables:
+        - value_selector:
+          - start_node
+          - pack_id
+          variable: pack_id
+        - value_selector:
+          - parse_generation_json
+          - generation_json
+          variable: generation_json
+        - value_selector:
+          - parse_quality_json
+          - quality_json
+          variable: quality_json
+      height: 53
+      id: final_initial_result
+      position:
+        x: 2700
+        y: -67.14285714285714
+      positionAbsolute:
+        x: 2700
+        y: -67.14285714285714
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(pack_id: str, generation_json: str, revision_json: str, revised_quality_json: str) -> dict:\n    import\
+          \ json\n    try:\n        generation = json.loads(generation_json or \"{}\")\n    except Exception:\n        generation\
+          \ = {}\n    try:\n        revision = json.loads(revision_json or \"{}\")\n    except Exception:\n        revision\
+          \ = {}\n    try:\n        quality = json.loads(revised_quality_json or \"{}\")\n    except Exception:\n        quality\
+          \ = {\"passed\": False, \"issues\": []}\n    issues = quality.get(\"issues\") if isinstance(quality, dict) else\
+          \ []\n    if not isinstance(issues, list):\n        issues = []\n    passed = bool(quality.get(\"passed\"))\n  \
+          \  result = {\n        \"status\": \"finished\" if passed else \"needs_manual_review\",\n        \"pack_id\": pack_id,\n\
+          \        \"report_title\": revision.get(\"report_title\") or generation.get(\"report_title\") or \"\",\n       \
+          \ \"report_markdown\": revision.get(\"report_markdown\") or generation.get(\"report_markdown\") or \"\",\n     \
+          \   \"version\": int(revision.get(\"version\") or 2),\n        \"quality_check\": quality,\n        \"generation_warnings\"\
+          : generation.get(\"generation_warnings\") or [],\n        \"remaining_issues\": [] if passed else issues,\n    }\n\
+          \    return {\n        \"result\": json.dumps(result, ensure_ascii=False),\n        \"status\": result[\"status\"\
+          ],\n        \"pack_id\": pack_id,\n        \"report_title\": result[\"report_title\"],\n        \"report_markdown\"\
+          : result[\"report_markdown\"],\n        \"version\": str(result[\"version\"]),\n        \"quality_check\": json.dumps(quality,\
+          \ ensure_ascii=False),\n        \"generation_warnings\": json.dumps(result[\"generation_warnings\"], ensure_ascii=False),\n\
+          \        \"remaining_issues\": json.dumps(result[\"remaining_issues\"], ensure_ascii=False),\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          generation_warnings:
+            children: null
+            type: string
+          pack_id:
+            children: null
+            type: string
+          quality_check:
+            children: null
+            type: string
+          remaining_issues:
+            children: null
+            type: string
+          report_markdown:
+            children: null
+            type: string
+          report_title:
+            children: null
+            type: string
+          result:
+            children: null
+            type: string
+          status:
+            children: null
+            type: string
+          version:
+            children: null
+            type: string
+        selected: false
+        title: Final Revised Result
+        type: code
+        variables:
+        - value_selector:
+          - start_node
+          - pack_id
+          variable: pack_id
+        - value_selector:
+          - parse_generation_json
+          - generation_json
+          variable: generation_json
+        - value_selector:
+          - parse_revision_json
+          - revision_json
+          variable: revision_json
+        - value_selector:
+          - parse_revised_quality_json
+          - quality_json
+          variable: revised_quality_json
+      height: 53
+      id: final_revised_result
+      position:
+        x: 3900
+        y: 300
+      positionAbsolute:
+        x: 3900
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        code: "def main(pack_id: str, pack_error: str) -> dict:\n    import json\n    result = {\n        \"status\": \"failed\"\
+          ,\n        \"pack_id\": pack_id,\n        \"report_title\": \"\",\n        \"report_markdown\": \"\",\n        \"\
+          version\": 1,\n        \"quality_check\": {\"passed\": False, \"issues\": []},\n        \"generation_warnings\"\
+          : [pack_error or \"failed to fetch evidence_pack\"],\n        \"remaining_issues\": [],\n    }\n    return {\n \
+          \       \"result\": json.dumps(result, ensure_ascii=False),\n        \"status\": result[\"status\"],\n        \"\
+          pack_id\": pack_id,\n        \"report_title\": \"\",\n        \"report_markdown\": \"\",\n        \"version\": \"\
+          1\",\n        \"quality_check\": json.dumps(result[\"quality_check\"], ensure_ascii=False),\n        \"generation_warnings\"\
+          : json.dumps(result[\"generation_warnings\"], ensure_ascii=False),\n        \"remaining_issues\": \"[]\",\n    }\n"
+        code_language: python3
+        desc: ''
+        outputs:
+          generation_warnings:
+            children: null
+            type: string
+          pack_id:
+            children: null
+            type: string
+          quality_check:
+            children: null
+            type: string
+          remaining_issues:
+            children: null
+            type: string
+          report_markdown:
+            children: null
+            type: string
+          report_title:
+            children: null
+            type: string
+          result:
+            children: null
+            type: string
+          status:
+            children: null
+            type: string
+          version:
+            children: null
+            type: string
+        selected: false
+        title: Evidence Pack Error Result
+        type: code
+        variables:
+        - value_selector:
+          - start_node
+          - pack_id
+          variable: pack_id
+        - value_selector:
+          - parse_evidence_pack
+          - pack_error
+          variable: pack_error
+      height: 53
+      id: error_result
+      position:
+        x: 1200
+        y: 440
+      positionAbsolute:
+        x: 1200
+        y: 440
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - final_initial_result
+          - result
+          value_type: string
+          variable: result
+        - value_selector:
+          - final_initial_result
+          - status
+          value_type: string
+          variable: status
+        - value_selector:
+          - final_initial_result
+          - pack_id
+          value_type: string
+          variable: pack_id
+        - value_selector:
+          - final_initial_result
+          - report_title
+          value_type: string
+          variable: report_title
+        - value_selector:
+          - final_initial_result
+          - report_markdown
+          value_type: string
+          variable: report_markdown
+        - value_selector:
+          - final_initial_result
+          - version
+          value_type: string
+          variable: version
+        - value_selector:
+          - final_initial_result
+          - quality_check
+          value_type: string
+          variable: quality_check
+        - value_selector:
+          - final_initial_result
+          - generation_warnings
+          value_type: string
+          variable: generation_warnings
+        - value_selector:
+          - final_initial_result
+          - remaining_issues
+          value_type: string
+          variable: remaining_issues
+        selected: false
+        title: End Initial
+        type: end
+      height: 297
+      id: end_initial
+      position:
+        x: 3005.714285714286
+        y: -67.14285714285714
+      positionAbsolute:
+        x: 3005.714285714286
+        y: -67.14285714285714
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - final_revised_result
+          - result
+          value_type: string
+          variable: result
+        - value_selector:
+          - final_revised_result
+          - status
+          value_type: string
+          variable: status
+        - value_selector:
+          - final_revised_result
+          - pack_id
+          value_type: string
+          variable: pack_id
+        - value_selector:
+          - final_revised_result
+          - report_title
+          value_type: string
+          variable: report_title
+        - value_selector:
+          - final_revised_result
+          - report_markdown
+          value_type: string
+          variable: report_markdown
+        - value_selector:
+          - final_revised_result
+          - version
+          value_type: string
+          variable: version
+        - value_selector:
+          - final_revised_result
+          - quality_check
+          value_type: string
+          variable: quality_check
+        - value_selector:
+          - final_revised_result
+          - generation_warnings
+          value_type: string
+          variable: generation_warnings
+        - value_selector:
+          - final_revised_result
+          - remaining_issues
+          value_type: string
+          variable: remaining_issues
+        selected: false
+        title: End Revised
+        type: end
+      height: 297
+      id: end_revised
+      position:
+        x: 4200
+        y: 300
+      positionAbsolute:
+        x: 4200
+        y: 300
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    - data:
+        desc: ''
+        outputs:
+        - value_selector:
+          - error_result
+          - result
+          value_type: string
+          variable: result
+        - value_selector:
+          - error_result
+          - status
+          value_type: string
+          variable: status
+        - value_selector:
+          - error_result
+          - pack_id
+          value_type: string
+          variable: pack_id
+        - value_selector:
+          - error_result
+          - report_title
+          value_type: string
+          variable: report_title
+        - value_selector:
+          - error_result
+          - report_markdown
+          value_type: string
+          variable: report_markdown
+        - value_selector:
+          - error_result
+          - version
+          value_type: string
+          variable: version
+        - value_selector:
+          - error_result
+          - quality_check
+          value_type: string
+          variable: quality_check
+        - value_selector:
+          - error_result
+          - generation_warnings
+          value_type: string
+          variable: generation_warnings
+        - value_selector:
+          - error_result
+          - remaining_issues
+          value_type: string
+          variable: remaining_issues
+        selected: false
+        title: End Error
+        type: end
+      height: 297
+      id: end_error
+      position:
+        x: 1500
+        y: 440
+      positionAbsolute:
+        x: 1500
+        y: 440
+      selected: false
+      sourcePosition: right
+      targetPosition: left
+      type: custom
+      width: 243
+    viewport:
+      x: -481.9999999999999
+      y: 55
+      zoom: 0.7

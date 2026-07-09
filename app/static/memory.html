@@ -1,0 +1,333 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>报告记忆库管理</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --line: #e7ebf2;
+      --line-strong: #d8dee9;
+      --primary: #246bdf;
+      --primary-dark: #1758c5;
+      --primary-soft: #edf4ff;
+      --danger: #b42318;
+      --warning: #b54708;
+      --green-soft: #ecfdf3;
+      --orange-soft: #fff7ed;
+      --red-soft: #fef3f2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    }
+    .app-header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid #e8edf5;
+      background: linear-gradient(90deg, #fff, #f8fbff);
+    }
+    .brand-block, .header-tools { display: flex; align-items: center; }
+    .brand-block { gap: 10px; }
+    .header-tools { gap: 18px; color: #667085; font-size: 12px; }
+    .brand-shield {
+      width: 30px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px 8px 11px 11px;
+      background: linear-gradient(145deg, #3a84f7, #1f65db);
+      color: #fff;
+      font-size: 20px;
+      font-weight: 800;
+      box-shadow: 0 5px 12px rgba(36, 107, 223, .22);
+    }
+    .brand-copy strong { display: block; color: #102044; font-size: 16px; line-height: 1.25; }
+    .brand-copy span { display: block; margin-top: 2px; color: #98a2b3; font-size: 10px; }
+    .user-chip { display: flex; align-items: center; gap: 7px; color: #475467; }
+    .user-avatar {
+      width: 25px;
+      height: 25px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: #2d71e8;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 800;
+    }
+    .page { max-width: 1320px; margin: 0 auto; padding: 18px 24px 32px; }
+    .page-heading-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px 18px;
+      margin-bottom: 14px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 4px 18px rgba(25, 57, 104, .055);
+    }
+    h1 { margin: 0 0 5px; font-size: 22px; color: #102044; }
+    p { margin: 0; color: var(--muted); }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      margin-bottom: 14px;
+      box-shadow: 0 4px 18px rgba(25, 57, 104, .055);
+    }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    button, .link-button {
+      border: 1px solid var(--line-strong);
+      background: #fff;
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+    }
+    button.primary { background: var(--primary); border-color: var(--primary); color: #fff; box-shadow: 0 3px 10px rgba(36, 107, 223, .18); }
+    button.primary:hover { background: var(--primary-dark); border-color: var(--primary-dark); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    label { display: grid; gap: 6px; color: var(--muted); }
+    input {
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 8px 10px;
+      min-width: min(360px, 100%);
+    }
+    .tabs {
+      display: flex;
+      gap: 4px;
+      width: fit-content;
+      margin-bottom: 12px;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      box-shadow: 0 4px 18px rgba(25, 57, 104, .04);
+    }
+    .tabs button { border-color: transparent; min-height: 32px; }
+    .tabs button.active { border-color: #b9d6ff; background: var(--primary-soft); color: var(--primary); font-weight: 700; }
+    .editor-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: flex-start;
+      margin-bottom: 10px;
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 9px; background: #f8fafc; }
+    .pill.warning { background: var(--orange-soft); color: var(--warning); border-color: #fed7aa; }
+    .pill.danger { background: var(--red-soft); color: var(--danger); border-color: #fecaca; }
+    textarea {
+      width: 100%;
+      min-height: 560px;
+      resize: vertical;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      padding: 14px;
+      font: 13px/1.65 Consolas, "SFMono-Regular", monospace;
+      color: var(--text);
+      background: #fcfdff;
+      outline: none;
+    }
+    textarea:focus, input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(36, 107, 223, .1); }
+    .status {
+      margin-top: 10px;
+      min-height: 22px;
+      color: var(--muted);
+    }
+    .status.error { color: var(--danger); }
+    .status.success { color: var(--primary); }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-block">
+      <div class="brand-shield" aria-hidden="true">+</div>
+      <div class="brand-copy">
+        <strong>医疗政策 / 通知分析系统</strong>
+        <span>智能解析 · 精准洞察 · 高效生成</span>
+      </div>
+    </div>
+    <div class="header-tools">
+      <span>ⓘ 帮助中心</span>
+      <span class="user-chip"><span class="user-avatar">医</span> 医保分析员⌄</span>
+    </div>
+  </header>
+  <main class="page">
+    <header class="page-heading-card">
+      <div>
+        <h1>报告记忆库管理</h1>
+        <p>维护报告写作、分析角度和质量检查规则；当前公告事实始终优先于记忆库内容。</p>
+      </div>
+      <a class="link-button" href="/records-ui">返回材料选择</a>
+    </header>
+
+    <section class="card">
+      <div class="toolbar">
+        <label>写入 token
+          <input id="writeToken" type="password" autocomplete="off" placeholder="仅在服务端配置 MEMORY_WRITE_TOKEN 时需要">
+        </label>
+        <span class="pill warning hidden" id="unprotectedWarning">当前未配置写入保护</span>
+      </div>
+    </section>
+
+    <nav class="tabs" aria-label="memory tabs">
+      <button id="reportTab" class="active" type="button" data-kind="report">正式记忆库</button>
+      <button id="candidatesTab" type="button" data-kind="candidates">候选记忆</button>
+    </nav>
+
+    <section class="card">
+      <div class="editor-head">
+        <div>
+          <h2 id="editorTitle">正式记忆库</h2>
+          <p id="editorHelp">会影响后续报告写作规则，但不能覆盖当前公告事实。</p>
+        </div>
+        <div class="toolbar">
+          <button id="refreshBtn" type="button">刷新</button>
+          <button id="saveBtn" class="primary" type="button">保存</button>
+        </div>
+      </div>
+      <div class="meta">
+        <span class="pill" id="charCount">0 / 0</span>
+        <span class="pill" id="updatedAt">更新时间 -</span>
+        <span class="pill" id="shaText">hash -</span>
+      </div>
+      <textarea id="memoryContent" spellcheck="false"></textarea>
+      <div class="status" id="statusText"></div>
+    </section>
+  </main>
+
+  <script>
+    const state = {
+      kind: 'report',
+      docs: { report: null, candidates: null },
+    };
+    const $ = (id) => document.getElementById(id);
+
+    function endpoint(kind) {
+      return kind === 'report' ? '/memory/report' : '/memory/candidates';
+    }
+
+    function titleFor(kind) {
+      return kind === 'report' ? '正式记忆库' : '候选记忆';
+    }
+
+    function helpFor(kind) {
+      return kind === 'report'
+        ? '会影响后续报告写作规则，但不能覆盖当前公告事实。'
+        : '仅供人工整理和保存，默认不参与报告生成。';
+    }
+
+    async function readError(response) {
+      const text = await response.text();
+      try {
+        const data = JSON.parse(text);
+        return data?.error?.message || data?.detail || text || response.statusText;
+      } catch {
+        return text || response.statusText;
+      }
+    }
+
+    function setStatus(message, type = '') {
+      $('statusText').textContent = message;
+      $('statusText').className = `status ${type}`;
+    }
+
+    function renderDoc(doc) {
+      $('editorTitle').textContent = titleFor(state.kind);
+      $('editorHelp').textContent = helpFor(state.kind);
+      $('memoryContent').value = doc?.content || '';
+      updateCount();
+      $('updatedAt').textContent = `更新时间 ${doc?.updated_at || '-'}`;
+      $('shaText').textContent = `hash ${(doc?.sha256 || '').slice(0, 12) || '-'}`;
+      $('unprotectedWarning').classList.toggle('hidden', Boolean(doc?.write_protection_enabled));
+      document.querySelectorAll('.tabs button').forEach((button) => {
+        button.classList.toggle('active', button.dataset.kind === state.kind);
+      });
+    }
+
+    function updateCount() {
+      const doc = state.docs[state.kind] || {};
+      const chars = $('memoryContent').value.length;
+      const max = doc.max_chars || 0;
+      $('charCount').textContent = `${chars} / ${max}`;
+      $('charCount').className = `pill ${max && chars > max ? 'danger' : max && chars > max * 0.8 ? 'warning' : ''}`;
+    }
+
+    async function loadMemory(kind = state.kind) {
+      setStatus('正在读取...');
+      try {
+        const response = await fetch(endpoint(kind));
+        if (!response.ok) throw new Error(await readError(response));
+        const doc = await response.json();
+        state.docs[kind] = doc;
+        state.kind = kind;
+        renderDoc(doc);
+        setStatus('读取完成', 'success');
+      } catch (error) {
+        setStatus(`读取失败：${error.message}`, 'error');
+      }
+    }
+
+    async function saveMemory() {
+      const token = $('writeToken').value;
+      const headers = { 'Content-Type': 'application/json' };
+      if (token) headers['X-Memory-Write-Token'] = token;
+      $('saveBtn').disabled = true;
+      setStatus('正在保存...');
+      try {
+        const response = await fetch(endpoint(state.kind), {
+          method: 'PUT',
+          headers,
+          body: JSON.stringify({ content: $('memoryContent').value }),
+        });
+        if (!response.ok) throw new Error(await readError(response));
+        const doc = await response.json();
+        state.docs[state.kind] = doc;
+        renderDoc(doc);
+        setStatus(`保存成功，备份文件：${doc.backup_name || '-'}`, 'success');
+      } catch (error) {
+        setStatus(`保存失败：${error.message}`, 'error');
+      } finally {
+        $('saveBtn').disabled = false;
+      }
+    }
+
+    document.querySelectorAll('.tabs button').forEach((button) => {
+      button.addEventListener('click', () => loadMemory(button.dataset.kind));
+    });
+    $('refreshBtn').addEventListener('click', () => loadMemory());
+    $('saveBtn').addEventListener('click', saveMemory);
+    $('memoryContent').addEventListener('input', updateCount);
+
+    loadMemory('report');
+  </script>
+</body>
+</html>

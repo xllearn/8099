@@ -1,0 +1,1119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>报告生成详情</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --line: #e7ebf2;
+      --line-strong: #d8dee9;
+      --text: #172033;
+      --muted: #667085;
+      --brand: #246bdf;
+      --brand-dark: #1758c5;
+      --brand-soft: #edf4ff;
+      --green: #079455;
+      --green-soft: #ecfdf3;
+      --orange: #dc6803;
+      --orange-soft: #fff4e5;
+      --danger: #d92d20;
+      --danger-soft: #fff1f3;
+      --shadow: 0 4px 18px rgba(25, 57, 104, .055);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 1180px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 0 12px;
+      background: #fff;
+      color: #344054;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover { border-color: #b8c2d6; color: #111827; }
+    button:disabled { cursor: not-allowed; opacity: .55; }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    button.primary:hover { background: var(--brand-dark); color: #fff; }
+    button.ghost { border-color: transparent; background: transparent; color: var(--brand); }
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .app-header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid #e8edf5;
+      background: linear-gradient(90deg, #fff, #f8fbff);
+    }
+    .brand-block, .header-tools { display: flex; align-items: center; }
+    .brand-block { gap: 10px; }
+    .header-tools { gap: 18px; color: #667085; font-size: 12px; }
+    .brand-shield {
+      width: 30px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 8px 8px 11px 11px;
+      background: linear-gradient(145deg, #3a84f7, #1f65db);
+      color: #fff;
+      font-size: 20px;
+      font-weight: 800;
+      box-shadow: 0 5px 12px rgba(36, 107, 223, .22);
+    }
+    .brand-copy strong { display: block; color: #102044; font-size: 16px; line-height: 1.25; }
+    .brand-copy span { display: block; margin-top: 2px; color: #98a2b3; font-size: 10px; }
+    .user-chip { display: flex; align-items: center; gap: 7px; color: #475467; }
+    .user-avatar {
+      width: 25px;
+      height: 25px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: #2d71e8;
+      color: #fff;
+      font-size: 10px;
+      font-weight: 800;
+    }
+    .page { max-width: 1720px; margin: 0 auto; padding: 16px 22px 28px; }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 14px;
+    }
+    .page-heading-card {
+      padding: 15px 18px;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .breadcrumb { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    h1 { margin: 0; color: #102044; font-size: 22px; letter-spacing: 0; }
+    .title-row { display: flex; align-items: center; gap: 10px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .badge.finished { background: var(--green-soft); color: var(--green); }
+    .badge.running { background: var(--brand-soft); color: var(--brand); }
+    .badge.failed { background: var(--danger-soft); color: var(--danger); }
+    .badge.review { background: var(--orange-soft); color: var(--orange); }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, 1fr)) auto;
+      gap: 0;
+      align-items: center;
+      padding: 14px 16px;
+      margin-bottom: 14px;
+    }
+    .metric {
+      min-height: 54px;
+      padding: 0 14px;
+      border-right: 1px solid var(--line);
+      min-width: 0;
+    }
+    .metric:first-child { padding-left: 0; }
+    .metric-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .metric-value {
+      font-weight: 800;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .copy-id { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; }
+    .copy-icon { height: 24px; padding: 0 6px; font-size: 12px; }
+    .actions { display: flex; align-items: center; gap: 9px; padding-left: 14px; }
+    .progress-card { padding: 16px 20px; margin-bottom: 14px; }
+    .progress-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 18px;
+      font-weight: 700;
+    }
+    .progress-note {
+      margin: -8px 0 14px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(7, 1fr);
+      gap: 0;
+      position: relative;
+    }
+    .steps::before {
+      content: "";
+      position: absolute;
+      left: 7%;
+      right: 7%;
+      top: 14px;
+      height: 2px;
+      background: var(--line-strong);
+    }
+    .step {
+      position: relative;
+      display: grid;
+      justify-items: center;
+      gap: 6px;
+      text-align: center;
+      z-index: 1;
+      color: var(--muted);
+    }
+    .dot {
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      border: 2px solid var(--line-strong);
+      background: #fff;
+      color: var(--muted);
+      font-weight: 800;
+      font-size: 12px;
+    }
+    .step.finished .dot { background: var(--brand); border-color: var(--brand); color: #fff; }
+    .step.running .dot { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
+    .step.failed .dot { background: var(--danger); border-color: var(--danger); color: #fff; }
+    .step.skipped .dot { background: #f2f4f7; border-color: #d0d5dd; color: #98a2b3; }
+    .step-name { font-weight: 700; color: #344054; }
+    .step-time { font-size: 12px; color: var(--muted); min-height: 18px; }
+    .content-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 14px;
+      align-items: start;
+    }
+    .report-card { min-height: 560px; overflow: hidden; }
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      font-weight: 800;
+    }
+    .report-body {
+      padding: 22px 26px;
+      background: #fff;
+      min-height: 500px;
+      max-height: calc(100vh - 320px);
+      overflow: auto;
+      font-size: 14px;
+    }
+    .report-body h1, .report-body h2, .report-body h3 { line-height: 1.35; color: #111827; }
+    .report-body h1 { font-size: 24px; margin: 0 0 18px; }
+    .report-body h2 { font-size: 19px; margin: 24px 0 10px; }
+    .report-body h3 { font-size: 16px; margin: 18px 0 8px; }
+    .report-body p { margin: 10px 0; }
+    .report-body ul, .report-body ol { padding-left: 22px; }
+    .report-body table { width: 100%; border-collapse: collapse; margin: 12px 0; }
+    .report-body th { background: #0070c0; color: #fff; }
+    .report-body th, .report-body td { border: 1px solid #9db7e8; padding: 8px 10px; vertical-align: top; }
+    .report-body .red { color: #d92d20; font-weight: 700; }
+    .report-body .blue { color: #175cd3; font-weight: 700; }
+    .analysis-highlight {
+      color: #b8860b;
+      background: #fff3cd;
+      padding: 0 2px;
+      border-radius: 3px;
+    }
+    body.hide-analysis-highlight .analysis-highlight {
+      color: inherit;
+      background: transparent;
+      padding: 0;
+    }
+    .muted { color: var(--muted); }
+    .side { display: grid; gap: 14px; }
+    .side-card { padding: 15px; }
+    .side-card h3 { margin: 0 0 12px; font-size: 15px; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+    .quick-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
+    textarea {
+      width: 100%;
+      min-height: 92px;
+      resize: vertical;
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      padding: 9px 10px;
+      font: inherit;
+      color: var(--text);
+    }
+    .switch-row { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .diag-main { font-weight: 800; color: var(--green); margin-bottom: 8px; }
+    .diag-main.warning { color: var(--orange); }
+    .diag-main.error { color: var(--danger); }
+    .kv {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .kv div { padding: 9px; border-bottom: 1px solid var(--line); }
+    .kv div:nth-child(odd) { color: var(--muted); background: #fafbfc; }
+    .kv div:nth-last-child(-n+2) { border-bottom: 0; }
+    .strategy-status {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-weight: 700;
+      font-size: 12px;
+    }
+    .strategy-status.normal { background: var(--green-soft); color: var(--green); }
+    .strategy-status.compact { background: var(--orange-soft); color: var(--orange); }
+    .strategy-status.warning { background: var(--danger-soft); color: var(--danger); }
+    .omitted-list { display: grid; gap: 8px; margin-top: 10px; }
+    .omitted-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px;
+      background: #fafbfc;
+    }
+    .flag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .flag {
+      border-radius: 999px;
+      border: 1px solid var(--line-strong);
+      padding: 1px 7px;
+      color: #344054;
+      background: #fff;
+      font-size: 12px;
+    }
+    .flag.warning { border-color: #fecdca; background: var(--danger-soft); color: var(--danger); }
+    .log-list { display: grid; gap: 8px; }
+    .log-row { display: flex; justify-content: space-between; gap: 10px; color: var(--muted); }
+    .log-row b { color: #344054; font-weight: 700; }
+    .empty {
+      min-height: 300px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      text-align: center;
+    }
+    dialog {
+      width: min(760px, calc(100vw - 48px));
+      border: 0;
+      border-radius: 10px;
+      padding: 0;
+      box-shadow: 0 24px 80px rgba(16, 24, 40, .25);
+    }
+    dialog::backdrop { background: rgba(16, 24, 40, .35); }
+    .dialog-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--line);
+      font-weight: 800;
+    }
+    pre {
+      margin: 0;
+      padding: 16px;
+      max-height: 70vh;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #0f172a;
+      color: #e5e7eb;
+      font-size: 12px;
+    }
+    .toast {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      z-index: 10;
+      min-width: 220px;
+      max-width: 420px;
+      padding: 11px 13px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+      box-shadow: var(--shadow);
+      display: none;
+    }
+    .toast.show { display: block; }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-block">
+      <div class="brand-shield" aria-hidden="true">+</div>
+      <div class="brand-copy">
+        <strong>医疗政策 / 通知分析系统</strong>
+        <span>智能解析 · 精准洞察 · 高效生成</span>
+      </div>
+    </div>
+    <div class="header-tools">
+      <span>ⓘ 帮助中心</span>
+      <span class="user-chip"><span class="user-avatar">医</span> 医保分析员⌄</span>
+    </div>
+  </header>
+  <main class="page">
+    <div class="topbar page-heading-card">
+      <div>
+        <div class="breadcrumb">数据库文章选材 / 报告生成详情</div>
+        <div class="title-row">
+          <h1>报告生成详情</h1>
+          <span id="statusBadge" class="badge running">加载中</span>
+        </div>
+      </div>
+      <button type="button" onclick="location.href='/records-ui'">返回选材</button>
+    </div>
+
+    <section class="card summary">
+      <div class="metric">
+        <div class="metric-label">报告生成状态</div>
+        <div class="metric-value" id="statusText">-</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">run_id</div>
+        <div class="metric-value copy-id"><span id="runIdText">-</span><button class="copy-icon" data-copy="run">复制</button></div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">pack_id</div>
+        <div class="metric-value copy-id"><span id="packIdText">-</span><button class="copy-icon" data-copy="pack">复制</button></div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">质检状态</div>
+        <div class="metric-value" id="qualityText">待质检</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">版本</div>
+        <div class="metric-value" id="versionText">-</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">报告字数</div>
+        <div class="metric-value" id="charsText">-</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">建议长度</div>
+        <div class="metric-value" id="suggestLengthText">-</div>
+      </div>
+      <div class="actions">
+        <button id="downloadBtn" class="primary" type="button" disabled>下载 Word</button>
+        <button id="copyMarkdownBtn" type="button" disabled>复制 Markdown</button>
+        <button id="diagnosticsBtn" type="button">查看诊断</button>
+        <button id="toggleHighlightBtn" type="button">隐藏标注</button>
+      </div>
+    </section>
+
+    <section class="card progress-card">
+      <div class="progress-head">
+        <span>生成流程进度：<span id="currentStep">-</span></span>
+        <span id="percentText">0%</span>
+      </div>
+      <div class="progress-note" id="progressNote"></div>
+      <div class="steps" id="steps"></div>
+    </section>
+
+    <section class="content-grid">
+      <article class="card report-card">
+        <div class="card-head">
+          <span>报告预览（Markdown 渲染）</span>
+          <span class="muted" id="updatedAtText"></span>
+        </div>
+        <div class="report-body" id="reportBody">
+          <div class="empty">正在读取报告生成状态...</div>
+        </div>
+      </article>
+
+      <aside class="side">
+        <section class="card side-card">
+          <h3>诊断摘要</h3>
+          <div id="diagnosisSummary" class="muted">诊断加载中...</div>
+        </section>
+        <section class="card side-card">
+          <h3>证据包信息</h3>
+          <div class="kv" id="evidenceInfo">
+            <div>主材料正文</div><div>-</div>
+            <div>主材料附件摘要</div><div>-</div>
+            <div>辅助材料正文</div><div>-</div>
+            <div>辅助相关片段</div><div>-</div>
+            <div>辅助附件摘要</div><div>-</div>
+            <div>原始可用文本总量</div><div>-</div>
+            <div>Dify 精简包</div><div>-</div>
+            <div>加权证据量</div><div>-</div>
+            <div>证据包信息量</div><div>-</div>
+            <div>建议报告长度</div><div>-</div>
+            <div>统计说明</div><div>建议报告长度根据主材料正文、附件摘要、辅助材料相关片段等加权估算。</div>
+          </div>
+        </section>
+        <section class="card side-card">
+          <h3>Dify 输入策略诊断</h3>
+          <div class="kv" id="difyStrategyInfo">
+            <div data-key="input_strategy">input_strategy</div><div>-</div>
+            <div data-key="input_strategy_type">input_strategy_type</div><div>-</div>
+            <div data-key="input_strategy_description">input_strategy_description</div><div>-</div>
+            <div data-key="strategy_basis">strategy_basis</div><div>-</div>
+            <div data-key="original_pack_chars">original_pack_chars</div><div>-</div>
+            <div data-key="strategy_basis_chars">strategy_basis_chars</div><div>-</div>
+            <div data-key="final_dify_input_chars">final_dify_input_chars</div><div>-</div>
+            <div data-key="hard_limit_chars">hard_limit_chars</div><div>-</div>
+            <div data-key="full_input_max_chars">full_input_max_chars</div><div>-</div>
+            <div data-key="safe_compact_max_chars">safe_compact_max_chars</div><div>-</div>
+            <div data-key="compression_ratio">compression_ratio</div><div>-</div>
+            <div data-key="compression_applied">compression_applied</div><div>-</div>
+            <div data-key="detail_preserved">detail_preserved</div><div>-</div>
+            <div data-key="primary_detail_preserved">primary_detail_preserved</div><div>-</div>
+            <div data-key="core_attachment_detail_preserved">core_attachment_detail_preserved</div><div>-</div>
+            <div data-key="auxiliary_detail_preserved">auxiliary_detail_preserved</div><div>-</div>
+            <div data-key="full_row_level_detail_preserved">full_row_level_detail_preserved</div><div>-</div>
+            <div data-key="omitted_content_count">omitted_content_count</div><div>-</div>
+            <div data-key="needs_manual_review">needs_manual_review</div><div>-</div>
+          </div>
+          <div class="hint" id="difyStrategyNotes"></div>
+          <div id="omittedContentList" class="omitted-list"></div>
+        </section>
+        <section class="card side-card">
+          <h3>报告记忆库状态</h3>
+          <div class="kv" id="reportMemoryStatus">
+            <div data-key="use_report_memory">use_report_memory</div><div>-</div>
+            <div data-key="report_memory_applied">report_memory_applied</div><div>-</div>
+            <div data-key="report_memory_chars">report_memory_chars</div><div>-</div>
+            <div data-key="report_memory_hash">report_memory_hash</div><div>-</div>
+            <div data-key="memory_read_failed">memory_read_failed</div><div>-</div>
+            <div data-key="report_memory_truncated">report_memory_truncated</div><div>-</div>
+          </div>
+          <div class="hint" id="reportMemoryHint"></div>
+        </section>
+        <section class="card side-card">
+          <h3>附件解析状态</h3>
+          <div class="kv" id="attachmentStatus">
+            <div>附件总数</div><div>-</div>
+            <div>核心附件</div><div>-</div>
+            <div>核心已解析</div><div>-</div>
+            <div>核心未解析</div><div>-</div>
+            <div>已解析</div><div>-</div>
+            <div>仅元数据</div><div>-</div>
+            <div>网络不可达</div><div>-</div>
+            <div>认证失败</div><div>-</div>
+            <div>下载失败</div><div>-</div>
+            <div>解析失败/不支持</div><div>-</div>
+            <div>缓存命中</div><div>-</div>
+            <div>短期失败缓存</div><div>-</div>
+            <div>证据包压缩</div><div>-</div>
+            <div>压缩前/后</div><div>-</div>
+            <div>表格摘要字符</div><div>-</div>
+          </div>
+          <div class="hint" id="coreAttachmentNames"></div>
+          <button id="refreshAttachmentsBtn" class="secondary" type="button" disabled>重新解析附件</button>
+        </section>
+        <section class="card side-card">
+          <h3>主辅材料说明</h3>
+          <div class="muted">主材料作为报告主体依据；辅助材料仅用于背景、对比和关联说明；metadata_only/auth_failed 等附件不能作为正文依据。</div>
+          <div class="hint">黄色标注表示系统基于材料作出的分析性表述，非原文直接摘录。</div>
+        </section>
+        <section class="card side-card">
+          <h3>用户反馈修改</h3>
+          <textarea id="feedbackText" placeholder="请输入修改意见，例如：减少复述原文，增加企业影响分析。"></textarea>
+          <div class="quick-actions" id="feedbackQuickActions">
+            <button type="button" data-feedback="写得更详细">写得更详细</button>
+            <button type="button" data-feedback="减少复述原文">减少复述</button>
+            <button type="button" data-feedback="加强价格规则分析">加强价格分析</button>
+            <button type="button" data-feedback="增加企业影响分析">增加企业影响</button>
+            <button type="button" data-feedback="增加历史对比">增加历史对比</button>
+            <button type="button" data-feedback="改得更正式">改得更正式</button>
+          </div>
+          <label class="switch-row"><input id="revisionHighlight" type="checkbox" checked> 修改版继续使用黄色分析标注</label>
+          <button id="submitRevisionBtn" class="primary" type="button" disabled>提交修改</button>
+          <div class="hint" id="revisionStatus">报告生成完成后可提交修改意见。</div>
+        </section>
+        <section class="card side-card">
+          <h3>运行日志 / 节点事件</h3>
+          <div class="log-list" id="runLogs"></div>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <dialog id="diagnosticsDialog">
+    <div class="dialog-head">
+      <span>诊断详情</span>
+      <button type="button" id="closeDialog">关闭</button>
+    </div>
+    <pre id="diagnosticsJson"></pre>
+  </dialog>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const terminalStatuses = new Set(['finished', 'needs_manual_review', 'failed']);
+    const state = {
+      runId: decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || ''),
+      run: null,
+      report: null,
+      diagnostics: null,
+      pollTimer: null,
+      highlightVisible: true,
+    };
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function showToast(message) {
+      const toast = $('toast');
+      toast.textContent = message;
+      toast.classList.add('show');
+      setTimeout(() => toast.classList.remove('show'), 2600);
+    }
+
+    async function readError(response) {
+      try {
+        const data = await response.json();
+        return data?.error?.message || data?.detail || JSON.stringify(data);
+      } catch {
+        return response.statusText || '请求失败';
+      }
+    }
+
+    async function fetchJson(url) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(await readError(response));
+      return response.json();
+    }
+
+    function statusLabel(status) {
+      return {
+        running: '生成中',
+        pending: '等待中',
+        finished: '已完成',
+        needs_manual_review: '需人工确认',
+        failed: '失败',
+      }[status] || status || '-';
+    }
+
+    function statusClass(status) {
+      if (status === 'finished') return 'finished';
+      if (status === 'failed') return 'failed';
+      if (status === 'needs_manual_review') return 'review';
+      return 'running';
+    }
+
+    function qualityLabel(value) {
+      if (value === true) return '通过';
+      if (value === false) return '未通过';
+      return '待质检';
+    }
+
+    function yesNo(value) {
+      if (value === true) return '是';
+      if (value === false) return '否';
+      return '-';
+    }
+
+    function packThreshold(pack, key) {
+      return pack?.strategy_thresholds?.[key] ?? pack?.[key] ?? '-';
+    }
+
+    function strategyStatusClass(pack) {
+      if (pack.needs_manual_review || pack.primary_detail_preserved === false || pack.core_attachment_detail_preserved === false) {
+        return 'warning';
+      }
+      if (pack.compression_applied) return 'compact';
+      return 'normal';
+    }
+
+    function strategyStatusLabel(pack) {
+      if (pack.needs_manual_review) return '建议人工复核';
+      if (pack.primary_detail_preserved === false || pack.core_attachment_detail_preserved === false) return '需关注';
+      if (pack.compression_applied) return '轻度压缩';
+      if (pack.detail_preserved === true) return '正常';
+      return '待诊断';
+    }
+
+    function renderOmittedContent(pack) {
+      const list = pack.omitted_content || [];
+      if (!list.length) {
+        $('omittedContentList').innerHTML = '';
+        return;
+      }
+      $('omittedContentList').innerHTML = list.slice(0, 10).map((item) => {
+        const flags = [];
+        if (item.manual_review) flags.push(['建议人工复核', true]);
+        if (item.affects_primary_detail) flags.push(['影响主材料细节', true]);
+        if (item.affects_core_attachment_detail) flags.push(['影响核心附件细节', true]);
+        if (item.affects_auxiliary_detail) flags.push(['影响辅助材料细节', false]);
+        const flagHtml = flags.length
+          ? `<div class="flag-row">${flags.map(([label, warn]) => `<span class="flag ${warn ? 'warning' : ''}">${escapeHtml(label)}</span>`).join('')}</div>`
+          : '';
+        return `
+          <div class="omitted-item">
+            <div><b>${escapeHtml(item.type || '-')}</b></div>
+            <div class="hint">原因：${escapeHtml(item.reason || '-')}</div>
+            <div class="hint">风险：${escapeHtml(item.risk || '-')}</div>
+            ${flagHtml}
+          </div>
+        `;
+      }).join('');
+    }
+
+    function formatLocalDateTime(value) {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const hasTimezone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(raw);
+      const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+      const date = new Date(hasTimezone ? normalized : `${normalized}Z`);
+      if (Number.isNaN(date.getTime())) return raw;
+      return new Intl.DateTimeFormat(undefined, {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }).format(date);
+    }
+
+
+    function renderMarkdown(markdown) {
+      const lines = String(markdown || '').split(/\r?\n/);
+      let html = '';
+      let listOpen = false;
+      let table = [];
+      const flushList = () => {
+        if (listOpen) {
+          html += '</ul>';
+          listOpen = false;
+        }
+      };
+      const flushTable = () => {
+        if (!table.length) return;
+        html += '<table>';
+        table.forEach((row, index) => {
+          const cells = row.split('|').slice(1, -1).map((cell) => cell.trim());
+          if (cells.every((cell) => /^:?-{3,}:?$/.test(cell))) return;
+          html += '<tr>' + cells.map((cell) => {
+            const tag = index === 0 ? 'th' : 'td';
+            return `<${tag}>${inlineMarkdown(cell)}</${tag}>`;
+          }).join('') + '</tr>';
+        });
+        html += '</table>';
+        table = [];
+      };
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (/^\|.+\|$/.test(trimmed)) {
+          flushList();
+          table.push(trimmed);
+          continue;
+        }
+        flushTable();
+        if (!trimmed) {
+          flushList();
+          continue;
+        }
+        if (trimmed.startsWith('### ')) {
+          flushList();
+          html += `<h3>${inlineMarkdown(trimmed.slice(4))}</h3>`;
+        } else if (trimmed.startsWith('## ')) {
+          flushList();
+          html += `<h2>${inlineMarkdown(trimmed.slice(3))}</h2>`;
+        } else if (trimmed.startsWith('# ')) {
+          flushList();
+          html += `<h1>${inlineMarkdown(trimmed.slice(2))}</h1>`;
+        } else if (/^[-*]\s+/.test(trimmed)) {
+          if (!listOpen) {
+            html += '<ul>';
+            listOpen = true;
+          }
+          html += `<li>${inlineMarkdown(trimmed.replace(/^[-*]\s+/, ''))}</li>`;
+        } else {
+          flushList();
+          html += `<p>${inlineMarkdown(trimmed)}</p>`;
+        }
+      }
+      flushTable();
+      flushList();
+      return html || '<div class="empty">暂无报告正文。</div>';
+    }
+
+    function inlineMarkdown(text) {
+      const placeholders = [];
+      const protectedText = String(text || '').replace(/<span(?:\s+[^>]*)?class=["']analysis-highlight["'][^>]*>(.*?)<\/span>/gis, (_, inner) => {
+        const token = `@@ANALYSIS_HIGHLIGHT_${placeholders.length}@@`;
+        placeholders.push(`<span class="analysis-highlight">${escapeHtml(inner)}</span>`);
+        return token;
+      }).replace(/<span\s+style=["'][^"']*(?:fff3cd|b8860b)[^"']*["'][^>]*>(.*?)<\/span>/gis, (_, inner) => {
+        const token = `@@ANALYSIS_HIGHLIGHT_${placeholders.length}@@`;
+        placeholders.push(`<span class="analysis-highlight">${escapeHtml(inner)}</span>`);
+        return token;
+      });
+      let html = escapeHtml(protectedText)
+        .replace(/&lt;red&gt;(.*?)&lt;\/red&gt;/g, '<span class="red">$1</span>')
+        .replace(/&lt;blue&gt;(.*?)&lt;\/blue&gt;/g, '<span class="blue">$1</span>')
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+      placeholders.forEach((value, index) => {
+        html = html.replace(`@@ANALYSIS_HIGHLIGHT_${index}@@`, value);
+      });
+      return html;
+    }
+
+    function renderProgress(progress) {
+      $('currentStep').textContent = progress?.current_step || '-';
+      const percent = progress?.percent ?? 0;
+      $('percentText').textContent = `${percent}%`;
+      const currentStep = progress?.current_step || '';
+      const isRunning = (state.run?.status || 'running') === 'running';
+      $('progressNote').textContent = isRunning
+        ? '系统正在生成、质检并整理报告，请稍候。'
+        : (currentStep ? `当前步骤：${currentStep}` : '');
+      const steps = progress?.steps || [];
+      $('steps').innerHTML = steps.map((step) => `
+        <div class="step ${escapeHtml(step.status || 'pending')}">
+          <div class="dot">${step.status === 'finished' ? '✓' : step.status === 'failed' ? '!' : step.status === 'skipped' ? '-' : ''}</div>
+          <div class="step-name">${escapeHtml(step.name || step.key || '-')}</div>
+          <div class="step-time">${escapeHtml(step.timestamp ? formatLocalDateTime(step.timestamp) : statusLabel(step.status))}</div>
+        </div>
+      `).join('');
+      $('runLogs').innerHTML = steps.map((step) => `
+        <div class="log-row"><b>${escapeHtml(step.name || step.key || '-')}</b><span>${escapeHtml(step.timestamp ? formatLocalDateTime(step.timestamp) : statusLabel(step.status))}</span></div>
+      `).join('');
+    }
+
+    function renderSummary() {
+      const run = state.run || {};
+      const report = state.report || {};
+      const diag = state.diagnostics?.diagnostics || {};
+      const reportDiag = diag.report || {};
+      const evidence = diag.evidence || {};
+      const status = run.status || 'running';
+      $('statusBadge').className = `badge ${statusClass(status)}`;
+      $('statusBadge').textContent = statusLabel(status);
+      $('statusText').textContent = `${statusLabel(status)} / ${status || '-'}`;
+      $('runIdText').textContent = run.run_id || state.runId || '-';
+      $('packIdText').textContent = run.pack_id || report.pack_id || '-';
+      $('qualityText').textContent = qualityLabel(report.quality_check?.passed ?? run.quality_passed);
+      $('versionText').textContent = report.version || run.version || '-';
+      $('charsText').textContent = reportDiag.report_markdown_chars ? `${reportDiag.report_markdown_chars} 字` : (report.report_markdown ? `${report.report_markdown.length} 字` : '-');
+      $('suggestLengthText').textContent = evidence.suggested_report_length || '-';
+      $('updatedAtText').textContent = run.updated_at ? `报告生成时间：${formatLocalDateTime(run.updated_at)}` : '';
+      $('downloadBtn').disabled = !report.report_markdown;
+      $('copyMarkdownBtn').disabled = !report.report_markdown;
+      $('submitRevisionBtn').disabled = !report.report_markdown;
+      $('downloadBtn').onclick = () => {
+        if (state.runId) location.href = `/analysis/runs/${encodeURIComponent(state.runId)}/download`;
+      };
+    }
+
+    function renderDiagnosis() {
+      const diag = state.diagnostics?.diagnostics;
+      if (!diag) {
+        $('diagnosisSummary').textContent = '诊断加载中...';
+        return;
+      }
+      const items = diag.diagnosis || [];
+      const level = items.some((item) => item.level === 'error') ? 'error' : items.some((item) => item.level === 'warning') ? 'warning' : 'normal';
+      const first = items[0] || { code: 'OK', message: '未发现明显问题。' };
+      const coverage = diag.coverage || {};
+      const qualityGate = diag.quality_gate || {};
+      const missingItems = coverage.missing_items || [];
+      $('diagnosisSummary').innerHTML = `
+        <div class="diag-main ${level === 'normal' ? '' : level}">${escapeHtml(first.code || 'OK')}</div>
+        <div>${escapeHtml(first.message || '')}</div>
+        <div class="hint">可交付状态：${escapeHtml(qualityGate.deliverable_status || '-')} · 原文遵循：${escapeHtml(qualityGate.source_fidelity_score ?? '-')} · 分析深度：${escapeHtml(qualityGate.analysis_depth_score ?? '-')}</div>
+        <div class="hint">覆盖度：${escapeHtml(coverage.coverage_score ?? '-')}% · 缺失项 ${escapeHtml(missingItems.length || 0)} 个</div>
+        ${missingItems.length ? `<div class="hint">缺失：${escapeHtml(missingItems.slice(0, 5).map((item) => item.label).join('、'))}${missingItems.length > 5 ? '等' : ''}</div>` : ''}
+      `;
+      $('evidenceInfo').innerHTML = `
+        <div>主材料正文</div><div>${escapeHtml(diag.evidence?.primary_content_chars ?? '-')} 字</div>
+        <div>主材料附件摘要</div><div>${escapeHtml(diag.evidence?.primary_attachment_summary_chars ?? 0)} 字</div>
+        <div>辅助材料正文</div><div>${escapeHtml(diag.evidence?.auxiliary_content_chars ?? '-')} 字</div>
+        <div>辅助相关片段</div><div>${escapeHtml(diag.evidence?.auxiliary_relevant_snippet_chars ?? 0)} 字</div>
+        <div>辅助附件摘要</div><div>${escapeHtml(diag.evidence?.auxiliary_attachment_summary_chars ?? 0)} 字</div>
+        <div>原始可用文本总量</div><div>${escapeHtml(diag.evidence?.raw_total_content_chars ?? '-')} 字</div>
+        <div>Dify 精简包</div><div>${escapeHtml(diag.evidence?.dify_compact_pack_chars ?? '-')} 字</div>
+        <div>加权证据量</div><div>${escapeHtml(diag.evidence?.weighted_evidence_chars ?? '-')} 字</div>
+        <div>证据包信息量</div><div>${escapeHtml(diag.evidence?.estimated_evidence_level || '-')}</div>
+        <div>建议报告长度</div><div>${escapeHtml(diag.evidence?.suggested_report_length || '-')}</div>
+        <div>可交付状态</div><div>${escapeHtml(qualityGate.deliverable_status || '-')}</div>
+        <div>原文遵循评分</div><div>${escapeHtml(qualityGate.source_fidelity_score ?? '-')}</div>
+        <div>未支撑硬事实</div><div>${escapeHtml(qualityGate.unsupported_fact_count ?? '-')}</div>
+        <div>分析深度评分</div><div>${escapeHtml(qualityGate.analysis_depth_score ?? '-')}</div>
+        <div>有依据分析句</div><div>${escapeHtml(qualityGate.evidence_backed_analysis_count ?? '-')}</div>
+        <div>摘要化风险</div><div>${qualityGate.summary_only_risk ? '是' : '否'}</div>
+        <div>报告覆盖率</div><div>${escapeHtml(coverage.coverage_score ?? '-')}%</div>
+        <div>缺失覆盖项</div><div>${escapeHtml(missingItems.map((item) => item.label).slice(0, 4).join('、') || '无')}</div>
+        <div>统计说明</div><div>建议报告长度根据主材料正文、附件摘要、辅助材料相关片段等加权估算。未解析附件和低相关辅助材料不会作为主要依据。</div>
+      `;
+      const memory = diag.report_memory || {};
+      $('reportMemoryStatus').innerHTML = `
+        <div data-key="use_report_memory">use_report_memory</div><div>${escapeHtml(yesNo(memory.requested))}</div>
+        <div data-key="report_memory_applied">report_memory_applied</div><div>${escapeHtml(yesNo(memory.applied))}</div>
+        <div data-key="report_memory_chars">report_memory_chars</div><div>${escapeHtml(memory.chars ?? 0)}</div>
+        <div data-key="report_memory_hash">report_memory_hash</div><div>${escapeHtml(memory.hash_prefix || '-')}</div>
+        <div data-key="memory_read_failed">memory_read_failed</div><div>${escapeHtml(yesNo(memory.read_failed))}</div>
+        <div data-key="report_memory_truncated">report_memory_truncated</div><div>${escapeHtml(yesNo(memory.truncated))}</div>
+      `;
+      $('reportMemoryHint').textContent = memory.read_failed
+        ? '报告记忆库读取失败，本次报告已按未使用记忆库继续生成。'
+        : (memory.truncated ? '报告记忆库超过长度限制，本次已截断后使用。' : '');
+      const pack = state.packDiagnostics || {};
+      const finalInputChars = pack.final_dify_input_chars ?? pack.compact_pack_chars ?? pack.dify_compact_pack_chars ?? '-';
+      const statusClassName = strategyStatusClass(pack);
+      $('difyStrategyInfo').innerHTML = `
+        <div data-key="input_strategy">输入策略 / input_strategy</div><div>${escapeHtml(pack.input_strategy || '-')} <span class="strategy-status ${statusClassName}">${escapeHtml(strategyStatusLabel(pack))}</span></div>
+        <div data-key="input_strategy_type">策略类型 / input_strategy_type</div><div>${escapeHtml(pack.input_strategy_type || '-')}</div>
+        <div data-key="input_strategy_description">策略说明 / input_strategy_description</div><div>${escapeHtml(pack.input_strategy_description || '-')}</div>
+        <div data-key="strategy_basis">策略依据 / strategy_basis</div><div>${escapeHtml(pack.strategy_basis || '-')}</div>
+        <div data-key="original_pack_chars">原始证据包字符 / original_pack_chars</div><div>${escapeHtml(pack.original_pack_chars ?? '-')} 字</div>
+        <div data-key="strategy_basis_chars">策略判断字符 / strategy_basis_chars</div><div>${escapeHtml(pack.strategy_basis_chars ?? '-')} 字</div>
+        <div data-key="final_dify_input_chars">最终 Dify 输入 / final_dify_input_chars</div><div>${escapeHtml(finalInputChars)} / ${escapeHtml(packThreshold(pack, 'hard_limit_chars'))} 字</div>
+        <div data-key="hard_limit_chars">硬上限 / hard_limit_chars</div><div>${escapeHtml(packThreshold(pack, 'hard_limit_chars'))} 字</div>
+        <div data-key="full_input_max_chars">full_input 阈值 / full_input_max_chars</div><div>${escapeHtml(packThreshold(pack, 'full_input_max_chars'))} 字</div>
+        <div data-key="safe_compact_max_chars">safe_compact 阈值 / safe_compact_max_chars</div><div>${escapeHtml(packThreshold(pack, 'safe_compact_max_chars'))} 字</div>
+        <div data-key="compression_ratio">压缩比例 / compression_ratio</div><div>${escapeHtml(pack.compression_ratio ?? '-')}</div>
+        <div data-key="compression_applied">实际压缩 / compression_applied</div><div>${escapeHtml(yesNo(pack.compression_applied))}</div>
+        <div data-key="detail_preserved">核心细节完整 / detail_preserved</div><div>${escapeHtml(yesNo(pack.detail_preserved))}</div>
+        <div data-key="primary_detail_preserved">主材料细节完整 / primary_detail_preserved</div><div>${escapeHtml(yesNo(pack.primary_detail_preserved))}</div>
+        <div data-key="core_attachment_detail_preserved">核心附件细节完整 / core_attachment_detail_preserved</div><div>${escapeHtml(yesNo(pack.core_attachment_detail_preserved))}</div>
+        <div data-key="auxiliary_detail_preserved">辅助材料细节完整 / auxiliary_detail_preserved</div><div>${escapeHtml(yesNo(pack.auxiliary_detail_preserved))}</div>
+        <div data-key="full_row_level_detail_preserved">全量行级明细 / full_row_level_detail_preserved</div><div>${escapeHtml(yesNo(pack.full_row_level_detail_preserved))}</div>
+        <div data-key="omitted_content_count">省略内容数量 / omitted_content_count</div><div>${escapeHtml(pack.omitted_content_count ?? 0)}</div>
+        <div data-key="needs_manual_review">建议人工复核 / needs_manual_review</div><div>${escapeHtml(yesNo(pack.needs_manual_review))}</div>
+      `;
+      $('difyStrategyNotes').innerHTML = `
+        input_strategy 表示策略选择依据，不等同于实际压缩；compression_applied 表示是否发生截断、省略、移除或降级。
+        attachment_led 表示正文较短但核心信息在附件中，不代表一定压缩；table_heavy 会保留结构、统计摘要和样例值，不输入全量行。
+        strategy_basis_chars 通常不包含重复二级证据；final_dify_input_chars 是实际传入 Dify 的 compact JSON 大小。
+      `;
+      renderOmittedContent(pack);
+      const total = pack.attachment_count ?? 0;
+      const parsed = pack.parsed_attachment_count ?? 0;
+      const coreTotal = pack.core_attachment_count ?? 0;
+      const coreParsed = pack.core_attachment_parsed_count ?? 0;
+      const coreUnparsed = pack.core_attachment_unparsed_count ?? 0;
+      const metadataOnly = pack.metadata_only_attachment_count ?? 0;
+      const networkUnreachable = pack.network_unreachable_attachment_count ?? 0;
+      const authFailed = pack.auth_failed_attachment_count ?? 0;
+      const downloadFailed = pack.download_failed_attachment_count ?? 0;
+      const parseFailed = pack.parse_failed_attachment_count ?? 0;
+      const cacheHit = pack.cache_hit_success_count ?? 0;
+      const cacheFailure = pack.cache_hit_failure_short_count ?? 0;
+      const compressed = pack.compression_applied ? '已压缩' : '未压缩';
+      const beforeAfter = `${pack.original_pack_chars ?? '-'} / ${pack.compact_pack_chars ?? pack.dify_compact_pack_chars ?? '-'}`;
+      $('attachmentStatus').innerHTML = `
+        <div>附件总数</div><div>${escapeHtml(total)}</div>
+        <div>核心附件</div><div>${escapeHtml(coreTotal)}</div>
+        <div>核心已解析</div><div>${escapeHtml(coreParsed)}</div>
+        <div>核心未解析</div><div>${escapeHtml(coreUnparsed)}</div>
+        <div>已解析</div><div>${escapeHtml(parsed)}</div>
+        <div>仅元数据</div><div>${escapeHtml(metadataOnly)}</div>
+        <div>网络不可达</div><div>${escapeHtml(networkUnreachable)}</div>
+        <div>认证失败</div><div>${escapeHtml(authFailed)}</div>
+        <div>下载失败</div><div>${escapeHtml(downloadFailed)}</div>
+        <div>解析失败/不支持</div><div>${escapeHtml(parseFailed)}</div>
+        <div>缓存命中</div><div>${escapeHtml(cacheHit)}</div>
+        <div>短期失败缓存</div><div>${escapeHtml(cacheFailure)}</div>
+        <div>证据包压缩</div><div>${escapeHtml(compressed)}</div>
+        <div>压缩前/后</div><div>${escapeHtml(beforeAfter)} 字</div>
+        <div>表格摘要字符</div><div>${escapeHtml((diag.evidence?.primary_attachment_table_summary_chars || 0) + (diag.evidence?.auxiliary_attachment_table_summary_chars || 0))} 字</div>
+      `;
+      const coreNames = pack.core_attachment_unparsed_names || [];
+      $('coreAttachmentNames').textContent = coreNames.length
+        ? `未解析核心附件：${coreNames.join('、')}。相关产品、企业、价格和中选结果分析需保守处理。`
+        : '核心附件解析状态正常或当前无核心附件。';
+      $('refreshAttachmentsBtn').disabled = !(pack.primary_materials || []).length;
+    }
+
+    function renderReport() {
+      const run = state.run || {};
+      if (run.status === 'failed') {
+        $('reportBody').innerHTML = `<div class="empty">生成失败：${escapeHtml(run.error_message || run.error_detail || '未知错误')}</div>`;
+        return;
+      }
+      if (!state.report?.report_markdown) {
+        $('reportBody').innerHTML = '<div class="empty">报告生成中，页面会自动刷新状态。</div>';
+        return;
+      }
+      const title = state.report.report_title || run.report_title || '分析报告';
+      $('reportBody').innerHTML = `<h1>${escapeHtml(title)}</h1>${renderMarkdown(state.report.report_markdown)}`;
+      $('revisionStatus').textContent = `当前版本：${state.report.version || run.version || '-'}；${run.user_feedback_modified ? '已根据用户反馈修改' : '尚未进行用户反馈修改'}`;
+    }
+
+    async function copyText(text, label) {
+      if (!text) {
+        showToast(`暂无可复制的 ${label}`);
+        return;
+      }
+      await navigator.clipboard.writeText(text);
+      showToast(`${label} 已复制`);
+    }
+
+    async function loadRun() {
+      try {
+        state.run = await fetchJson(`/analysis/runs/${encodeURIComponent(state.runId)}`);
+        renderProgress(state.run.progress);
+        renderSummary();
+        if (terminalStatuses.has(state.run.status)) {
+          if (state.pollTimer) clearInterval(state.pollTimer);
+          if (state.run.status !== 'failed') {
+            try {
+              state.report = await fetchJson(`/analysis/runs/${encodeURIComponent(state.runId)}/report`);
+            } catch (error) {
+              showToast(`报告读取失败：${error.message}`);
+            }
+          }
+          await loadDiagnostics();
+        }
+        renderSummary();
+        renderReport();
+      } catch (error) {
+        $('reportBody').innerHTML = `<div class="empty">读取运行状态失败：${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    async function loadDiagnostics() {
+      try {
+        state.diagnostics = await fetchJson(`/analysis/runs/${encodeURIComponent(state.runId)}/diagnostics`);
+        if (state.diagnostics?.pack_id) {
+          const packDiag = await fetchJson(`/analysis/packs/${encodeURIComponent(state.diagnostics.pack_id)}/diagnostics`);
+          state.packDiagnostics = packDiag.diagnostics;
+        }
+      } catch (error) {
+        state.diagnostics = { diagnostics: { diagnosis: [{ code: 'DIAGNOSTICS_FAILED', level: 'warning', message: error.message }] } };
+      }
+      renderDiagnosis();
+    }
+
+    document.querySelectorAll('[data-copy]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const type = button.dataset.copy;
+        copyText(type === 'run' ? (state.run?.run_id || state.runId) : state.run?.pack_id, type === 'run' ? 'run_id' : 'pack_id');
+      });
+    });
+    $('copyMarkdownBtn').addEventListener('click', () => copyText(state.report?.report_markdown || '', 'Markdown'));
+    $('toggleHighlightBtn').addEventListener('click', () => {
+      state.highlightVisible = !state.highlightVisible;
+      document.body.classList.toggle('hide-analysis-highlight', !state.highlightVisible);
+      $('toggleHighlightBtn').textContent = state.highlightVisible ? '隐藏标注' : '显示标注';
+    });
+    $('feedbackQuickActions').addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-feedback]');
+      if (!button) return;
+      const current = $('feedbackText').value.trim();
+      $('feedbackText').value = current ? `${current}；${button.dataset.feedback}` : button.dataset.feedback;
+    });
+    $('submitRevisionBtn').addEventListener('click', async () => {
+      const feedback = $('feedbackText').value.trim();
+      if (!feedback) {
+        showToast('请先输入修改意见');
+        return;
+      }
+      $('submitRevisionBtn').disabled = true;
+      $('revisionStatus').textContent = '正在提交修改...';
+      try {
+        const response = await fetch(`/analysis/runs/${encodeURIComponent(state.runId)}/revise`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ feedback, mode: 'user_feedback', analysis_highlight: $('revisionHighlight').checked }),
+        });
+        if (!response.ok) throw new Error(await readError(response));
+        const data = await response.json();
+        state.report = {
+          success: true,
+          run_id: data.run_id,
+          pack_id: data.pack_id,
+          report_title: data.report_title,
+          report_markdown: data.report_markdown,
+          quality_check: data.quality_check || {},
+          version: data.version,
+          warnings: data.warnings || [],
+          remaining_issues: [],
+        };
+        state.run = await fetchJson(`/analysis/runs/${encodeURIComponent(state.runId)}`);
+        renderSummary();
+        renderReport();
+        $('revisionStatus').textContent = `修改完成，当前版本：${data.version}`;
+        showToast('报告已按反馈生成新版');
+      } catch (error) {
+        $('revisionStatus').textContent = `修改失败：${error.message}`;
+        showToast(`修改失败：${error.message}`);
+      } finally {
+        $('submitRevisionBtn').disabled = !state.report?.report_markdown;
+      }
+    });
+    $('diagnosticsBtn').addEventListener('click', () => {
+      $('diagnosticsJson').textContent = JSON.stringify(state.diagnostics || {}, null, 2);
+      $('diagnosticsDialog').showModal();
+    });
+    $('closeDialog').addEventListener('click', () => $('diagnosticsDialog').close());
+    $('refreshAttachmentsBtn').addEventListener('click', async () => {
+      const pack = state.packDiagnostics || {};
+      const primary = (pack.primary_materials || []).map((item) => ({ menu_code: item.menu_code, articleid: item.articleid }));
+      const auxiliary = (pack.auxiliary_materials || []).map((item) => ({ menu_code: item.menu_code, articleid: item.articleid }));
+      if (!primary.length) {
+        showToast('当前诊断中没有可重新解析的主材料');
+        return;
+      }
+      $('refreshAttachmentsBtn').disabled = true;
+      $('refreshAttachmentsBtn').textContent = '重新解析中...';
+      try {
+        const response = await fetch('/analysis/prepare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            primary_materials: primary,
+            auxiliary_materials: auxiliary,
+            force_refresh_attachments: true,
+          }),
+        });
+        if (!response.ok) throw new Error(await readError(response));
+        const data = await response.json();
+        showToast(`附件已重新解析并生成新 pack_id：${data.pack_id}`);
+      } catch (error) {
+        showToast(`重新解析失败：${error.message}`);
+      } finally {
+        $('refreshAttachmentsBtn').textContent = '重新解析附件';
+        $('refreshAttachmentsBtn').disabled = false;
+      }
+    });
+
+    if (!state.runId) {
+      $('reportBody').innerHTML = '<div class="empty">缺少 run_id。</div>';
+    } else {
+      $('runIdText').textContent = state.runId;
+      loadRun();
+      state.pollTimer = setInterval(() => {
+        if (!state.run || !terminalStatuses.has(state.run.status)) loadRun();
+      }, 2000);
+    }
+  </script>
+</body>
+</html>
