@@ -1,0 +1,2 @@
+"""Report generation provider abstractions."""
+

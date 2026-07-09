@@ -44,6 +44,10 @@ from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
 from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
+from app.generation.base import ReportGenerationResult, ReportGenerator
+from app.generation.dify_generator import DifyReportGenerator
+from app.quality_gate import QualityGate
+from app.repair_pipeline import RepairPipeline, StructureRepairer
 from app.report_memory import (
     MemoryContentError,
     MemoryKind,
@@ -393,6 +397,7 @@ class AnalysisRunResponse(BaseModel):
     status: str
     run_status: str = "running"
     workflow_run_id: str = ""
+    provider_run_id: str = ""
     report_title: str = ""
     quality_passed: bool | None = None
     version: int = 1
@@ -2773,6 +2778,7 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
             "manual_review_reason_summary": reason_summary,
             "final_blocking_reason": final_blocking_reason,
             "provider": str(normalized.get("provider") or "dify").strip() or "dify",
+            "provider_run_id": str(normalized.get("provider_run_id") or normalized.get("workflow_run_id") or "").strip(),
             "generator_version": str(normalized.get("generator_version") or "").strip(),
             "prompt_version": str(normalized.get("prompt_version") or "").strip(),
             "workflow_version": str(normalized.get("workflow_version") or "").strip(),
@@ -3211,46 +3217,8 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
 
 
 def _apply_local_quality_gate_to_dify_result(result: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
-    gated = dict(result)
-    diagnostics = build_run_diagnostics(gated, pack, _compact_evidence_pack_for_dify(pack))
-    quality_gate = diagnostics.get("quality_gate") if isinstance(diagnostics.get("quality_gate"), dict) else {}
-    gated["quality_gate"] = quality_gate
-    if quality_gate.get("deliverable_status") != "needs_manual_review":
-        return gated
-
-    issue = {
-        "issue_id": "Q_LOCAL_QUALITY_GATE",
-        "severity": "high",
-        "problem_type": "local_quality_gate",
-        "report_text": "",
-        "source_basis": "evidence_pack",
-        "fix_instruction": "本地质量门禁发现原文遵循、核心覆盖或分析深度问题，报告需人工复核后再交付。",
-        "quality_gate": quality_gate,
-    }
-    quality_check = gated.get("quality_check") if isinstance(gated.get("quality_check"), dict) else {"passed": None, "issues": []}
-    issues = list(quality_check.get("issues") or []) if isinstance(quality_check.get("issues"), list) else []
-    if not any(isinstance(item, dict) and item.get("issue_id") == issue["issue_id"] for item in issues):
-        issues.append(issue)
-    quality_check = dict(quality_check)
-    quality_check["passed"] = False
-    quality_check["issues"] = issues
-    remaining_issues = list(gated.get("remaining_issues") or [])
-    if not any(isinstance(item, dict) and item.get("issue_id") == issue["issue_id"] for item in remaining_issues):
-        remaining_issues.append(issue)
-    warnings = list(gated.get("warnings") or gated.get("generation_warnings") or [])
-    warning = "报告未通过原文遵循或分析深度门禁，已标记为需人工复核。"
-    if warning not in warnings:
-        warnings.append(warning)
-    gated.update(
-        {
-            "status": "needs_manual_review",
-            "quality_check": quality_check,
-            "remaining_issues": remaining_issues,
-            "warnings": warnings,
-            "generation_warnings": warnings,
-        }
-    )
-    return gated
+    generation_result = ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify"))
+    return QualityGate().run(generation_result, pack).to_legacy_result()
 
 
 def _fallback_result_from_dify_error(
@@ -3454,6 +3422,33 @@ def _call_dify_workflow(
         elapsed_ms,
     )
     return result
+
+
+def _configured_report_generator() -> ReportGenerator:
+    provider = (os.getenv("REPORT_GENERATOR") or "dify").strip().lower() or "dify"
+    native_shadow = _env_bool("NATIVE_GENERATOR_SHADOW", False)
+    dify_fallback = _env_bool("DIFY_GENERATOR_FALLBACK", False)
+    if provider != "dify":
+        logger.error(
+            "report_generator_provider_not_supported provider=%s native_shadow=%s dify_fallback=%s",
+            provider,
+            native_shadow,
+            dify_fallback,
+        )
+        raise DifyWorkflowError(
+            "REPORT_GENERATOR_NOT_SUPPORTED",
+            "Report generator provider is not enabled in P0.2",
+            f"provider={provider}",
+            status_code=500,
+        )
+    if native_shadow or dify_fallback:
+        logger.info(
+            "report_generator_flags_observed_but_inactive provider=%s native_shadow=%s dify_fallback=%s",
+            provider,
+            native_shadow,
+            dify_fallback,
+        )
+    return DifyReportGenerator(_call_dify_workflow)
 
 
 def _make_revision_id(run_id: str) -> str:
@@ -4480,21 +4475,23 @@ def _execute_analysis_run_background(
         watchdog.daemon = True
         watchdog.start()
     try:
-        try:
-            result = _call_dify_workflow(
-                pack_id,
-                run_id,
-                pack_for_policy,
-                report_memory_snapshot,
-                use_report_memory=use_report_memory,
-            )
-        except TypeError as exc:
-            if "positional" not in str(exc) and "argument" not in str(exc):
-                raise
-            result = _call_dify_workflow(pack_id, run_id, pack_for_policy)
+        generator = _configured_report_generator()
+        generation_result = generator.generate(
+            pack_id,
+            run_id,
+            pack_for_policy,
+            report_memory_snapshot,
+            use_report_memory=use_report_memory,
+        )
+        result = generation_result.to_legacy_result()
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            result = _repair_unusable_dify_result(result, pack)
+            repaired_result = RepairPipeline(
+                repairers=[
+                    StructureRepairer(_repair_unusable_dify_result),
+                ]
+            ).run(ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify")), pack)
+            result = repaired_result.to_legacy_result()
             result = _apply_local_quality_gate_to_dify_result(result, pack)
         except Exception as repair_exc:  # noqa: BLE001
             logger.warning(
@@ -4652,6 +4649,7 @@ def run_analysis(req: AnalysisRunRequest):
         status="running",
         run_status=str(record.get("run_status") or "running"),
         workflow_run_id=str(record.get("workflow_run_id") or ""),
+        provider_run_id=str(record.get("provider_run_id") or ""),
         report_title=str(record.get("report_title") or ""),
         quality_passed=(record.get("quality_check") or {}).get("passed") if isinstance(record.get("quality_check"), dict) else None,
         version=int(record.get("version") or 1),
