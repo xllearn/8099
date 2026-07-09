@@ -391,11 +391,37 @@ class AnalysisRunResponse(BaseModel):
     run_id: str
     pack_id: str
     status: str
+    run_status: str = "running"
     workflow_run_id: str = ""
     report_title: str = ""
     quality_passed: bool | None = None
     version: int = 1
     warnings: list[str] = Field(default_factory=list)
+    deliverable: bool = False
+    draft_word_export_available: bool = False
+    final_word_export_available: bool = False
+    word_export_available: bool = False
+    needs_manual_review: bool = False
+    primary_failure_code: str = ""
+    secondary_failure_codes: list[str] = Field(default_factory=list)
+    quality_failure_codes: list[str] = Field(default_factory=list)
+    generation_failure_codes: list[str] = Field(default_factory=list)
+    blocking_issue_codes: list[str] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    fallback_provider: str = ""
+    repair_attempted: bool = False
+    repair_success: bool = False
+    repair_actions: list[Any] = Field(default_factory=list)
+    manual_review_reason_summary: str = ""
+    final_blocking_reason: str = ""
+    provider: str = "dify"
+    generator_version: str = ""
+    prompt_version: str = ""
+    workflow_version: str = ""
+    compact_pack_chars: int = 0
+    input_strategy: str = ""
+    timings: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalysisRunReportResponse(BaseModel):
@@ -2463,7 +2489,311 @@ def _make_analysis_run_id(pack_id: str) -> str:
     return f"run_{datetime.now().strftime('%Y%m%d')}_{digest}"
 
 
+RUN_STATE_MACHINE_STATUSES = {
+    "created",
+    "preparing",
+    "running",
+    "generating",
+    "generated",
+    "local_quality_checking",
+    "repairing",
+    "fallback_generating",
+    "export_checking",
+    "finished",
+    "needs_manual_review",
+    "failed",
+    "interrupted",
+}
+
+RUN_TERMINAL_STATUSES = {"finished", "needs_manual_review", "failed", "interrupted"}
+
+RUN_P0_FAILURE_CODES = {
+    "UNSUPPORTED_FACT",
+    "SUMMARY_ONLY_REPORT",
+    "REPORT_TOO_SHORT",
+    "REPORT_STRUCTURE_TOO_THIN",
+    "DIFY_OUTPUT_EMPTY",
+    "GENERATION_JSON_PARSE_FAILED",
+    "DIFY_FRAGMENTARY_REPORT",
+    "DIFY_TIMEOUT",
+    "LOCAL_QUALITY_GATE_FAILED",
+    "MODEL_QA_BLOCKED",
+    "FALLBACK_REPORT_USED",
+    "FORBIDDEN_PHRASE_IN_REPORT",
+    "EXPORT_GATE_BLOCKED",
+    "AUTO_REPAIR_FAILED",
+    "AUTO_REPAIR_PARTIAL",
+}
+
+RUN_FAILURE_PRIORITY = [
+    "DIFY_TIMEOUT",
+    "DIFY_FRAGMENTARY_REPORT",
+    "GENERATION_JSON_PARSE_FAILED",
+    "DIFY_OUTPUT_EMPTY",
+    "UNSUPPORTED_FACT",
+    "SUMMARY_ONLY_REPORT",
+    "REPORT_TOO_SHORT",
+    "REPORT_STRUCTURE_TOO_THIN",
+    "FORBIDDEN_PHRASE_IN_REPORT",
+    "LOCAL_QUALITY_GATE_FAILED",
+    "MODEL_QA_BLOCKED",
+    "FALLBACK_REPORT_USED",
+    "EXPORT_GATE_BLOCKED",
+    "AUTO_REPAIR_FAILED",
+    "AUTO_REPAIR_PARTIAL",
+]
+
+RUN_DEFAULT_TIMINGS = {
+    "generation_ms": 0,
+    "local_quality_gate_ms": 0,
+    "repair_ms": 0,
+    "export_check_ms": 0,
+}
+
+RUN_QUALITY_BLOCKING_CODE_MAP = {
+    "UNSUPPORTED_FACT": "UNSUPPORTED_FACT",
+    "SUMMARY_ONLY_REPORT": "SUMMARY_ONLY_REPORT",
+    "REPORT_TOO_SHORT": "REPORT_TOO_SHORT",
+    "REPORT_TOO_SHORT_FOR_WEIGHTED_EVIDENCE": "REPORT_TOO_SHORT",
+    "REPORT_MISSING_CORE_COVERAGE": "REPORT_STRUCTURE_TOO_THIN",
+    "MISSING_CORE_COVERAGE": "REPORT_STRUCTURE_TOO_THIN",
+    "REPORT_STRUCTURE_TOO_THIN": "REPORT_STRUCTURE_TOO_THIN",
+    "TECHNICAL_NOTE_IN_REPORT_BODY": "FORBIDDEN_PHRASE_IN_REPORT",
+    "FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
+    "QUALITY_CHECK_BLOCKED": "LOCAL_QUALITY_GATE_FAILED",
+    "LOCAL_QUALITY_GATE_FAILED": "LOCAL_QUALITY_GATE_FAILED",
+}
+
+RUN_ISSUE_ID_CODE_MAP = {
+    "Q_LOCAL_QUALITY_GATE": "LOCAL_QUALITY_GATE_FAILED",
+    "Q_DIFY_CALL_FAILED_FALLBACK": "FALLBACK_REPORT_USED",
+    "Q_DIFY_FRAGMENTARY_REPORT": "DIFY_FRAGMENTARY_REPORT",
+    "Q_FORBIDDEN_PHRASE": "FORBIDDEN_PHRASE_IN_REPORT",
+    "Q_FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
+    "Q_AUTO_REPAIR_FAILED": "AUTO_REPAIR_FAILED",
+    "Q_AUTO_REPAIR_PARTIAL": "AUTO_REPAIR_PARTIAL",
+}
+
+RUN_DIFY_ERROR_CODE_MAP = {
+    "DIFY_TIMEOUT": "DIFY_TIMEOUT",
+    "DIFY_INVALID_RESPONSE": "GENERATION_JSON_PARSE_FAILED",
+    "DIFY_OUTPUT_EMPTY": "DIFY_OUTPUT_EMPTY",
+    "DIFY_FRAGMENTARY_REPORT": "DIFY_FRAGMENTARY_REPORT",
+    "GENERATION_JSON_PARSE_FAILED": "GENERATION_JSON_PARSE_FAILED",
+}
+
+RUN_FAILURE_REASON_LABELS = {
+    "UNSUPPORTED_FACT": "报告存在未被 evidence_pack 支撑的事实表述。",
+    "SUMMARY_ONLY_REPORT": "报告偏摘要化，分析深度未达到自动交付条件。",
+    "REPORT_TOO_SHORT": "报告正文过短，未达到自动交付条件。",
+    "REPORT_STRUCTURE_TOO_THIN": "报告结构或核心覆盖不足，未达到自动交付条件。",
+    "DIFY_OUTPUT_EMPTY": "生成链路未返回可用正文。",
+    "GENERATION_JSON_PARSE_FAILED": "生成结果解析失败。",
+    "DIFY_FRAGMENTARY_REPORT": "Dify 返回内容片段化，已转入保守处理。",
+    "DIFY_TIMEOUT": "Dify 工作流调用超时。",
+    "LOCAL_QUALITY_GATE_FAILED": "本地质量门禁未通过。",
+    "MODEL_QA_BLOCKED": "模型或工作流异常导致未达到自动交付条件。",
+    "FALLBACK_REPORT_USED": "已启用后端保守兜底报告。",
+    "FORBIDDEN_PHRASE_IN_REPORT": "正式报告命中禁止表达。",
+    "EXPORT_GATE_BLOCKED": "导出门禁阻止最终 Word 交付。",
+    "AUTO_REPAIR_FAILED": "自动修复未成功。",
+    "AUTO_REPAIR_PARTIAL": "自动修复仅部分成功。",
+}
+
+
+def _dedupe_strings(values: list[Any] | tuple[Any, ...] | set[Any] | None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
+
+
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def _normalize_run_timings(value: Any) -> dict[str, int]:
+    timings = dict(RUN_DEFAULT_TIMINGS)
+    if isinstance(value, dict):
+        for key, raw in value.items():
+            text_key = str(key or "").strip()
+            if not text_key:
+                continue
+            timings[text_key] = max(0, _safe_int_value(raw, 0))
+    return timings
+
+
+def _extract_issue_codes(items: Any) -> list[str]:
+    codes: list[str] = []
+    if not isinstance(items, list):
+        return codes
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        issue_id = str(item.get("issue_id") or "").strip()
+        problem_type = str(item.get("problem_type") or "").strip()
+        code = str(item.get("code") or "").strip()
+        mapped = RUN_ISSUE_ID_CODE_MAP.get(issue_id) or RUN_DIFY_ERROR_CODE_MAP.get(problem_type) or RUN_QUALITY_BLOCKING_CODE_MAP.get(code)
+        if mapped:
+            codes.append(mapped)
+    return _dedupe_strings(codes)
+
+
+def _extract_quality_gate_codes(quality_gate: Any) -> list[str]:
+    if not isinstance(quality_gate, dict):
+        return []
+    codes: list[str] = []
+    raw_codes = quality_gate.get("blocking_issue_codes")
+    if isinstance(raw_codes, list):
+        codes.extend(str(item or "").strip() for item in raw_codes)
+    blocking_issues = quality_gate.get("blocking_issues")
+    if isinstance(blocking_issues, list):
+        for item in blocking_issues:
+            if isinstance(item, dict):
+                codes.append(str(item.get("code") or "").strip())
+    mapped = [RUN_QUALITY_BLOCKING_CODE_MAP.get(code, code) for code in codes if code]
+    if bool(quality_gate.get("summary_only_risk")):
+        mapped.append("SUMMARY_ONLY_REPORT")
+    if _safe_int_value(quality_gate.get("unsupported_fact_count"), 0) > 0:
+        mapped.append("UNSUPPORTED_FACT")
+    return _dedupe_strings(mapped)
+
+
+def _is_explicitly_deliverable(record: dict[str, Any], run_status: str, report_markdown: str) -> bool:
+    quality_gate = record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {}
+    quality_check = record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {}
+    gate_status = str(quality_gate.get("deliverable_status") or "").strip()
+    if run_status != "finished" or not report_markdown:
+        return False
+    if gate_status:
+        return gate_status == "deliverable"
+    return quality_check.get("passed") is True
+
+
+def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    raw_status = str(normalized.get("status") or normalized.get("run_status") or "created").strip() or "created"
+    if raw_status not in RUN_STATE_MACHINE_STATUSES:
+        raw_status = "failed" if normalized.get("success") is False else "running"
+    normalized["run_status"] = raw_status
+    normalized["status"] = raw_status
+
+    report_markdown = str(normalized.get("report_markdown") or "").strip()
+    quality_check = normalized.get("quality_check") if isinstance(normalized.get("quality_check"), dict) else {"passed": None, "issues": []}
+    quality_gate = normalized.get("quality_gate") if isinstance(normalized.get("quality_gate"), dict) else {}
+    remaining_issues = normalized.get("remaining_issues") if isinstance(normalized.get("remaining_issues"), list) else []
+    quality_issues = quality_check.get("issues") if isinstance(quality_check.get("issues"), list) else []
+
+    quality_failure_codes = _dedupe_strings(
+        [
+            *list(normalized.get("quality_failure_codes") or []),
+            *_extract_quality_gate_codes(quality_gate),
+            *_extract_issue_codes(quality_issues),
+            *_extract_issue_codes(remaining_issues),
+        ]
+    )
+    if raw_status in RUN_TERMINAL_STATUSES and quality_check.get("passed") is False and not quality_failure_codes:
+        quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
+    if quality_gate.get("deliverable_status") == "needs_manual_review" and not quality_failure_codes:
+        quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
+
+    generation_failure_codes = _dedupe_strings(list(normalized.get("generation_failure_codes") or []))
+    dify_error_code = str(normalized.get("dify_error_code") or "").strip()
+    if dify_error_code:
+        generation_failure_codes.append(RUN_DIFY_ERROR_CODE_MAP.get(dify_error_code, "MODEL_QA_BLOCKED"))
+    generation_failure_codes.extend(code for code in _extract_issue_codes(remaining_issues) if code in {"DIFY_TIMEOUT", "DIFY_FRAGMENTARY_REPORT", "GENERATION_JSON_PARSE_FAILED", "DIFY_OUTPUT_EMPTY", "FALLBACK_REPORT_USED"})
+    if raw_status in {"failed", "needs_manual_review"} and not report_markdown and "DIFY_OUTPUT_EMPTY" not in generation_failure_codes:
+        generation_failure_codes.append("DIFY_OUTPUT_EMPTY")
+    generation_failure_codes = _dedupe_strings(generation_failure_codes)
+
+    fallback_used = bool(normalized.get("fallback_used"))
+    if dify_error_code or "FALLBACK_REPORT_USED" in generation_failure_codes or "DIFY_FRAGMENTARY_REPORT" in generation_failure_codes:
+        fallback_used = True
+    if any(isinstance(item, dict) and item.get("issue_id") in {"Q_DIFY_CALL_FAILED_FALLBACK", "Q_DIFY_FRAGMENTARY_REPORT"} for item in remaining_issues):
+        fallback_used = True
+
+    deliverable = _is_explicitly_deliverable(normalized, raw_status, report_markdown)
+    word_export_available = bool(report_markdown)
+    final_word_export_available = bool(word_export_available and deliverable)
+    draft_word_export_available = bool(word_export_available and not final_word_export_available)
+    needs_manual_review = bool(raw_status == "needs_manual_review" or quality_gate.get("deliverable_status") == "needs_manual_review")
+
+    all_codes = _dedupe_strings([*generation_failure_codes, *quality_failure_codes, *list(normalized.get("blocking_issue_codes") or [])])
+    if fallback_used and "FALLBACK_REPORT_USED" not in all_codes:
+        all_codes.append("FALLBACK_REPORT_USED")
+
+    primary_failure_code = str(normalized.get("primary_failure_code") or "").strip()
+    if deliverable:
+        primary_failure_code = ""
+    elif raw_status in RUN_TERMINAL_STATUSES:
+        for code in RUN_FAILURE_PRIORITY:
+            if code in all_codes:
+                primary_failure_code = code
+                break
+        if not primary_failure_code:
+            primary_failure_code = "MODEL_QA_BLOCKED" if raw_status == "failed" else "LOCAL_QUALITY_GATE_FAILED"
+
+    secondary_failure_codes = _dedupe_strings([*list(normalized.get("secondary_failure_codes") or []), *[code for code in all_codes if code != primary_failure_code]])
+    if fallback_used and "FALLBACK_REPORT_USED" not in secondary_failure_codes and primary_failure_code != "FALLBACK_REPORT_USED":
+        secondary_failure_codes.append("FALLBACK_REPORT_USED")
+
+    reason_summary = str(normalized.get("manual_review_reason_summary") or "").strip()
+    final_blocking_reason = str(normalized.get("final_blocking_reason") or "").strip()
+    if primary_failure_code and not reason_summary:
+        reason_summary = RUN_FAILURE_REASON_LABELS.get(primary_failure_code, "当前 run 未达到自动交付条件。")
+    if primary_failure_code and not final_blocking_reason:
+        final_blocking_reason = reason_summary
+
+    normalized.update(
+        {
+            "deliverable": deliverable,
+            "draft_word_export_available": draft_word_export_available,
+            "final_word_export_available": final_word_export_available,
+            "word_export_available": word_export_available,
+            "needs_manual_review": needs_manual_review,
+            "primary_failure_code": primary_failure_code,
+            "secondary_failure_codes": secondary_failure_codes,
+            "quality_failure_codes": _dedupe_strings(quality_failure_codes),
+            "generation_failure_codes": _dedupe_strings(generation_failure_codes),
+            "blocking_issue_codes": _dedupe_strings(all_codes),
+            "fallback_used": fallback_used,
+            "fallback_reason": str(normalized.get("fallback_reason") or dify_error_code or ("DIFY_FRAGMENTARY_REPORT" if "DIFY_FRAGMENTARY_REPORT" in all_codes else "")).strip(),
+            "fallback_provider": str(normalized.get("fallback_provider") or ("backend_pack_fallback" if fallback_used else "")).strip(),
+            "repair_attempted": bool(normalized.get("repair_attempted")),
+            "repair_success": bool(normalized.get("repair_success")),
+            "repair_actions": list(normalized.get("repair_actions") or []),
+            "manual_review_reason_summary": reason_summary,
+            "final_blocking_reason": final_blocking_reason,
+            "provider": str(normalized.get("provider") or "dify").strip() or "dify",
+            "generator_version": str(normalized.get("generator_version") or "").strip(),
+            "prompt_version": str(normalized.get("prompt_version") or "").strip(),
+            "workflow_version": str(normalized.get("workflow_version") or "").strip(),
+            "compact_pack_chars": max(
+                0,
+                _safe_int_value(
+                    normalized.get("compact_pack_chars")
+                    or normalized.get("final_dify_input_chars")
+                    or normalized.get("dify_compact_pack_chars")
+                    or 0
+                ),
+            ),
+            "input_strategy": str(normalized.get("input_strategy") or "").strip(),
+            "timings": _normalize_run_timings(normalized.get("timings")),
+        }
+    )
+    return normalized
+
+
 def _write_analysis_run(record: dict[str, Any]) -> None:
+    record = _normalize_analysis_run_schema(record)
     run_id = str(record.get("run_id") or "")
     path = _analysis_run_path(run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2482,7 +2812,8 @@ def _read_analysis_run(run_id: str) -> dict[str, Any]:
     if not path.exists():
         raise HTTPException(status_code=404, detail="analysis run not found")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return _normalize_analysis_run_schema(data if isinstance(data, dict) else {})
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis_run_read_failed run_id=%s error_type=%s", run_id, exc.__class__.__name__)
         raise HTTPException(status_code=500, detail="analysis run read failed") from exc
@@ -2957,6 +3288,10 @@ def _fallback_result_from_dify_error(
         "dify_error_code": exc.code,
         "dify_error_message": exc.message,
         "dify_error_detail": exc.detail,
+        "provider": "dify",
+        "fallback_used": True,
+        "fallback_reason": exc.code,
+        "fallback_provider": "backend_pack_fallback",
     }
     if apply_quality_gate:
         return _apply_local_quality_gate_to_dify_result(result, pack)
@@ -3099,6 +3434,17 @@ def _call_dify_workflow(
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     result = _normalize_dify_result(response_json, pack_id)
+    result["provider"] = "dify"
+    result["input_strategy"] = str(policy.get("input_strategy") or "")
+    timings = _normalize_run_timings(result.get("timings"))
+    timings["generation_ms"] = elapsed_ms
+    result["timings"] = timings
+    if pack is not None:
+        try:
+            compact = _compact_evidence_pack_for_dify(pack)
+            result["compact_pack_chars"] = _safe_int_value(compact.get("compact_pack_chars") or compact.get("final_dify_input_chars") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dify_compact_observability_failed run_id=%s pack_id=%s error_type=%s", run_id, pack_id, exc.__class__.__name__)
     logger.info(
         "dify_workflow_call_finished run_id=%s pack_id=%s workflow_run_id=%s status=%s elapsed_ms=%s",
         run_id,
@@ -4282,6 +4628,7 @@ def run_analysis(req: AnalysisRunRequest):
         "error_message": "",
         **memory_metadata,
     }
+    record = _normalize_analysis_run_schema(record)
     _write_analysis_run(record)
     logger.info(
         "analysis_run_started run_id=%s pack_id=%s use_report_memory=%s report_memory_applied=%s report_memory_chars=%s memory_read_failed=%s",
@@ -4303,11 +4650,37 @@ def run_analysis(req: AnalysisRunRequest):
         run_id=run_id,
         pack_id=pack_id,
         status="running",
+        run_status=str(record.get("run_status") or "running"),
         workflow_run_id=str(record.get("workflow_run_id") or ""),
         report_title=str(record.get("report_title") or ""),
         quality_passed=(record.get("quality_check") or {}).get("passed") if isinstance(record.get("quality_check"), dict) else None,
         version=int(record.get("version") or 1),
         warnings=list(record.get("warnings") or record.get("generation_warnings") or []),
+        deliverable=bool(record.get("deliverable")),
+        draft_word_export_available=bool(record.get("draft_word_export_available")),
+        final_word_export_available=bool(record.get("final_word_export_available")),
+        word_export_available=bool(record.get("word_export_available")),
+        needs_manual_review=bool(record.get("needs_manual_review")),
+        primary_failure_code=str(record.get("primary_failure_code") or ""),
+        secondary_failure_codes=list(record.get("secondary_failure_codes") or []),
+        quality_failure_codes=list(record.get("quality_failure_codes") or []),
+        generation_failure_codes=list(record.get("generation_failure_codes") or []),
+        blocking_issue_codes=list(record.get("blocking_issue_codes") or []),
+        fallback_used=bool(record.get("fallback_used")),
+        fallback_reason=str(record.get("fallback_reason") or ""),
+        fallback_provider=str(record.get("fallback_provider") or ""),
+        repair_attempted=bool(record.get("repair_attempted")),
+        repair_success=bool(record.get("repair_success")),
+        repair_actions=list(record.get("repair_actions") or []),
+        manual_review_reason_summary=str(record.get("manual_review_reason_summary") or ""),
+        final_blocking_reason=str(record.get("final_blocking_reason") or ""),
+        provider=str(record.get("provider") or "dify"),
+        generator_version=str(record.get("generator_version") or ""),
+        prompt_version=str(record.get("prompt_version") or ""),
+        workflow_version=str(record.get("workflow_version") or ""),
+        compact_pack_chars=int(record.get("compact_pack_chars") or 0),
+        input_strategy=str(record.get("input_strategy") or ""),
+        timings=record.get("timings") if isinstance(record.get("timings"), dict) else {},
     )
 
 

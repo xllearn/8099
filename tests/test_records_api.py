@@ -1777,6 +1777,119 @@ class RecordsApiTests(unittest.TestCase):
         self.assertFalse(report_memory["read_failed"])
         self.assertNotIn("content", report_memory)
 
+    def test_read_analysis_run_backfills_p0_1_schema_for_legacy_record(self) -> None:
+        legacy = {
+            "success": True,
+            "run_id": "run_legacy1234",
+            "pack_id": "pack_legacy",
+            "status": "needs_manual_review",
+            "workflow_run_id": "wf-legacy",
+            "report_title": "Legacy report",
+            "report_markdown": "# Legacy report\n\n## Summary\n\nExisting generated content.",
+            "quality_check": {"passed": False, "issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}]},
+            "quality_gate": {
+                "deliverable_status": "needs_manual_review",
+                "unsupported_fact_count": 1,
+                "summary_only_risk": False,
+                "blocking_issues": [{"code": "UNSUPPORTED_FACT"}],
+            },
+            "remaining_issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}],
+        }
+        required_fields = {
+            "run_status",
+            "deliverable",
+            "draft_word_export_available",
+            "final_word_export_available",
+            "word_export_available",
+            "needs_manual_review",
+            "primary_failure_code",
+            "secondary_failure_codes",
+            "quality_failure_codes",
+            "generation_failure_codes",
+            "blocking_issue_codes",
+            "fallback_used",
+            "fallback_reason",
+            "fallback_provider",
+            "repair_attempted",
+            "repair_success",
+            "repair_actions",
+            "manual_review_reason_summary",
+            "final_blocking_reason",
+            "provider",
+            "generator_version",
+            "prompt_version",
+            "workflow_version",
+            "compact_pack_chars",
+            "input_strategy",
+            "timings",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "run_legacy1234.json").write_text(json.dumps(legacy), encoding="utf-8")
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                loaded = main_module._read_analysis_run("run_legacy1234")
+
+        self.assertTrue(required_fields.issubset(set(loaded)))
+        self.assertEqual(loaded["run_status"], "needs_manual_review")
+        self.assertFalse(loaded["deliverable"])
+        self.assertTrue(loaded["word_export_available"])
+        self.assertTrue(loaded["draft_word_export_available"])
+        self.assertFalse(loaded["final_word_export_available"])
+        self.assertTrue(loaded["needs_manual_review"])
+        self.assertEqual(loaded["primary_failure_code"], "UNSUPPORTED_FACT")
+        self.assertIn("LOCAL_QUALITY_GATE_FAILED", loaded["quality_failure_codes"])
+        self.assertIn("UNSUPPORTED_FACT", loaded["blocking_issue_codes"])
+        self.assertIn("generation_ms", loaded["timings"])
+
+    def test_write_analysis_run_sets_p0_1_final_word_flags_for_deliverable_report(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_schemaok1",
+            "pack_id": "pack_schemaok1",
+            "status": "finished",
+            "workflow_run_id": "wf-schema",
+            "report_title": "Schema report",
+            "report_markdown": "# Schema report\n\n## Summary\n\nA complete mocked report body.",
+            "quality_check": {"passed": True, "issues": []},
+            "quality_gate": {"deliverable_status": "deliverable", "blocking_issues": []},
+            "remaining_issues": [],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True):
+                main_module._write_analysis_run(record)
+                saved = main_module._read_analysis_run("run_schemaok1")
+
+        self.assertEqual(saved["run_status"], "finished")
+        self.assertTrue(saved["deliverable"])
+        self.assertTrue(saved["word_export_available"])
+        self.assertTrue(saved["final_word_export_available"])
+        self.assertFalse(saved["draft_word_export_available"])
+        self.assertFalse(saved["needs_manual_review"])
+        self.assertEqual(saved["primary_failure_code"], "")
+        self.assertEqual(saved["blocking_issue_codes"], [])
+        self.assertEqual(saved["provider"], "dify")
+        self.assertIn("export_check_ms", saved["timings"])
+
+    def test_analysis_run_initial_response_contains_p0_1_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_20260612_schema1"}, create=True
+        ), patch.object(main_module, "_execute_analysis_run_background", return_value=None, create=True):
+            response = self.client.post("/analysis/run", json={"pack_id": "pack_20260612_schema1"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["run_status"], "running")
+        self.assertFalse(body["deliverable"])
+        self.assertFalse(body["word_export_available"])
+        self.assertFalse(body["draft_word_export_available"])
+        self.assertFalse(body["final_word_export_available"])
+        self.assertEqual(body["primary_failure_code"], "")
+        self.assertEqual(body["provider"], "dify")
+        self.assertIn("generation_ms", body["timings"])
+
     def test_run_diagnostics_reports_missing_material_coverage_items(self) -> None:
         pack = {
             "pack_id": "pack_coverage",
@@ -2078,6 +2191,16 @@ class RecordsApiTests(unittest.TestCase):
         self.assertGreater(len(saved["report_markdown"]), 300)
         self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
         self.assertIn("Q_DIFY_CALL_FAILED_FALLBACK", {item["issue_id"] for item in saved["remaining_issues"]})
+        self.assertEqual(saved["run_status"], "needs_manual_review")
+        self.assertFalse(saved["deliverable"])
+        self.assertTrue(saved["word_export_available"])
+        self.assertTrue(saved["draft_word_export_available"])
+        self.assertFalse(saved["final_word_export_available"])
+        self.assertEqual(saved["primary_failure_code"], "DIFY_TIMEOUT")
+        self.assertIn("DIFY_TIMEOUT", saved["generation_failure_codes"])
+        self.assertIn("FALLBACK_REPORT_USED", saved["secondary_failure_codes"])
+        self.assertTrue(saved["fallback_used"])
+        self.assertEqual(saved["fallback_provider"], "backend_pack_fallback")
 
     def test_staged_analysis_run_watchdog_writes_fallback_before_late_dify_result(self) -> None:
         pack = {
