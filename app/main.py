@@ -658,6 +658,21 @@ def _url_analyze_enabled() -> bool:
     return _env_bool("ENABLE_URL_ANALYZE", False)
 
 
+def _project_notice_priority_enabled() -> bool:
+    return _env_bool("ENABLE_PROJECT_NOTICE_PRIORITY", True)
+
+
+def _records_order_by(sort: str = "") -> str:
+    normalized = (sort or "").strip().lower()
+    if not normalized:
+        normalized = "project_notice_first" if _project_notice_priority_enabled() else "latest"
+    if normalized == "latest":
+        return "ORDER BY a.audittime DESC"
+    if normalized == "project_notice_first":
+        return "ORDER BY CASE WHEN a.menu_name = '项目公告' THEN 0 ELSE 1 END, a.audittime DESC"
+    raise HTTPException(status_code=422, detail="Invalid records sort")
+
+
 def _url_analyze_disabled_response(endpoint: str, raw_url: str) -> JSONResponse:
     logger.warning(
         "url_analyze_disabled_endpoint_access endpoint=%s url=%s",
@@ -4187,6 +4202,7 @@ def list_records(
     projecttype: str = "",
     start_date: str = "",
     end_date: str = "",
+    sort: str = "",
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> RecordListResponse:
@@ -4202,6 +4218,7 @@ def list_records(
     total_row = _db_fetch_one(f"SELECT COUNT(*) AS total FROM sample_article_wide a WHERE {where_sql}", params)
     total = int((total_row or {}).get("total") or 0)
     offset = (page - 1) * page_size
+    order_by = _records_order_by(sort)
     selected_fields = ", ".join(f"a.{field}" for field in ARTICLE_LIST_FIELDS)
     group_fields = ", ".join(f"a.{field}" for field in ARTICLE_LIST_FIELDS)
     list_sql = f"""
@@ -4211,7 +4228,7 @@ def list_records(
           ON a.menu_code = att.menu_code AND a.articleid = att.articleid
         WHERE {where_sql}
         GROUP BY {group_fields}
-        ORDER BY a.audittime DESC
+        {order_by}
         LIMIT %s OFFSET %s
     """
     rows = _db_fetch_all(list_sql, [*params, page_size, offset])

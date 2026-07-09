@@ -134,10 +134,53 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("a.status = %s", list_sql)
         self.assertIn("LEFT JOIN", list_sql)
         self.assertIn("GROUP BY", list_sql)
-        self.assertIn("ORDER BY a.audittime DESC", list_sql)
+        self.assertIn("CASE WHEN a.menu_name = '项目公告' THEN 0 ELSE 1 END", list_sql)
+        self.assertIn("a.audittime DESC", list_sql)
         self.assertIn("LIMIT %s OFFSET %s", list_sql)
         self.assertIn("%stent%", list_params)
         self.assertEqual(list_params[-2:], [20, 20])
+
+    def test_records_list_sort_latest_keeps_previous_time_desc_order(self) -> None:
+        calls = []
+
+        def fake_fetch_one(sql: str, params: list[object]):
+            calls.append(("one", sql, params))
+            return {"total": 1}
+
+        def fake_fetch_all(sql: str, params: list[object]):
+            calls.append(("all", sql, params))
+            return [list_row(articleid="a1", title="Latest first")]
+
+        with patch.object(main_module, "_db_fetch_one", fake_fetch_one, create=True), patch.object(
+            main_module, "_db_fetch_all", fake_fetch_all, create=True
+        ):
+            response = self.client.get("/records", params={"sort": "latest", "page": 1, "page_size": 20})
+
+        self.assertEqual(response.status_code, 200)
+        list_sql = calls[1][1]
+        self.assertIn("ORDER BY a.audittime DESC", list_sql)
+        self.assertNotIn("CASE WHEN a.menu_name", list_sql)
+
+    def test_records_list_can_disable_project_notice_priority_by_feature_flag(self) -> None:
+        calls = []
+
+        def fake_fetch_one(sql: str, params: list[object]):
+            calls.append(("one", sql, params))
+            return {"total": 1}
+
+        def fake_fetch_all(sql: str, params: list[object]):
+            calls.append(("all", sql, params))
+            return [list_row(articleid="a1", title="Latest first")]
+
+        with patch.dict(main_module.os.environ, {"ENABLE_PROJECT_NOTICE_PRIORITY": "false"}), patch.object(
+            main_module, "_db_fetch_one", fake_fetch_one, create=True
+        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True):
+            response = self.client.get("/records", params={"page": 1, "page_size": 20})
+
+        self.assertEqual(response.status_code, 200)
+        list_sql = calls[1][1]
+        self.assertIn("ORDER BY a.audittime DESC", list_sql)
+        self.assertNotIn("CASE WHEN a.menu_name", list_sql)
 
     def test_records_ui_serves_static_page(self) -> None:
         response = self.client.get("/records-ui")
@@ -159,6 +202,11 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("复制 pack_id", response.text)
         self.assertIn("查看证据包摘要", response.text)
         self.assertNotIn("查看完整 evidence_pack</a>", response.text)
+
+    def test_records_ui_requests_project_notice_first_sort_by_default(self) -> None:
+        html = (main_module.Path(main_module.__file__).resolve().parent / "static" / "records.html").read_text(encoding="utf-8")
+
+        self.assertIn("sort', 'project_notice_first'", html)
 
     def test_url_analyze_endpoints_are_soft_disabled_by_default(self) -> None:
         client = TestClient(main_module.app, raise_server_exceptions=False)

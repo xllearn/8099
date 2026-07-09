@@ -1,0 +1,67 @@
+version: "2026-07-09-p0.2-b"
+
+trigger:
+  menu_names: ["项目公告"]
+  title_keywords: ["带量采购", "集中采购", "接续采购", "协议期满", "采购文件"]
+  category_keywords: ["带量采购", "集采", "耗材采购"]
+
+topics:
+  - topic_id: procurement_varieties
+    labels: ["采购品种", "采购范围", "产品范围"]
+    presentation: bullet
+    required_when_evidence_present: true
+    failure_code: VBP_REQUIRED_TOPIC_MISSING
+
+  - topic_id: procurement_cycle
+    labels: ["采购周期", "采购期限", "协议期"]
+    presentation: bullet
+    required_when_evidence_present: true
+    failure_code: VBP_REQUIRED_TOPIC_MISSING
+
+  - topic_id: alliance_provinces
+    labels: ["联盟省份", "联盟地区", "参与省份"]
+    presentation: bullet
+    required_when_evidence_present: true
+    failure_code: VBP_REQUIRED_TOPIC_MISSING
+
+  - topic_id: group_price_table
+    labels: ["分组", "分组规则", "最高有效申报价", "报价上限"]
+    presentation: table
+    required_when_evidence_present: true
+    preserve_rows: true
+    failure_code: VBP_CORE_TABLE_MISSING
+
+  - topic_id: quote_rules
+    labels: ["报价要求", "报价规则", "申报价", "挂网价", "最低中选价"]
+    presentation: dedicated_section
+    required_when_evidence_present: true
+    failure_code: VBP_PRICE_RULE_MISSING
+
+  - topic_id: selection_rules
+    labels: ["拟中选规则", "中选规则", "中选资格"]
+    presentation: dedicated_section
+    required_when_evidence_present: true
+    failure_code: VBP_SELECTION_RULE_MISSING
+
+  - topic_id: agreed_purchase_volume
+    labels: ["约定采购量", "采购需求量", "待分配量"]
+    presentation: dedicated_section
+    required_when_evidence_present: true
+    failure_code: VBP_VOLUME_RULE_MISSING
+
+forbidden_phrases:
+  - "具体见采购文件"
+  - "具体数值见采购文件"
+  - "按采购文件执行"
+  - "详见采购文件"
+  - "以采购文件为准"
+  - "资料未显示"
+  - "需人工核验"
+  - "证据不足"
+
+raw_object_patterns:
+  - "{name:"
+  - "'name':"
+  - "\"name\":"
+  - "'value':"
+  - "\"value\":"

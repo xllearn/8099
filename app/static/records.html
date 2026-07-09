@@ -1383,6 +1383,7 @@
     function paramsFromForm() {
       const data = new FormData($('filters'));
       const params = new URLSearchParams({ page: state.page, page_size: state.pageSize });
+      params.set('sort', 'project_notice_first');
       for (const [key, value] of data.entries()) {
         const trimmed = String(value).trim();
         if (trimmed) params.set(key, trimmed);
