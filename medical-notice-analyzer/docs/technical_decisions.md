@@ -76,9 +76,11 @@
 
 **Rejected alternatives:** Treating historical reports as retrievable facts would increase hallucination and stale-data risk.
 
-**Limitations:** P0-1 does not change memory behavior.
+**Limitations:** P1-1 does not add semantic search, relevance scoring, audit history, rollback, or UI-heavy memory management.
 
 **Evolution:** P1-1 adds scoped `MemoryItem` retrieval and records `used_memory_ids`.
+
+**P1-1 result:** Structured memory items are stored in `memory_items.json`, retrieved only when `status=approved` and scope matches the current evidence pack, and appended to `report_memory` in a separate section that says memory is guidance only and must not override the evidence pack.
 
 ## TD-006: Use Public Notice Data For Real Data Checks
 
@@ -107,6 +109,8 @@
 **Limitations:** Fixtures need updates when schema changes.
 
 **Evolution:** P1-2 adds smoke evaluation cases and metrics.
+
+**P1-2 result:** `scripts/run_quality_smoke.py` runs offline against `tests/eval_fixtures`, reuses `build_run_diagnostics`, and writes JSON/Markdown reports. It records deliverable rate, coverage, analysis depth, unsupported facts, summary-only risk, blocking issue counts, and diagnosis counts without calling live company services.
 
 ## TD-008: Do Not Prioritize React/Vue/Vite
 
@@ -193,3 +197,73 @@
 **Limitations:** Word download availability no longer means report quality passed. Users must treat `needs_manual_review`, failed QA issues, and diagnostics as delivery warnings rather than export blockers.
 
 **Evolution:** P1/P2 stages can enrich the quality gate inputs and add operational diagnostics, while keeping Word export as an explicit user action rather than an automatic delivery signal.
+
+## TD-014: Evidence Pack v3 Lite Uses Coarse Traceability Metadata
+
+**Background:** Later repair, citation, and staged synthesis work need facts and table summaries to be traceable to their source material. The current database evidence pack already contains useful structured fields, but they did not carry stable evidence IDs or source spans.
+
+**Decision:** Add a small `app/core/evidence` annotation layer for generated database packs. It preserves existing `pack_version: 2.0` compatibility and adds `evidence_schema_version: 3_lite`, `evidence_items`, `evidence_id`, coarse `source_span`, `confidence`, and `parse_risks`.
+
+**Why:** Coarse spans give enough provenance for diagnostics and future repair contracts without increasing parser complexity or forcing a data migration. Keeping the full evidence index out of the Dify compact payload avoids unnecessary prompt bloat while inline IDs remain visible on facts, passages, attachments, and tables.
+
+**Rejected alternatives:** Character-level offsets were rejected for P1-3 because existing HTML/PDF/Excel parsing paths do not preserve stable offsets. A separate evidence database was rejected because JSON pack persistence is still the current storage boundary.
+
+**Limitations:** Historical packs are not backfilled automatically. Evidence IDs are stable for a generated pack but can change if selected material order or attachment order changes. Coarse spans do not identify exact character positions inside long paragraphs.
+
+**Evolution:** P3 repair contracts can reference these IDs directly, and a later evidence browser or citation renderer can build on the same fields without changing P1-3 pack generation.
+
+## TD-015: Retry And Resume Create Linked New Runs
+
+**Background:** P2-1 adds user-facing control operations while the current execution model still uses in-process background threads and JSON run files. A cancelled or failed source run may still have a background worker returning late.
+
+**Decision:** `cancel` updates the current run state in place, but `retry` and `resume` create a new linked run ID instead of reusing the source run ID.
+
+**Why:** Reusing a cancelled run ID could let an old background result write into a resumed run if the status is changed back to `running`. A new linked run preserves the original outcome, keeps audit history simple, and uses the existing late-result guard safely.
+
+**Rejected alternatives:** Reusing the same run ID for resume was rejected because it needs stronger worker identity/checkpoint semantics than P2-1 provides. Introducing a queue or durable worker platform was rejected because P2-1 scope is only a controlled shell; recovery and idempotency are P2-2.
+
+**Limitations:** This does not deduplicate repeated user clicks and does not recover pending runs on startup. It also does not call a remote Dify cancellation endpoint; cancellation is local run-state cancellation.
+
+**Evolution:** P2-2 should add input hashes, duplicate detection, and startup recovery policy around the linked-run behavior.
+
+## TD-016: Input-Hash Idempotency And Stale Pending Recovery
+
+**Background:** P2-1 created safe retry/cancel/resume operations, but a repeated click on `/analysis/run` could still start multiple background workers for the same evidence pack. Interrupted service processes could also leave `created` or `running` JSON run files indefinitely.
+
+**Decision:** Compute an analysis-run `input_hash` from the pack ID, selected workflow backend, report-memory flag, report-memory hash, and scoped structured memory IDs. For normal `/analysis/run` requests, scan active JSON run records under a process-local creation lock and reuse an existing active run with the same hash. On startup and before new normal run creation, scan persisted runs and mark stale `created` or `running` records as `failed` with `RUN_RECOVERED_STALE_PENDING` metadata.
+
+**Why:** This matches the current JSON-store architecture and prevents the highest-risk duplicate-submission case without introducing a queue service, database migration, or Dify configuration change. Marking stale runs failed keeps recovery explicit and lets users retry through the P2-1 linked-run path.
+
+**Rejected alternatives:** A distributed lock or durable job queue was rejected because the project still runs as a single FastAPI service with local JSON state. Reusing stale run IDs was rejected because late worker writes and partial state need stronger checkpoint identity than P2-2 provides.
+
+**Limitations:** Duplicate protection is process-local plus JSON scan; it is not a cross-container distributed lock. The hash must evolve if future stages add user-selectable generation parameters. Recovery does not resume partially completed work; it only makes stale state visible and retryable.
+
+**Evolution:** P2-2.5 material compression cache can reuse this pattern for duplicate-build avoidance and safe fallback, while P2-3 can expose recovery counts and stale-run diagnostics through health/operations endpoints.
+
+## TD-017: Material Compression Cache Is Derived SQLite State
+
+**Background:** `/analysis/prepare` repeatedly rebuilds material objects from company database rows, attachment metadata, parsed attachment summaries, and role-specific context. P2-2.5 needs reusable material views without changing company database schema during local implementation.
+
+**Decision:** Store material compression cache rows in a local SQLite database selected by `MATERIAL_COMPRESSION_CACHE_DB_PATH`, guarded by `MATERIAL_COMPRESSION_CACHE_ENABLED`. Each row is derived data keyed by material identity, view type, source hash, attachment metadata hash, attachment options hash, parser version, compression version, and schema version. The first implementation includes `material/full`, `primary/light`, `primary/safe`, and `auxiliary/summary`, but `/analysis/prepare` reads only `material/full`.
+
+**Why:** Local SQLite preserves the current JSON/local-data deployment style and avoids changing the company announcement database during this stage. Reading only `material/full` keeps evidence detail equivalent to the dynamic path and prevents lightweight views from accidentally reducing report evidence. Miss, stale, corrupt, failed, building, or force-refresh states fall back to dynamic construction.
+
+**Rejected alternatives:** Process-memory caching was rejected because material payloads can be large and would grow with FastAPI worker lifetime. Caching assembled evidence packs was rejected because final pack content depends on selection combination, material role, report options, and compact strategy. Independent attachment/table rows were deferred because v1 can embed attachment/table summaries inside material payloads.
+
+**Limitations:** The prebuild script currently provides local-safe option parsing and dry-run behavior; real DB candidate scanning needs a later real-environment validation. Cache invalidation must be reviewed whenever source fields, parser inputs, or compression payload versions change.
+
+**Evolution:** P2-3 can surface storage/cache health and cleanup behavior. A later MC slice can decide whether compact-stage use of `primary/light`, `primary/safe`, or `auxiliary/summary` is safe after fixed-case quality comparison.
+
+## TD-018: Operations Health Is Read-Mostly And Cleanup Is Bounded
+
+**Background:** P2-3 needs better operational visibility for database configuration, workflow/model provider configuration, local JSON storage, generated Word files, attachment parse cache, and material compression cache state.
+
+**Decision:** Add read-mostly health and diagnostics endpoints in the FastAPI monolith: `/health/db`, `/health/llm`, `/health/storage`, `/ops/diagnostics`, and `/ops-diagnostics-ui`. Add `/ops/cleanup` for generated report files and expired attachment parse-cache entries only. Cleanup defaults to dry-run, requires an explicit scope, and enforces a `max_delete` limit.
+
+**Why:** Operators need quick dependency classification without exposing secrets or accidentally calling external systems. Generated Word files and expired attachment parse cache are safe local derived artifacts to clean; evidence packs and analysis run records are user-visible workflow state and should not be deleted by a generic cleanup endpoint.
+
+**Rejected alternatives:** A BI dashboard was rejected as out of scope. Polling Dify or the company database by default was rejected because health pages should not create unnecessary external load. Deleting packs/runs was rejected because it could break report detail pages and auditability.
+
+**Limitations:** `/health/db?check=true` performs a real database check and should be used intentionally. Storage health uses bounded directory snapshots and does not prove every file is readable. The static diagnostics page is intentionally small and does not replace real 8100 smoke testing.
+
+**Evolution:** P2-4 can move these routes into dedicated routers/services during modular refactor without changing the API contract.

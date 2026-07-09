@@ -155,6 +155,41 @@ class WorkflowRunStoreTests(unittest.TestCase):
             self.assertEqual(parsed["run_id"], "run_20260703_concurrent1")
             self.assertIn("last_update", parsed)
 
+    def test_list_runs_returns_valid_records_and_skips_corrupt_files(self) -> None:
+        from app.core.workflow.state import WorkflowBackend, WorkflowRunStatus
+        from app.core.workflow.store import WorkflowRunStore
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            store = WorkflowRunStore(root)
+            store.write_run(
+                {
+                    "run_id": "run_20260707_list1",
+                    "pack_id": "pack_list_1",
+                    "status": WorkflowRunStatus.RUNNING.value,
+                    "backend": WorkflowBackend.DIFY_LEGACY.value,
+                    "workflow_backend": WorkflowBackend.DIFY_LEGACY.value,
+                    "created_at": "2026-07-07 10:00:00",
+                }
+            )
+            store.write_run(
+                {
+                    "run_id": "run_20260707_list2",
+                    "pack_id": "pack_list_2",
+                    "status": WorkflowRunStatus.FINISHED.value,
+                    "backend": WorkflowBackend.LOCAL_ENGINE.value,
+                    "workflow_backend": WorkflowBackend.LOCAL_ENGINE.value,
+                    "created_at": "2026-07-07 10:01:00",
+                }
+            )
+            (root / "run_20260707_broken1.json").write_text("{not valid json", encoding="utf-8")
+            (root / "not-a-run.json").write_text("{}", encoding="utf-8")
+
+            records = store.list_runs()
+
+        self.assertEqual({record["run_id"] for record in records}, {"run_20260707_list1", "run_20260707_list2"})
+        self.assertEqual({record["pack_id"] for record in records}, {"pack_list_1", "pack_list_2"})
+
     def test_read_corrupt_run_json_raises_clear_store_error(self) -> None:
         from app.core.workflow.store import WorkflowRunStore, WorkflowRunStoreError
 

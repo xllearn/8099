@@ -102,6 +102,45 @@ class ReportMemoryServiceTests(unittest.TestCase):
             self.assertFalse(saved.json()["write_protection_enabled"])
             self.assertTrue(saved.json()["backup_name"].startswith("memory_candidates_"))
 
+    def test_memory_items_api_enforces_token_and_persists_structured_items(self) -> None:
+        client = TestClient(main_module.app)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            main_module.os.environ,
+            {"MEMORY_DIR": tmpdir, "MEMORY_WRITE_TOKEN": "secret-token"},
+            clear=False,
+        ):
+            missing = client.put(
+                "/memory/items/mem_api_style",
+                json={
+                    "title": "API style",
+                    "content": "Use short recommendation paragraphs.",
+                    "status": "approved",
+                    "scopes": ["global"],
+                    "kind": "writing_style",
+                },
+            )
+            self.assertEqual(missing.status_code, 401)
+
+            saved = client.put(
+                "/memory/items/mem_api_style",
+                json={
+                    "title": "API style",
+                    "content": "Use short recommendation paragraphs.",
+                    "status": "approved",
+                    "scopes": ["global"],
+                    "kind": "writing_style",
+                },
+                headers={"X-Memory-Write-Token": "secret-token"},
+            )
+            self.assertEqual(saved.status_code, 200)
+            self.assertEqual(saved.json()["item"]["id"], "mem_api_style")
+            self.assertEqual(saved.json()["item"]["status"], "approved")
+
+            listed = client.get("/memory/items")
+            self.assertEqual(listed.status_code, 200)
+            self.assertEqual([item["id"] for item in listed.json()["items"]], ["mem_api_style"])
+            self.assertTrue((Path(tmpdir) / "memory_items.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

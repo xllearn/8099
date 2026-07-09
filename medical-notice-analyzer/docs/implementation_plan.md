@@ -31,7 +31,7 @@ Upgrade `medical-notice-analyzer` from a Dify helper service into a resume-ready
 
 ## Current Stage
 
-`P0-4: Quality gate blocks export` completed locally on 2026-07-06. P1-1 has not started.
+`P2-3: Cleanup, health, diagnostics` completed locally on 2026-07-08. The next stage is `P2-4: Modular refactor`; do not start it until the user explicitly says "continue next stage".
 
 ## Deployment Policy During Remaining Plan
 
@@ -151,6 +151,103 @@ Effective 2026-07-07, all subsequent implementation, Dify workflow experiments, 
 - Records API/UI static regression tests.
 - Local 16-case regression-script unit tests.
 - Full unittest discovery when feasible.
+
+### P1-1 Scope
+
+- Add `MemoryItem` v1 as structured JSON storage under the existing report-memory storage root.
+- Support `approved` and `disabled` item status.
+- Support simple explicit scopes, including `global`, `menu_code:*`, `projecttype:*`, `dl_project_type:*`, `category:*`, `area:*`, and `policytype:*`.
+- Retrieve only approved items whose scopes match the current evidence pack.
+- Inject structured memory into the existing `report_memory` Dify input only when `use_report_memory=true`.
+- Keep structured memory in a separate prompt section that states memory is style, angle, and quality guidance only, not current facts.
+- Persist run-level `used_memory_ids`, `memory_item_count`, `memory_item_chars`, and `memory_items_read_failed`.
+- Add minimal `/memory/items` list/upsert API using the existing memory write-token protection.
+
+### P1-1 Out Of Scope
+
+- No diff, rollback, audit trail, approval workflow, vector database, semantic search, or broad memory UI rebuild.
+- No use of memory as current factual evidence.
+- No change to production `8099`, Dify workflow configuration, server secrets, or frontend build system.
+- No broad `app/main.py` refactor beyond the minimal API/run integration required for this stage.
+
+### P1-1 Test Plan
+
+- Unit tests for scoped memory-item retrieval and prompt separation from current facts.
+- API tests for token-protected memory-item persistence.
+- Analysis-run API regression proving matching memory items are injected and `used_memory_ids` are recorded.
+- Existing report-memory and Dify-input regression tests proving old memory behavior remains compatible.
+- Full unittest discovery when feasible.
+
+### P1-1 Acceptance
+
+- Only approved matching memory items are injected.
+- Disabled or non-matching scoped items are not injected.
+- `report_memory` still remains opt-in through `use_report_memory`.
+- The Dify input separates memory guidance from current evidence facts.
+- Run status records expose which structured memory IDs were used.
+- Focused tests and full unittest discovery pass.
+
+### P1-2 Scope
+
+- Add a small offline quality smoke runner under `scripts/run_quality_smoke.py`.
+- Use 3 fixed JSON fixtures under `tests/eval_fixtures`.
+- Reuse existing `build_run_diagnostics` metrics instead of defining a separate quality scoring system.
+- Emit `quality_smoke_summary.json` and `quality_smoke_report.md`.
+- Record deliverable/manual-review/failed counts, deliverable rate, coverage, analysis depth, unsupported facts, summary-only count, blocking issue counts, and diagnosis counts.
+- Keep the runner callable after prompt/workflow changes without touching live services.
+
+### P1-2 Out Of Scope
+
+- No BI dashboard, database-backed evaluation warehouse, large 16-case run, live Dify call, production `8099` change, standby `8100` deployment, or Dify workflow configuration change.
+- No new quality scoring model separate from the existing diagnostics path.
+- No public/live URL fetch during local stage implementation.
+
+### P1-2 Test Plan
+
+- TDD unit tests for default fixture execution, JSON/Markdown output, blocking issue counting, and direct CLI execution from repo root.
+- Existing `tests.test_16case_regression_script` and `tests.test_report_quality` regressions.
+- P1-1 memory focused regressions to verify stage interaction remains safe.
+- Full unittest discovery when feasible.
+- Run the new smoke runner once against `tests/eval_fixtures` and record metrics.
+
+### P1-2 Acceptance
+
+- `scripts/run_quality_smoke.py` runs from the repo root without external services.
+- 3 fixed fixtures produce repeatable JSON and Markdown reports.
+- Smoke metrics include deliverable rate, coverage, analysis depth, unsupported facts, and blocking issue counts.
+- Existing quality diagnostics and 16-case script unit tests remain green.
+- Full unittest discovery passes.
+
+### P1-3 Scope
+
+- Add `app/core/evidence` as the Evidence Pack v3 lite annotation boundary.
+- Keep existing database evidence-pack construction and `pack_version: 2.0` compatibility.
+- Add `evidence_schema_version: 3_lite`, `evidence_items`, and pack-level `parse_risks`.
+- Attach `evidence_id`, coarse `source_span`, `confidence`, and `parse_risks` to material facts, important passages, attachments, attachment facts/sections, and table summaries.
+- Preserve lightweight evidence references in the Dify compact pack without sending the full `evidence_items` index.
+
+### P1-3 Out Of Scope
+
+- No character-level offsets.
+- No row-level table extraction beyond existing table summaries.
+- No evidence database, vector search, UI evidence browser, report citation renderer, Dify workflow change, production `8099` change, standby `8100` deployment, or server secret/config change.
+- No broad `app/main.py` refactor beyond minimal annotation/compact integration.
+
+### P1-3 Test Plan
+
+- TDD unit tests for evidence IDs, paragraph/attachment/sheet-row spans, confidence, parse risks, and absence of character offsets.
+- `/analysis/prepare` API regression proving generated and persisted packs include v3 lite traceability fields.
+- Records API and local quality regressions to verify compact-pack and report-quality paths remain compatible.
+- Run the offline P1-2 quality smoke script before and after to detect metric drift.
+- Full unittest discovery when feasible.
+
+### P1-3 Acceptance
+
+- Key facts and important passages in generated database packs have stable `evidence_id` values and coarse source spans.
+- Attachment summaries, attachment key facts/sections, and table summaries can trace to attachment or sheet/row spans.
+- Parse risks are recorded for short body text, incomplete attachments, attachment warnings, OCR use, and missing table headers.
+- Dify compact packs retain lightweight evidence refs while omitting the full evidence index.
+- Focused tests, related API/quality regressions, quality smoke, and full unittest discovery pass.
 
 ### P2-2.5 Material Compression Cache Scope
 
@@ -489,13 +586,18 @@ Minimum review audit fields:
 - P0-2 completed locally on 2026-07-06. `WORKFLOW_BACKEND=local_engine` now runs the local serial MVP and produces a draft report from the synthetic evidence pack without calling Dify. The default backend remains `dify_legacy`.
 - P0-3 completed locally on 2026-07-06. The local engine now calls a deterministic mock `LLMProvider`, records provider/model/prompt SHA-256 metadata, and routes invalid provider JSON to manual review without changing the legacy Dify default.
 - P0-4 completed locally on 2026-07-06, then revised on 2026-07-06 after real-environment smoke feedback. Analysis-run Word downloads keep quality diagnostics and manual-review status, but `needs_manual_review` reports are allowed to export by explicit user download. Not-ready reports still return 409. QA-passed reports still require an explicit download action.
+- P1-1 completed locally on 2026-07-07. Structured `MemoryItem` v1 storage, scoped retrieval, minimal token-protected API, prompt separation, and run-level `used_memory_ids` metadata are implemented. No production `8099` or Dify configuration was changed.
+- P1-2 completed locally on 2026-07-07. `scripts/run_quality_smoke.py` now evaluates 3 offline fixtures, writes JSON/Markdown reports, and records repeatable quality metrics from the existing diagnostics path. No live service, production `8099`, standby `8100`, or Dify configuration was changed.
+- P1-3 completed locally on 2026-07-07. Generated database evidence packs now include v3 lite evidence IDs, coarse source spans, confidence, and parse-risk metadata while preserving compact-pack compatibility. No live service, production `8099`, standby `8100`, Dify workflow, or secret/config change was performed.
+- P2-1 completed locally on 2026-07-07. Analysis runs now expose state-checked `cancel`, `retry`, and `resume` control endpoints. Cancel marks running/created runs as cancelled so late background results are ignored; retry creates a linked new run only from failed runs; resume creates a linked new run only from cancelled runs. No queue platform, idempotency/recovery policy, Dify cancellation API, deployment, production `8099`, standby `8100`, Dify workflow, or secret/config change was performed.
+- P2-2 completed locally on 2026-07-07. Analysis run creation now computes an input hash from pack/backend/memory inputs, reuses active duplicate submissions instead of spawning uncontrolled duplicate workers, lists JSON run records through `WorkflowRunStore`, and recovers stale `created/running` runs by marking them failed with retryable recovery metadata. No queue platform, material compression cache, deployment, production `8099`, standby `8100`, Dify workflow, or secret/config change was performed.
+- P2-2.5 completed locally on 2026-07-07. Added local SQLite-backed material compression cache schemas/repository, deterministic v1 material views, selected-material check/build APIs, `material/full` read-only prepare integration with dynamic fallback, diagnostics/UI cache metadata, and a local-safe prebuild script option parser. No company database schema deployment, production `8099`, standby `8100`, Dify workflow, or server secret/config change was performed.
+- P2-3 completed locally on 2026-07-08. Added dependency health endpoints for database, workflow/model provider, and local storage; added bounded dry-run-first cleanup for local reports and expired attachment parse cache; added `/ops/diagnostics` and a static diagnostics page. No live DB/Dify check is performed unless explicitly requested, and no production `8099`, standby `8100`, Dify workflow, deployment, or server secret/config change was performed.
 
-## Entry Criteria For P1-1
+## Entry Criteria For P2-4
 
-- P0-4 focused quality/export tests and full regression pass.
-- Failed QA and manual-review quality gates mark risk but do not block explicit Word download.
-- QA-passed reports remain downloadable only through explicit user action.
-- Existing Dify legacy and local-engine report generation flows remain compatible.
-- Required docs contain stage results and architecture state.
-- Remaining risks are documented and do not block memory-item work.
-- P1-1 may start only after an explicit "continue next stage" instruction.
+- P2-3 focused operations health/cleanup/diagnostics tests, deployment health regressions, pack/run diagnostics regressions, workflow-store regressions, material cache regressions, and full unittest discovery pass.
+- `scripts/run_quality_smoke.py` before/after metrics for P2-3 are documented in `docs/testing_and_evaluation.md`.
+- `/health/db`, `/health/llm`, `/health/storage`, `/ops/cleanup`, `/ops/diagnostics`, and `/ops-diagnostics-ui` expose operational state without secrets; cleanup defaults to dry-run and enforces `max_delete`.
+- No production `8099`, standby `8100`, Dify workflow, or server secret changes are included.
+- P2-4 may start only after an explicit "continue next stage" instruction.

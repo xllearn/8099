@@ -53,6 +53,18 @@ class WorkflowRunStore:
             self._atomic_write(self._path_for(safe_run_id), current)
             return current
 
+    def list_runs(self) -> list[dict[str, Any]]:
+        if not self.root.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        for path in self.root.glob("run_*.json"):
+            try:
+                record = self.read_run(path.stem)
+            except WorkflowRunStoreError:
+                continue
+            records.append(record)
+        return sorted(records, key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""), reverse=True)
+
     def _path_for(self, run_id: str) -> Path:
         return self.root / f"{run_id}.json"
 

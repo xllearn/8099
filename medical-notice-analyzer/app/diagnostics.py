@@ -355,6 +355,7 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         and not _attachment_is_usable(attachment)
     ]
     warnings = list(pack.get("warnings") or [])
+    material_cache_stats = dict(pack.get("material_cache_stats") or {})
     evidence_level, suggested_length = _evidence_level(weighted_evidence_chars)
     parsed_count = attachment_counts["parsed_attachment_count"]
     attachment_count = attachment_counts["attachment_count"]
@@ -411,6 +412,12 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         diagnosis.append(_diagnosis("ATTACHMENT_PARSE_CACHE_EXPIRED", "normal", "存在附件缓存过期并重新解析。"))
     if attachment_counts["cache_hit_failure_short_count"]:
         diagnosis.append(_diagnosis("ATTACHMENT_PARSE_FAILED_SHORT_CACHED", "warning", "存在短期失败缓存，到期后会重新尝试解析。"))
+    if material_cache_stats.get("hit_count"):
+        diagnosis.append(_diagnosis("MATERIAL_COMPRESSION_CACHE_HIT", "normal", "存在材料压缩缓存命中，证据包构建复用了 material/full 派生视图。"))
+    if material_cache_stats.get("dynamic_count"):
+        diagnosis.append(_diagnosis("MATERIAL_COMPRESSION_CACHE_FALLBACK", "normal", "部分材料未使用缓存，已回退到动态构建路径。"))
+    if material_cache_stats.get("corrupt_count") or material_cache_stats.get("failed_count") or material_cache_stats.get("stale_count"):
+        diagnosis.append(_diagnosis("MATERIAL_COMPRESSION_CACHE_UNSAFE_STATE", "warning", "存在失效、损坏或失败的材料缓存，已避免直接用于证据包。"))
     if auxiliary_content_chars > max(primary_content_chars * 2, 2000) and auxiliary_relevant_snippet_chars < auxiliary_content_chars * 0.25:
         diagnosis.append(
             _diagnosis(
@@ -506,6 +513,7 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         "auxiliary_materials": [_material_brief(item, "auxiliary") for item in auxiliary],
         "attachment_led_primary_count": attachment_led_primary_count,
         **attachment_counts,
+        "material_cache_stats": material_cache_stats,
         "core_attachment_unparsed_names": core_unparsed_names,
         "attachment_analysis_impact": bool(core_unparsed_names),
         "compression_applied": bool(dify_pack.get("compression_applied")) if dify_pack else False,

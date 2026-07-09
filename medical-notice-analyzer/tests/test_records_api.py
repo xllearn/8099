@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 import json
+from contextlib import closing
 from unittest.mock import patch
 
 from docx import Document
@@ -315,6 +318,10 @@ class RecordsApiTests(unittest.TestCase):
             self.assertEqual(attachment["parse_status"], "metadata_only")
             self.assertIn("{articleattid}", attachment["download_url_template"])
             self.assertEqual(pack["pack_version"], "2.0")
+            self.assertEqual(pack["evidence_schema_version"], "3_lite")
+            self.assertGreaterEqual(len(pack["evidence_items"]), 1)
+            self.assertIn("evidence_id", pack["primary_materials"][0]["key_facts"][0])
+            self.assertIn("source_span", pack["primary_materials"][0]["key_facts"][0])
             self.assertIn("primary_evidence", pack)
             self.assertIn("auxiliary_evidence", pack)
             self.assertIn("attachment_evidence", pack)
@@ -324,12 +331,180 @@ class RecordsApiTests(unittest.TestCase):
             pack_response = self.client.get(f"/analysis/packs/{body['pack_id']}")
             self.assertEqual(pack_response.status_code, 200)
             self.assertEqual(pack_response.json()["pack_id"], body["pack_id"])
+            self.assertEqual(pack_response.json()["evidence_schema_version"], "3_lite")
+            self.assertGreater(pack_response.json()["evidence_item_count"], 0)
+            self.assertNotIn("evidence_items", pack_response.json())
+            self.assertIn("evidence_id", pack_response.json()["primary_materials"][0]["key_facts"][0])
             self.assertNotIn("report_memory", json.dumps(pack_response.json(), ensure_ascii=False))
             self.assertNotIn("memory_candidates", json.dumps(pack_response.json(), ensure_ascii=False))
 
             summary_response = self.client.get(f"/analysis/packs/{body['pack_id']}/summary")
             self.assertEqual(summary_response.status_code, 200)
             self.assertEqual(summary_response.json()["attachment_count"], 2)
+
+    def test_analysis_prepare_uses_material_full_cache_hit_and_recomputes_role_context(self) -> None:
+        from app.material_compression_cache import MaterialCompressionCacheRepository
+
+        rows = {
+            ("m1", "a1"): detail_row(menu_code="m1", articleid="a1", title="Cached Primary", summary="fresh summary"),
+            ("m2", "a2"): detail_row(
+                menu_code="m2",
+                articleid="a2",
+                title="Cached Aux",
+                summary="aux summary",
+                content="<p>Cached Primary 价格规则 辅助材料用于对比。</p>",
+            ),
+        }
+        attachments = {
+            ("m1", "a1"): [attachment_row(menu_code="m1", articleid="a1", articleattid="att1", filename="primary.pdf", fileext=".pdf")],
+            ("m2", "a2"): [attachment_row(menu_code="m2", articleid="a2", articleattid="att2", filename="aux.xlsx", fileext=".xlsx")],
+        }
+
+        def fake_fetch_all(sql: str, params: list[object]):
+            if "sample_article_wide" in sql:
+                return list(rows.values())
+            if "sample_article_attach" in sql:
+                return [item for group in attachments.values() for item in group]
+            return []
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            main_module.os.environ,
+            {
+                "MATERIAL_COMPRESSION_CACHE_ENABLED": "true",
+                "MATERIAL_COMPRESSION_CACHE_DB_PATH": str(main_module.Path(tmpdir) / "material_cache.sqlite3"),
+            },
+            clear=False,
+        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True), patch.object(
+            main_module, "_database_evidence_pack_dir", return_value=main_module.Path(tmpdir) / "packs", create=True
+        ), patch.object(main_module, "_database_attachment_metadata", side_effect=AssertionError("cache hit should not rebuild attachments")):
+            repo = MaterialCompressionCacheRepository(main_module.Path(tmpdir) / "material_cache.sqlite3")
+            options = {"enable_download": False, "force_refresh": False, "user_cookie": "", "user_headers": {}}
+            for key, row in rows.items():
+                signature = main_module._material_cache_signature(row, attachments[key], options, "material/full")
+                repo.write_ready(
+                    signature,
+                    {
+                        "material_role": "cached",
+                        "menu_code": row["menu_code"],
+                        "articleid": row["articleid"],
+                        "title": row["title"],
+                        "summary": row["summary"],
+                        "content_text": main_module._article_text_from_html(row["content"]),
+                        "content_summary": row["summary"],
+                        "attachments": [{"articleattid": "cached-att", "filename": "cached.pdf", "parse_status": "metadata_only"}],
+                        "relation_to_primary": "stale relation must be recomputed",
+                    },
+                    diagnostics={"source": "unit"},
+                    build_source="unit",
+                )
+
+            response = self.client.post(
+                "/analysis/prepare",
+                json={
+                    "primary_materials": [{"menu_code": "m1", "articleid": "a1"}],
+                    "auxiliary_materials": [{"menu_code": "m2", "articleid": "a2"}],
+                    "enable_attachment_download": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        pack = response.json()["evidence_pack"]
+        self.assertEqual(pack["material_cache_stats"]["hit_count"], 2)
+        self.assertEqual(pack["material_cache_stats"]["dynamic_count"], 0)
+        self.assertEqual(pack["primary_materials"][0]["material_role"], "primary")
+        self.assertEqual(pack["primary_materials"][0]["material_cache"]["status"], "hit")
+        self.assertEqual(pack["auxiliary_materials"][0]["material_role"], "auxiliary")
+        self.assertEqual(pack["auxiliary_materials"][0]["material_cache"]["status"], "hit")
+        self.assertNotEqual(pack["auxiliary_materials"][0]["relation_to_primary"], "stale relation must be recomputed")
+        self.assertIn("relation_to_primary", pack["auxiliary_materials"][0])
+        compact = main_module._compact_evidence_pack_for_dify(pack)
+        self.assertNotIn("material_cache", json.dumps(compact, ensure_ascii=False))
+        diagnostics = build_pack_diagnostics(pack, compact)
+        self.assertEqual(diagnostics["material_cache_stats"]["hit_count"], 2)
+        self.assertIn("MATERIAL_COMPRESSION_CACHE_HIT", {item["code"] for item in diagnostics["diagnosis"]})
+
+    def test_analysis_prepare_falls_back_when_material_cache_is_corrupt(self) -> None:
+        from app.material_compression_cache import MaterialCompressionCacheRepository
+
+        row = detail_row(menu_code="m1", articleid="a1", title="Primary", summary="primary summary")
+        attachment = attachment_row(menu_code="m1", articleid="a1", articleattid="att1", filename="primary.pdf", fileext=".pdf")
+
+        def fake_fetch_all(sql: str, params: list[object]):
+            if "sample_article_wide" in sql:
+                return [row]
+            if "sample_article_attach" in sql:
+                return [attachment]
+            return []
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            main_module.os.environ,
+            {
+                "MATERIAL_COMPRESSION_CACHE_ENABLED": "true",
+                "MATERIAL_COMPRESSION_CACHE_DB_PATH": str(main_module.Path(tmpdir) / "material_cache.sqlite3"),
+            },
+            clear=False,
+        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True), patch.object(
+            main_module, "_database_evidence_pack_dir", return_value=main_module.Path(tmpdir) / "packs", create=True
+        ):
+            db_path = main_module.Path(tmpdir) / "material_cache.sqlite3"
+            repo = MaterialCompressionCacheRepository(db_path)
+            options = {"enable_download": False, "force_refresh": False, "user_cookie": "", "user_headers": {}}
+            signature = main_module._material_cache_signature(row, [attachment], options, "material/full")
+            repo.write_ready(signature, {"title": "bad"}, diagnostics={}, build_source="unit")
+            with closing(sqlite3.connect(db_path)) as conn:
+                with conn:
+                    conn.execute("UPDATE material_compression_cache SET payload_json = ? WHERE cache_key = ?", ("{not-json", signature.cache_key))
+
+            response = self.client.post(
+                "/analysis/prepare",
+                json={
+                    "primary_materials": [{"menu_code": "m1", "articleid": "a1"}],
+                    "auxiliary_materials": [],
+                    "enable_attachment_download": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        pack = response.json()["evidence_pack"]
+        self.assertEqual(pack["material_cache_stats"]["corrupt_count"], 1)
+        self.assertEqual(pack["material_cache_stats"]["dynamic_count"], 1)
+        self.assertEqual(pack["primary_materials"][0]["material_cache"]["status"], "corrupt")
+        self.assertEqual(pack["primary_materials"][0]["title"], "Primary")
+
+    def test_material_cache_check_and_build_selected_materials_api(self) -> None:
+        def fake_fetch_all(sql: str, params: list[object]):
+            if "sample_article_wide" in sql:
+                return [detail_row(menu_code="m1", articleid="a1", title="Primary", summary="primary summary")]
+            if "sample_article_attach" in sql:
+                return [attachment_row(menu_code="m1", articleid="a1", articleattid="att1", filename="primary.pdf", fileext=".pdf")]
+            return []
+
+        request_body = {
+            "primary_materials": [{"menu_code": "m1", "articleid": "a1"}],
+            "auxiliary_materials": [],
+            "enable_attachment_download": False,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            main_module.os.environ,
+            {
+                "MATERIAL_COMPRESSION_CACHE_ENABLED": "true",
+                "MATERIAL_COMPRESSION_CACHE_DB_PATH": str(main_module.Path(tmpdir) / "material_cache.sqlite3"),
+            },
+            clear=False,
+        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True):
+            before = self.client.post("/analysis/material-cache/check", json=request_body)
+            build = self.client.post(
+                "/analysis/material-cache/build",
+                json={**request_body, "levels": ["material/full", "primary/light", "primary/safe", "auxiliary/summary"]},
+            )
+            after = self.client.post("/analysis/material-cache/check", json=request_body)
+
+        self.assertEqual(before.status_code, 200)
+        self.assertEqual(before.json()["summary"]["miss_count"], 4)
+        self.assertEqual(build.status_code, 200)
+        self.assertEqual(build.json()["summary"]["built_count"], 4)
+        self.assertEqual(after.status_code, 200)
+        self.assertEqual(after.json()["summary"]["hit_count"], 4)
 
     def test_attachment_download_without_cookie_attempts_request_and_handles_rejection(self) -> None:
         with patch.dict(
@@ -2539,6 +2714,268 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("Synthetic medical consumables procurement notice", report_body["report_markdown"])
         self.assertTrue(report_body["quality_check"]["passed"])
 
+    def test_analysis_run_cancel_marks_running_run_cancelled(self) -> None:
+        run_id = "run_20260707_cancel1"
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ):
+            main_module._write_analysis_run(
+                {
+                    "success": True,
+                    "run_id": run_id,
+                    "pack_id": "pack_cancel",
+                    "status": "running",
+                    "backend": "dify_legacy",
+                    "workflow_backend": "dify_legacy",
+                    "workflow_run_id": "wf-cancel",
+                    "created_at": "2026-07-07 10:00:00",
+                    "updated_at": "2026-07-07 10:00:00",
+                    "report_markdown": "",
+                    "quality_check": {"passed": None, "issues": []},
+                }
+            )
+
+            response = self.client.post(f"/analysis/runs/{run_id}/cancel")
+            status_body = self.client.get(f"/analysis/runs/{run_id}").json()
+            second_response = self.client.post(f"/analysis/runs/{run_id}/cancel")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["action"], "cancel")
+        self.assertEqual(body["run_id"], run_id)
+        self.assertEqual(body["status"], "cancelled")
+        self.assertEqual(status_body["status"], "cancelled")
+        self.assertTrue(status_body["cancel_requested"])
+        self.assertTrue(status_body["cancelled_at"])
+        self.assertEqual(status_body["nodes"][0]["status"], "cancelled")
+        self.assertEqual(status_body["control_events"][-1]["action"], "cancel")
+        self.assertEqual(second_response.status_code, 409)
+        self.assertEqual(second_response.json()["error"]["code"], "RUN_OPERATION_NOT_ALLOWED")
+
+    def test_analysis_run_retry_failed_run_starts_linked_new_run(self) -> None:
+        failed_run_id = "run_20260707_failed1"
+        calls: list[tuple[str, str]] = []
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            calls.append((pack_id, run_id))
+            return {
+                "workflow_run_id": "wf-retry-ok",
+                "status": "finished",
+                "report_title": "Retry report",
+                "report_markdown": "# Retry report\n\n## Intro\n\nRetry produced a complete report body. " * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_retry"}, create=True
+        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
+            main_module._write_analysis_run(
+                {
+                    "success": False,
+                    "run_id": failed_run_id,
+                    "pack_id": "pack_retry",
+                    "status": "failed",
+                    "backend": "dify_legacy",
+                    "workflow_backend": "dify_legacy",
+                    "workflow_run_id": "wf-failed",
+                    "created_at": "2026-07-07 10:00:00",
+                    "updated_at": "2026-07-07 10:01:00",
+                    "error_message": "failed once",
+                    "quality_check": {"passed": False, "issues": [{"issue_id": "DIFY_CALL_FAILED"}]},
+                    "use_report_memory": False,
+                }
+            )
+
+            response = self.client.post(f"/analysis/runs/{failed_run_id}/retry")
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            new_run_id = body["new_run_id"]
+            wait_until(lambda: self.client.get(f"/analysis/runs/{new_run_id}").json().get("status") == "finished")
+            failed_status = self.client.get(f"/analysis/runs/{failed_run_id}").json()
+            retry_status = self.client.get(f"/analysis/runs/{new_run_id}").json()
+
+        self.assertTrue(body["success"])
+        self.assertEqual(body["action"], "retry")
+        self.assertEqual(body["run_id"], failed_run_id)
+        self.assertTrue(new_run_id.startswith("run_"))
+        self.assertNotEqual(new_run_id, failed_run_id)
+        self.assertEqual(body["status"], "running")
+        self.assertEqual(body["pack_id"], "pack_retry")
+        self.assertEqual(calls, [("pack_retry", new_run_id)])
+        self.assertEqual(failed_status["status"], "failed")
+        self.assertEqual(failed_status["retried_by"], new_run_id)
+        self.assertEqual(retry_status["status"], "finished")
+        self.assertEqual(retry_status["retry_of"], failed_run_id)
+        self.assertEqual(retry_status["control_events"][0]["action"], "retry")
+
+    def test_analysis_run_resume_cancelled_run_starts_linked_new_run_and_checks_state(self) -> None:
+        cancelled_run_id = "run_20260707_resume1"
+        finished_run_id = "run_20260707_resume2"
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            return {
+                "workflow_run_id": "wf-resume-ok",
+                "status": "finished",
+                "report_title": "Resume report",
+                "report_markdown": "# Resume report\n\n## Intro\n\nResume produced a complete report body. " * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_resume"}, create=True
+        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
+            main_module._write_analysis_run(
+                {
+                    "success": True,
+                    "run_id": cancelled_run_id,
+                    "pack_id": "pack_resume",
+                    "status": "cancelled",
+                    "backend": "dify_legacy",
+                    "workflow_backend": "dify_legacy",
+                    "workflow_run_id": "wf-cancelled",
+                    "created_at": "2026-07-07 10:00:00",
+                    "updated_at": "2026-07-07 10:01:00",
+                    "quality_check": {"passed": None, "issues": []},
+                    "use_report_memory": False,
+                }
+            )
+            main_module._write_analysis_run(
+                {
+                    "success": True,
+                    "run_id": finished_run_id,
+                    "pack_id": "pack_resume",
+                    "status": "finished",
+                    "backend": "dify_legacy",
+                    "workflow_backend": "dify_legacy",
+                    "workflow_run_id": "wf-finished",
+                    "created_at": "2026-07-07 10:00:00",
+                    "updated_at": "2026-07-07 10:01:00",
+                    "report_markdown": "# Finished",
+                    "quality_check": {"passed": True, "issues": []},
+                    "use_report_memory": False,
+                }
+            )
+
+            response = self.client.post(f"/analysis/runs/{cancelled_run_id}/resume")
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            new_run_id = body["new_run_id"]
+            wait_until(lambda: self.client.get(f"/analysis/runs/{new_run_id}").json().get("status") == "finished")
+            resume_status = self.client.get(f"/analysis/runs/{new_run_id}").json()
+            invalid_response = self.client.post(f"/analysis/runs/{finished_run_id}/resume")
+
+        self.assertTrue(body["success"])
+        self.assertEqual(body["action"], "resume")
+        self.assertEqual(body["run_id"], cancelled_run_id)
+        self.assertEqual(body["status"], "running")
+        self.assertEqual(resume_status["status"], "finished")
+        self.assertEqual(resume_status["resume_of"], cancelled_run_id)
+        self.assertEqual(resume_status["control_events"][0]["action"], "resume")
+        self.assertEqual(invalid_response.status_code, 409)
+        self.assertEqual(invalid_response.json()["error"]["code"], "RUN_OPERATION_NOT_ALLOWED")
+
+    def test_analysis_run_reuses_active_duplicate_submission_by_input_hash(self) -> None:
+        calls: list[str] = []
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            calls.append(run_id)
+            started.set()
+            release.wait(timeout=2)
+            return {
+                "workflow_run_id": "wf-idempotent",
+                "status": "finished",
+                "report_title": "Idempotent report",
+                "report_markdown": "# Idempotent report\n\n## Intro\n\nDuplicate submissions should reuse the active run. " * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+                main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+            ), patch.object(
+                main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_idempotent"}, create=True
+            ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
+                first_response = self.client.post("/analysis/run", json={"pack_id": "pack_idempotent"})
+                self.assertEqual(first_response.status_code, 200)
+                self.assertTrue(started.wait(timeout=1))
+                second_response = self.client.post("/analysis/run", json={"pack_id": "pack_idempotent"})
+                release.set()
+                first_body = first_response.json()
+                second_body = second_response.json()
+                wait_until(lambda: self.client.get(f"/analysis/runs/{first_body['run_id']}").json().get("status") == "finished")
+                status_body = self.client.get(f"/analysis/runs/{first_body['run_id']}").json()
+        finally:
+            release.set()
+
+        self.assertEqual(second_response.status_code, 200)
+        self.assertEqual(second_body["run_id"], first_body["run_id"])
+        self.assertTrue(second_body["idempotency_reused"])
+        self.assertEqual(calls, [first_body["run_id"]])
+        self.assertEqual(status_body["idempotency_duplicate_count"], 1)
+        self.assertTrue(status_body["input_hash"])
+
+    def test_recover_pending_analysis_runs_marks_stale_active_runs_failed(self) -> None:
+        stale_run_id = "run_20260707_stale1"
+        fresh_run_id = "run_20260707_fresh1"
+        now = main_module.datetime.now().isoformat(sep=" ", timespec="seconds")
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ):
+            main_module._write_analysis_run(
+                {
+                    "success": True,
+                    "run_id": stale_run_id,
+                    "pack_id": "pack_recovery",
+                    "status": "running",
+                    "backend": "dify_legacy",
+                    "workflow_backend": "dify_legacy",
+                    "created_at": "2000-01-01 00:00:00",
+                    "updated_at": "2000-01-01 00:00:00",
+                    "quality_check": {"passed": None, "issues": []},
+                }
+            )
+            main_module._write_analysis_run(
+                {
+                    "success": True,
+                    "run_id": fresh_run_id,
+                    "pack_id": "pack_recovery",
+                    "status": "running",
+                    "backend": "dify_legacy",
+                    "workflow_backend": "dify_legacy",
+                    "created_at": now,
+                    "updated_at": now,
+                    "quality_check": {"passed": None, "issues": []},
+                }
+            )
+
+            result = main_module._recover_stale_pending_analysis_runs(stale_seconds=3600)
+            stale_status = self.client.get(f"/analysis/runs/{stale_run_id}").json()
+            fresh_status = self.client.get(f"/analysis/runs/{fresh_run_id}").json()
+
+        self.assertEqual(result["recovered_count"], 1)
+        self.assertEqual(result["checked_count"], 2)
+        self.assertEqual(stale_status["status"], "failed")
+        self.assertEqual(stale_status["recovery_reason"], "stale_pending_run")
+        self.assertEqual(stale_status["error_code"], "RUN_RECOVERED_STALE_PENDING")
+        self.assertEqual(stale_status["nodes"][0]["status"], "failed")
+        self.assertEqual(fresh_status["status"], "running")
+
     def test_analysis_run_with_memory_explicitly_false_keeps_legacy_dify_behavior(self) -> None:
         captured: dict[str, object] = {}
 
@@ -2629,6 +3066,105 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(len(status_body["report_memory_hash"]), 12)
         self.assertFalse(status_body["memory_read_failed"])
         self.assertFalse(status_body["report_memory_truncated"])
+
+    def test_analysis_run_injects_scoped_memory_items_and_records_used_ids(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
+            captured["report_memory"] = report_memory
+            captured["use_report_memory"] = use_report_memory
+            return {
+                "workflow_run_id": "wf-memory-items",
+                "status": "finished",
+                "report_title": "Memory item report",
+                "report_markdown": "# Memory item report\n\n## Intro\n\nReport body with enough structure and length to avoid fragment repair. "
+                * 8,
+                "version": 1,
+                "quality_check": {"passed": True, "issues": []},
+                "generation_warnings": [],
+                "remaining_issues": [],
+            }
+
+        pack = {
+            "pack_id": "pack_memory_items",
+            "primary_materials": [
+                {
+                    "menu_code": "ylsf",
+                    "articleid": "a1",
+                    "title": "Medical service price notice",
+                    "areaname": "广东",
+                    "projecttype": "医疗服务价格",
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value=pack, create=True
+        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True), patch.dict(
+            main_module.os.environ, {"MEMORY_DIR": str(main_module.Path(tmpdir) / "memory")}, clear=False
+        ):
+            (main_module.Path(tmpdir) / "runs").mkdir()
+            memory_dir = main_module.Path(tmpdir) / "memory"
+            memory_dir.mkdir()
+
+            from app.core.memory.items import MemoryItem, MemoryItemStore
+            from app.report_memory import MemoryKind, save_memory
+
+            save_memory(MemoryKind.REPORT, "# Report Memory\n\nUse conservative report wording.")
+            MemoryItemStore(memory_dir / "memory_items.json").save_items(
+                [
+                    MemoryItem(
+                        id="mem_global_style",
+                        title="Global style",
+                        content="Use concise executive recommendations.",
+                        status="approved",
+                        scopes=["global"],
+                        kind="writing_style",
+                    ),
+                    MemoryItem(
+                        id="mem_ylsf_angle",
+                        title="Medical service price angle",
+                        content="Compare mapping requirements and payment-rule changes.",
+                        status="approved",
+                        scopes=["menu_code:ylsf"],
+                        kind="analysis_angle",
+                    ),
+                    MemoryItem(
+                        id="mem_disabled",
+                        title="Disabled item",
+                        content="disabled content must not appear",
+                        status="disabled",
+                        scopes=["global"],
+                        kind="quality_rule",
+                    ),
+                    MemoryItem(
+                        id="mem_wrong_scope",
+                        title="Wrong scope",
+                        content="wrong scope content must not appear",
+                        status="approved",
+                        scopes=["menu_code:project_information"],
+                        kind="analysis_angle",
+                    ),
+                ]
+            )
+            response = self.client.post("/analysis/run", json={"pack_id": "pack_memory_items", "use_report_memory": True})
+            self.assertEqual(response.status_code, 200)
+            run_id = response.json()["run_id"]
+            wait_until(lambda: self.client.get(f"/analysis/runs/{run_id}").json().get("status") in {"finished", "needs_manual_review"})
+            status_body = self.client.get(f"/analysis/runs/{run_id}").json()
+
+        report_memory = str(captured["report_memory"])
+        self.assertTrue(captured["use_report_memory"])
+        self.assertIn("# Report Memory", report_memory)
+        self.assertIn("# Structured Memory Items", report_memory)
+        self.assertIn("Use concise executive recommendations.", report_memory)
+        self.assertIn("Compare mapping requirements and payment-rule changes.", report_memory)
+        self.assertNotIn("disabled content must not appear", report_memory)
+        self.assertNotIn("wrong scope content must not appear", report_memory)
+        self.assertEqual(status_body["used_memory_ids"], ["mem_global_style", "mem_ylsf_angle"])
+        self.assertEqual(status_body["memory_item_count"], 2)
 
     def test_analysis_run_truncates_oversized_existing_memory_without_blocking_generation(self) -> None:
         captured: dict[str, str] = {}
@@ -3309,6 +3845,10 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertIn("force_refresh_attachments", html)
         self.assertIn("reparseAttachmentsBtn", html)
+        self.assertIn("checkMaterialCacheBtn", html)
+        self.assertIn("buildMaterialCacheBtn", html)
+        self.assertIn("/analysis/material-cache/check", html)
+        self.assertIn("/analysis/material-cache/build", html)
         self.assertIn("\u91cd\u65b0\u89e3\u6790\u9644\u4ef6\u5e76\u751f\u6210\u8bc1\u636e\u5305", html)
         self.assertIn(".doc", html)
         self.assertNotIn("force_refresh_attachments: true,\n      };", html)

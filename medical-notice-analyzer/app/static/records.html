@@ -785,7 +785,7 @@
 
     .bottom-actions button {
       height: 40px;
-      min-width: 150px;
+      min-width: 132px;
       font-weight: 750;
     }
 
@@ -898,6 +898,12 @@
 
     .pack-actions .wide {
       grid-column: 1 / -1;
+    }
+    .cache-result {
+      display: grid;
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
     }
     .attachment-options {
       border: 1px solid var(--line);
@@ -1241,6 +1247,8 @@
       </span>
     </div>
     <div class="bottom-actions">
+      <button class="secondary" id="checkMaterialCacheBtn" type="button">检查材料缓存</button>
+      <button class="secondary" id="buildMaterialCacheBtn" type="button">预构建材料缓存</button>
       <button class="secondary" id="reparseAttachmentsBtn" type="button">↻ 重新解析附件</button>
       <button class="primary generate-button" id="confirmBtn" type="button">生成分析报告</button>
     </div>
@@ -1267,6 +1275,7 @@
       lastPrepareResult: null,
       lastForceRefresh: false,
       lastRunResult: null,
+      lastMaterialCacheResult: null,
       toastTimer: null,
     };
 
@@ -1503,6 +1512,7 @@
       target.push(normalized);
       state.lastPrepareResult = null;
       state.lastRunResult = null;
+      state.lastMaterialCacheResult = null;
       $('previewResult').classList.remove('show');
       $('previewResult').textContent = '';
       renderSelected();
@@ -1515,6 +1525,7 @@
       state[type] = state[type].filter((row) => keyOf(row) !== key);
       state.lastPrepareResult = null;
       state.lastRunResult = null;
+      state.lastMaterialCacheResult = null;
       $('previewResult').classList.remove('show');
       $('previewResult').textContent = '';
       renderSelected();
@@ -1527,6 +1538,7 @@
       state.auxiliary = [];
       state.lastPrepareResult = null;
       state.lastRunResult = null;
+      state.lastMaterialCacheResult = null;
       $('previewResult').classList.remove('show');
       $('previewResult').textContent = '';
       renderSelected();
@@ -1561,6 +1573,90 @@
       $('bottomPrimaryCount').textContent = `${state.primary.length}/3`;
       $('bottomAuxiliaryCount').textContent = `${state.auxiliary.length}/10`;
       $('confirmBtn').disabled = state.primary.length < 1;
+      $('checkMaterialCacheBtn').disabled = state.primary.length < 1;
+      $('buildMaterialCacheBtn').disabled = state.primary.length < 1;
+    }
+
+    function selectedPayload(extra = {}) {
+      return {
+        primary_materials: state.primary.map(({ menu_code, articleid }) => ({ menu_code, articleid })),
+        auxiliary_materials: state.auxiliary.map(({ menu_code, articleid }) => ({ menu_code, articleid })),
+        ...extra,
+      };
+    }
+
+    function renderMaterialCacheResult(data, actionLabel) {
+      state.lastMaterialCacheResult = data;
+      const summary = data.summary || {};
+      $('previewResult').classList.add('show');
+      $('previewResult').innerHTML = `
+        <div class="cache-result">
+          <strong>${escapeHtml(actionLabel)}</strong>
+          <div class="pack-stats">
+            <div class="pack-stat"><span>命中</span><b>${escapeHtml(summary.hit_count ?? 0)}</b></div>
+            <div class="pack-stat"><span>未命中</span><b>${escapeHtml(summary.miss_count ?? 0)}</b></div>
+            <div class="pack-stat"><span>已构建</span><b>${escapeHtml(summary.built_count ?? 0)}</b></div>
+          </div>
+          <div class="pack-stats">
+            <div class="pack-stat"><span>失效</span><b>${escapeHtml(summary.stale_count ?? 0)}</b></div>
+            <div class="pack-stat"><span>损坏</span><b>${escapeHtml(summary.corrupt_count ?? 0)}</b></div>
+            <div class="pack-stat"><span>失败</span><b>${escapeHtml(summary.failed_count ?? 0)}</b></div>
+          </div>
+          <div class="muted">仅检查或构建当前已选材料；报告正文和 Word 不会包含缓存内部信息。</div>
+        </div>
+      `;
+    }
+
+    async function checkMaterialCache() {
+      if (state.primary.length < 1) {
+        showToast('请至少选择 1 条主分析材料。', 'warning');
+        return;
+      }
+      const button = $('checkMaterialCacheBtn');
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '检查中...';
+      try {
+        const response = await fetch('/analysis/material-cache/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(selectedPayload()),
+        });
+        if (!response.ok) throw new Error(await readError(response));
+        renderMaterialCacheResult(await response.json(), '材料缓存检查结果');
+      } catch (error) {
+        showToast(`材料缓存检查失败：${error.message}`, 'error');
+      } finally {
+        button.disabled = state.primary.length < 1;
+        button.textContent = originalText;
+      }
+    }
+
+    async function buildMaterialCache() {
+      if (state.primary.length < 1) {
+        showToast('请至少选择 1 条主分析材料。', 'warning');
+        return;
+      }
+      const button = $('buildMaterialCacheBtn');
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = '构建中...';
+      try {
+        const response = await fetch('/analysis/material-cache/build', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(selectedPayload({
+            levels: ['material/full', 'primary/light', 'primary/safe', 'auxiliary/summary'],
+          })),
+        });
+        if (!response.ok) throw new Error(await readError(response));
+        renderMaterialCacheResult(await response.json(), '材料缓存构建结果');
+      } catch (error) {
+        showToast(`材料缓存构建失败：${error.message}`, 'error');
+      } finally {
+        button.disabled = state.primary.length < 1;
+        button.textContent = originalText;
+      }
     }
 
     async function showDetail(menuCode, articleId) {
@@ -1957,6 +2053,8 @@
     }
 
     $('confirmBtn').addEventListener('click', () => confirmSelection(false, true));
+    $('checkMaterialCacheBtn').addEventListener('click', checkMaterialCache);
+    $('buildMaterialCacheBtn').addEventListener('click', buildMaterialCache);
     $('reparseAttachmentsBtn').addEventListener('click', () => confirmSelection(true));
     $('previewResult').addEventListener('click', (event) => {
       const button = event.target.closest('button');

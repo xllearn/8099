@@ -39,14 +39,30 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field, HttpUrl
 from pypdf import PdfReader
 
+from app.attachment_cache import cache_dir as attachment_parse_cache_dir
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
+from app.core.llm import LLMProviderError, get_llm_provider
+from app.core.evidence import annotate_evidence_pack_v3_lite
+from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
 from app.core.quality import analysis_run_export_precheck
 from app.core.workflow.engine import run_local_workflow
 from app.core.workflow.state import WorkflowBackend, make_workflow_node
 from app.core.workflow.store import WorkflowRunStore, WorkflowRunStoreError
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
+from app.material_compression_cache import (
+    MaterialCacheSignature,
+    MaterialCompressionCacheRepository,
+    attachment_options_hash,
+    make_material_cache_key,
+    material_attachment_hash,
+    material_cache_db_path,
+    material_cache_enabled,
+    material_source_hash,
+)
+from app.material_compressor import SUPPORTED_MATERIAL_VIEW_TYPES, build_material_compression_view
+from app.ops_health import cleanup_local_storage, directory_snapshot, file_snapshot, summarize_json_directory
 from app.report_memory import (
     MemoryContentError,
     MemoryKind,
@@ -54,6 +70,7 @@ from app.report_memory import (
     read_memory,
     require_write_token,
     save_memory,
+    write_protection_enabled,
 )
 
 try:
@@ -367,6 +384,11 @@ class SelectionPreviewRequest(BaseModel):
     attachment_headers: dict[str, str] = Field(default_factory=dict)
 
 
+class MaterialCacheBuildRequest(SelectionPreviewRequest):
+    levels: list[str] = Field(default_factory=lambda: list(SUPPORTED_MATERIAL_VIEW_TYPES))
+    force_refresh_cache: bool = False
+
+
 class SelectionPreviewResponse(BaseModel):
     success: bool
     primary_materials: list[RecordListItem]
@@ -397,6 +419,19 @@ class AnalysisRunResponse(BaseModel):
     report_title: str = ""
     quality_passed: bool | None = None
     version: int = 1
+    warnings: list[str] = Field(default_factory=list)
+    input_hash: str = ""
+    idempotency_reused: bool = False
+
+
+class AnalysisRunControlResponse(BaseModel):
+    success: bool
+    action: str
+    run_id: str
+    status: str
+    pack_id: str = ""
+    new_run_id: str = ""
+    workflow_run_id: str = ""
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -435,6 +470,14 @@ class MemoryUpdateRequest(BaseModel):
     content: str = ""
 
 
+class MemoryItemUpdateRequest(BaseModel):
+    title: str = ""
+    content: str = ""
+    status: str = "disabled"
+    scopes: list[str] = Field(default_factory=list)
+    kind: str = "writing_rule"
+
+
 class MemoryResponse(BaseModel):
     success: bool = True
     kind: str
@@ -446,6 +489,29 @@ class MemoryResponse(BaseModel):
     write_protection_enabled: bool
     backup_name: str = ""
     warning: str = ""
+
+
+class MemoryItemResponse(BaseModel):
+    id: str
+    title: str
+    content: str
+    status: str
+    scopes: list[str] = Field(default_factory=list)
+    kind: str
+    created_at: str = ""
+    updated_at: str = ""
+
+
+class MemoryItemsResponse(BaseModel):
+    success: bool = True
+    items: list[MemoryItemResponse] = Field(default_factory=list)
+    write_protection_enabled: bool = False
+
+
+class MemoryItemSaveResponse(BaseModel):
+    success: bool = True
+    item: MemoryItemResponse
+    write_protection_enabled: bool = False
 
 
 @dataclass
@@ -466,22 +532,32 @@ app = FastAPI(title="Medical Notice Analyzer", version="0.1.0")
 REPORT_DIR = Path(os.getenv("REPORT_DIR", "/tmp/medical-notice-reports"))
 SITE_CACHE_DIR = Path(os.getenv("SITE_CACHE_DIR", "/app/site-cache"))
 DEFAULT_PUBLIC_BASE_URL = "http://192.168.34.88:8099"
+_ANALYSIS_RUN_CREATE_LOCK = threading.Lock()
 
 
 @app.on_event("startup")
 def _cleanup_attachment_parse_cache_on_start() -> None:
-    if not _env_bool("ATTACHMENT_PARSE_CACHE_CLEANUP_ON_START", True):
-        return
+    if _env_bool("ATTACHMENT_PARSE_CACHE_CLEANUP_ON_START", True):
+        try:
+            result = cleanup_cache()
+            if result.get("deleted_files"):
+                logger.info(
+                    "attachment_parse_cache_cleanup deleted_files=%s freed_bytes=%s",
+                    result.get("deleted_files"),
+                    result.get("freed_bytes"),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("attachment_parse_cache_cleanup_failed error_type=%s", exc.__class__.__name__)
     try:
-        result = cleanup_cache()
-        if result.get("deleted_files"):
-            logger.info(
-                "attachment_parse_cache_cleanup deleted_files=%s freed_bytes=%s",
-                result.get("deleted_files"),
-                result.get("freed_bytes"),
+        recovery = _recover_stale_pending_analysis_runs()
+        if recovery.get("recovered_count"):
+            logger.warning(
+                "analysis_run_startup_recovered_stale_pending checked_count=%s recovered_count=%s",
+                recovery.get("checked_count"),
+                recovery.get("recovered_count"),
             )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("attachment_parse_cache_cleanup_failed error_type=%s", exc.__class__.__name__)
+        logger.warning("analysis_run_startup_recovery_failed error_type=%s", exc.__class__.__name__)
 
 ARTICLE_LIST_FIELDS = [
     "menu_code",
@@ -571,6 +647,165 @@ def health() -> dict[str, Any]:
         "report_dir": str(REPORT_DIR),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
         "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
+    }
+
+
+@app.get("/health/db")
+def health_db(check: bool = Query(False, description="Run a lightweight SELECT 1 database check")) -> dict[str, Any]:
+    cfg = _db_config()
+    configured = bool(cfg.get("database") and cfg.get("user"))
+    payload: dict[str, Any] = {
+        "success": True,
+        "component": "db",
+        "dependency_class": "external_database",
+        "status": "configured" if configured else "unconfigured",
+        "configured": configured,
+        "checked": False,
+        "config": {
+            "host": cfg.get("host") or "",
+            "port": cfg.get("port") or 0,
+            "database": cfg.get("database") or "",
+            "user_configured": bool(cfg.get("user")),
+            "charset": cfg.get("charset") or "",
+        },
+    }
+    if not check or not configured:
+        return payload
+    started = time.perf_counter()
+    payload["checked"] = True
+    try:
+        row = _db_fetch_one("SELECT 1 AS ok", [])
+        payload["status"] = "ok" if row is not None else "error"
+        payload["result"] = "select_1_ok" if row is not None else "select_1_empty"
+    except HTTPException as exc:
+        payload["status"] = "error"
+        payload["error"] = {"code": "DB_CHECK_FAILED", "status_code": exc.status_code, "message": str(exc.detail)}
+    except Exception as exc:  # noqa: BLE001
+        payload["status"] = "error"
+        payload["error"] = {"code": "DB_CHECK_FAILED", "error_type": exc.__class__.__name__}
+    payload["latency_ms"] = int((time.perf_counter() - started) * 1000)
+    return payload
+
+
+@app.get("/health/llm")
+def health_llm() -> dict[str, Any]:
+    backend = _selected_workflow_backend().value
+    base_url = (os.getenv("DIFY_BASE_URL") or "").strip().rstrip("/")
+    endpoint = (os.getenv("DIFY_REPORT_WORKFLOW_ENDPOINT") or "/workflows/run").strip() or "/workflows/run"
+    api_key_configured = bool((os.getenv("DIFY_WORKFLOW_API_KEY") or "").strip())
+    dify_configured = bool(base_url and api_key_configured)
+    provider_name = (os.getenv("LLM_PROVIDER") or "mock").strip().lower() or "mock"
+    local_provider: dict[str, Any] = {"provider": provider_name, "status": "configured"}
+    try:
+        provider = get_llm_provider(provider_name)
+        local_provider["provider"] = provider.provider
+        local_provider["model"] = provider.model
+    except LLMProviderError as exc:
+        local_provider = {"provider": provider_name, "status": "error", "error_code": exc.code}
+    status = "configured" if (backend == WorkflowBackend.DIFY_LEGACY.value and dify_configured) else "unconfigured"
+    if backend == WorkflowBackend.LOCAL_ENGINE.value:
+        status = "ok" if local_provider.get("status") != "error" else "error"
+    return {
+        "success": True,
+        "component": "llm",
+        "dependency_class": "workflow_or_model_provider",
+        "status": status,
+        "workflow_backend": backend,
+        "dify": {
+            "configured": dify_configured,
+            "base_url": base_url,
+            "endpoint": endpoint,
+            "api_key_configured": api_key_configured,
+            "response_mode": (os.getenv("DIFY_RESPONSE_MODE") or "blocking").strip() or "blocking",
+        },
+        "local_provider": local_provider,
+    }
+
+
+def _storage_health_payload() -> dict[str, Any]:
+    stores = [
+        directory_snapshot("reports", REPORT_DIR, patterns=["*.docx"]),
+        directory_snapshot("site_cache", SITE_CACHE_DIR),
+        directory_snapshot("attachment_parse_cache", attachment_parse_cache_dir(), patterns=["*.json"]),
+        directory_snapshot("database_packs", _database_evidence_pack_dir(), patterns=["pack_*.json"]),
+        directory_snapshot("analysis_runs", _analysis_run_dir(), patterns=["run_*.json"]),
+        file_snapshot("material_compression_cache", material_cache_db_path()),
+    ]
+    error_statuses = {"error", "not_directory"}
+    status = "degraded" if any(item.get("status") in error_statuses for item in stores) else "ok"
+    return {
+        "success": True,
+        "component": "storage",
+        "dependency_class": "local_filesystem",
+        "status": status,
+        "stores": stores,
+    }
+
+
+@app.get("/health/storage")
+def health_storage() -> dict[str, Any]:
+    return _storage_health_payload()
+
+
+def _parse_cleanup_scopes(scope: str) -> list[str]:
+    scopes = [item.strip().lower() for item in str(scope or "").split(",") if item.strip()]
+    scopes = scopes or ["all"]
+    allowed = {"all", "reports", "attachment_parse_cache"}
+    unknown = sorted(set(scopes) - allowed)
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"unknown cleanup scope: {', '.join(unknown)}")
+    if "all" in scopes:
+        return ["all"]
+    return list(dict.fromkeys(scopes))
+
+
+@app.post("/ops/cleanup")
+def ops_cleanup(
+    scope: str = Query("all", description="Comma-separated cleanup scopes: all,reports,attachment_parse_cache"),
+    dry_run: bool = Query(True),
+    max_delete: int = Query(100, ge=0, le=1000),
+) -> dict[str, Any]:
+    scopes = _parse_cleanup_scopes(scope)
+    result = cleanup_local_storage(
+        scopes=scopes,
+        report_dir=REPORT_DIR,
+        attachment_cache_dir=attachment_parse_cache_dir(),
+        report_retention_hours=_env_int("REPORT_RETENTION_HOURS", 168),
+        dry_run=dry_run,
+        max_delete=max_delete,
+    )
+    logger.info(
+        "ops_cleanup_completed scopes=%s dry_run=%s max_delete=%s deleted_files=%s freed_bytes=%s",
+        ",".join(result.get("scopes") or []),
+        dry_run,
+        max_delete,
+        result.get("total_deleted_files"),
+        result.get("total_freed_bytes"),
+    )
+    return result
+
+
+@app.get("/ops/diagnostics")
+def ops_diagnostics() -> dict[str, Any]:
+    storage = _storage_health_payload()
+    return {
+        "success": True,
+        "service": "medical-notice-analyzer",
+        "version": app.version,
+        "diagnostics": {
+            "storage": storage,
+            "analysis_runs": summarize_json_directory(_analysis_run_dir(), "run_*.json"),
+            "database_packs": summarize_json_directory(_database_evidence_pack_dir(), "pack_*.json"),
+            "dependencies": {
+                "db": health_db(check=False),
+                "llm": health_llm(),
+            },
+            "cleanup": {
+                "available_scopes": ["reports", "attachment_parse_cache"],
+                "default_dry_run": True,
+                "max_delete_limit": 1000,
+            },
+        },
     }
 
 
@@ -1245,6 +1480,10 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
         business_value = str(table.get("business_value") or "")
         table_summaries.append(
             {
+                "evidence_id": table.get("evidence_id") or "",
+                "source_span": copy.deepcopy(table.get("source_span") or {}),
+                "confidence": table.get("confidence") or "",
+                "parse_risks": list(table.get("parse_risks") or [])[:8],
                 "sheet_name": table.get("sheet_name") or "",
                 "rows": table.get("rows") or 0,
                 "columns_count": table.get("columns_count") or 0,
@@ -1294,6 +1533,10 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
         section_limit = max(section_limit, len(list(attachment.get("important_sections") or [])))
         section_chars = 1200
     compact = {
+        "evidence_id": attachment.get("evidence_id") or "",
+        "source_span": copy.deepcopy(attachment.get("source_span") or {}),
+        "confidence": attachment.get("confidence") or "",
+        "parse_risks": list(attachment.get("parse_risks") or [])[:8],
         "articleattid": attachment.get("articleattid") or "",
         "filename": attachment.get("filename") or "",
         "fileext": attachment.get("fileext") or "",
@@ -1313,6 +1556,10 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
         ],
         "table_summaries": table_summaries,
     }
+    if attachment.get("key_fact_evidence_refs"):
+        compact["key_fact_evidence_refs"] = list(attachment.get("key_fact_evidence_refs") or [])[:key_fact_limit]
+    if attachment.get("important_section_evidence_refs"):
+        compact["important_section_evidence_refs"] = list(attachment.get("important_section_evidence_refs") or [])[:section_limit]
     compact["evidence_value_score"] = _evidence_value_score_attachment(attachment, role=role)
     return compact
 
@@ -1339,6 +1586,10 @@ def _compact_material_for_dify(
     key_fact_limit = max(16, len(list(material.get("key_facts") or []))) if preserve_detail else 16
     compact = {
         "material_role": material.get("material_role") or role,
+        "evidence_id": material.get("evidence_id") or "",
+        "source_span": copy.deepcopy(material.get("source_span") or {}),
+        "confidence": material.get("confidence") or "",
+        "parse_risks": list(material.get("parse_risks") or [])[:8],
         "evidence_source_type": "attachment_led_primary"
         if role == "primary" and _is_attachment_led_primary_material(material)
         else ("primary_body" if role == "primary" else "auxiliary_reference"),
@@ -1544,6 +1795,9 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
         "pack_id": pack.get("pack_id") or "",
         "created_at": pack.get("created_at") or "",
         "pack_version": pack.get("pack_version") or "2.0",
+        "evidence_schema_version": pack.get("evidence_schema_version") or "",
+        "evidence_item_count": len(pack.get("evidence_items") or []),
+        "parse_risks": list(pack.get("parse_risks") or [])[:20],
         "source": pack.get("source") or "database_selection",
         "primary_materials": primary,
         "auxiliary_materials": auxiliary,
@@ -1953,6 +2207,128 @@ def _read_analysis_run(run_id: str) -> dict[str, Any]:
         if exc.code == "RUN_NOT_FOUND":
             raise HTTPException(status_code=404, detail="analysis run not found") from exc
         raise HTTPException(status_code=500, detail=f"analysis run read failed: {exc.code}") from exc
+
+
+def _list_analysis_runs() -> list[dict[str, Any]]:
+    try:
+        return _analysis_run_store().list_runs()
+    except WorkflowRunStoreError as exc:
+        logger.warning("analysis_run_list_failed code=%s", exc.code)
+        return []
+
+
+def _active_analysis_run_statuses() -> set[str]:
+    return {"created", "running"}
+
+
+def _analysis_run_input_hash(
+    *,
+    pack_id: str,
+    backend: str,
+    use_report_memory: bool,
+    memory_metadata: dict[str, Any],
+) -> str:
+    payload = {
+        "pack_id": pack_id,
+        "workflow_backend": backend,
+        "use_report_memory": bool(use_report_memory),
+        "report_memory_hash": str(memory_metadata.get("report_memory_hash") or ""),
+        "used_memory_ids": list(memory_metadata.get("used_memory_ids") or []),
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _find_active_analysis_run_by_input_hash(input_hash: str) -> dict[str, Any] | None:
+    if not input_hash:
+        return None
+    for record in _list_analysis_runs():
+        if str(record.get("input_hash") or "") != input_hash:
+            continue
+        if str(record.get("status") or "") in _active_analysis_run_statuses():
+            return record
+    return None
+
+
+def _mark_analysis_run_idempotency_reuse(record: dict[str, Any]) -> dict[str, Any]:
+    duplicate_count = int(record.get("idempotency_duplicate_count") or 0) + 1
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    record["idempotency_duplicate_count"] = duplicate_count
+    record["last_duplicate_at"] = now
+    record["updated_at"] = now
+    _append_analysis_run_control_event(
+        record,
+        _make_analysis_run_control_event(
+            "idempotency_reuse",
+            source_run_id=str(record.get("run_id") or ""),
+            target_run_id=str(record.get("run_id") or ""),
+            status_before=str(record.get("status") or ""),
+            status_after=str(record.get("status") or ""),
+        ),
+    )
+    _write_analysis_run(record)
+    reused = dict(record)
+    reused["idempotency_reused"] = True
+    return reused
+
+
+def _analysis_run_recovery_stale_seconds() -> float:
+    return max(0.0, _env_float("ANALYSIS_RUN_RECOVERY_STALE_SECONDS", 3600.0))
+
+
+def _pending_run_is_stale(record: dict[str, Any], stale_seconds: float, now: datetime | None = None) -> bool:
+    if str(record.get("status") or "") not in _active_analysis_run_statuses():
+        return False
+    if stale_seconds <= 0:
+        return False
+    started_at = _parse_analysis_timestamp(record.get("started_at") or record.get("created_at") or record.get("updated_at"))
+    if not started_at:
+        return False
+    return ((now or datetime.now()) - started_at).total_seconds() >= stale_seconds
+
+
+def _recover_stale_pending_analysis_runs(stale_seconds: float | None = None) -> dict[str, Any]:
+    threshold = _analysis_run_recovery_stale_seconds() if stale_seconds is None else max(0.0, float(stale_seconds))
+    records = _list_analysis_runs()
+    checked_count = 0
+    recovered_run_ids: list[str] = []
+    now_dt = datetime.now()
+    now = now_dt.isoformat(sep=" ", timespec="seconds")
+    for record in records:
+        if str(record.get("status") or "") not in _active_analysis_run_statuses():
+            continue
+        checked_count += 1
+        if not _pending_run_is_stale(record, threshold, now_dt):
+            continue
+        record.update(
+            {
+                "success": False,
+                "status": "failed",
+                "updated_at": now,
+                "finished_at": now,
+                "recovered_at": now,
+                "recovery_reason": "stale_pending_run",
+                "error_code": "RUN_RECOVERED_STALE_PENDING",
+                "error_message": "服务启动恢复：上次遗留的运行中任务已标记为失败，可重试",
+                "error_detail": f"pending run exceeded recovery threshold {threshold:.0f}s",
+            }
+        )
+        _append_analysis_run_control_event(
+            record,
+            _make_analysis_run_control_event(
+                "startup_recovery",
+                source_run_id=str(record.get("run_id") or ""),
+                status_before="running",
+                status_after="failed",
+            ),
+        )
+        _write_analysis_run(record)
+        recovered_run_ids.append(str(record.get("run_id") or ""))
+    return {
+        "checked_count": checked_count,
+        "recovered_count": len(recovered_run_ids),
+        "recovered_run_ids": recovered_run_ids,
+        "stale_seconds": threshold,
+    }
 
 
 class DifyWorkflowError(Exception):
@@ -2458,7 +2834,7 @@ def _fallback_result_from_dify_error(
     return result
 
 
-def _resolve_report_memory_snapshot(requested: bool) -> tuple[str, dict[str, Any], list[str]]:
+def _resolve_report_memory_snapshot(requested: bool, pack: dict[str, Any] | None = None) -> tuple[str, dict[str, Any], list[str]]:
     metadata = {
         "use_report_memory": bool(requested),
         "report_memory_applied": False,
@@ -2466,6 +2842,10 @@ def _resolve_report_memory_snapshot(requested: bool) -> tuple[str, dict[str, Any
         "report_memory_hash": "",
         "memory_read_failed": False,
         "report_memory_truncated": False,
+        "used_memory_ids": [],
+        "memory_item_count": 0,
+        "memory_item_chars": 0,
+        "memory_items_read_failed": False,
     }
     if not requested:
         return "", metadata, []
@@ -2477,6 +2857,19 @@ def _resolve_report_memory_snapshot(requested: bool) -> tuple[str, dict[str, Any
         return "", metadata, ["长期记忆读取失败，本次报告已按未使用长期记忆继续生成。"]
 
     content = document.content
+    memory_item_section = ""
+    if pack:
+        try:
+            memory_items = retrieve_scoped_memory_items(MemoryItemStore(memory_items_path()), pack)
+            memory_item_section = format_memory_items_for_prompt(memory_items)
+            metadata["used_memory_ids"] = [item.id for item in memory_items]
+            metadata["memory_item_count"] = len(memory_items)
+            metadata["memory_item_chars"] = len(memory_item_section)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("memory_items_read_failed error_type=%s", exc.__class__.__name__)
+            metadata["memory_items_read_failed"] = True
+    if memory_item_section:
+        content = "\n\n".join([content.rstrip(), memory_item_section])
     max_chars = int(document.max_chars or 15000)
     if len(content) > max_chars:
         content = content[:max_chars]
@@ -2491,6 +2884,8 @@ def _resolve_report_memory_snapshot(requested: bool) -> tuple[str, dict[str, Any
     warnings = []
     if metadata["report_memory_truncated"]:
         warnings.append(f"长期记忆超过 {max_chars} 字符，已截断后传入 Dify，请在 /memory-ui 精简。")
+    if metadata["memory_items_read_failed"]:
+        warnings.append("结构化记忆条目读取失败，本次报告仅使用可读取的正式记忆继续生成。")
     return content, metadata, warnings
 
 
@@ -2733,6 +3128,74 @@ def _attachment_request_options(req: SelectionPreviewRequest) -> dict[str, Any]:
         "force_refresh": bool(req.force_refresh_attachments),
         "user_cookie": user_cookie,
         "user_headers": user_headers,
+    }
+
+
+def _material_cache_repository() -> MaterialCompressionCacheRepository:
+    return MaterialCompressionCacheRepository(material_cache_db_path())
+
+
+def _material_cache_signature(row: dict[str, Any], attachments: list[dict[str, Any]], attachment_options: dict[str, Any], view_type: str) -> MaterialCacheSignature:
+    source_hash = material_source_hash(row)
+    attachment_hash = material_attachment_hash(attachments)
+    options_hash = attachment_options_hash(attachment_options)
+    cache_key = make_material_cache_key(
+        menu_code=str(row.get("menu_code") or ""),
+        articleid=str(row.get("articleid") or ""),
+        view_type=view_type,
+        source_hash=source_hash,
+        attachment_hash=attachment_hash,
+        attachment_options_hash=options_hash,
+    )
+    return MaterialCacheSignature(
+        cache_key=cache_key,
+        menu_code=str(row.get("menu_code") or ""),
+        articleid=str(row.get("articleid") or ""),
+        view_type=view_type,
+        source_hash=source_hash,
+        attachment_hash=attachment_hash,
+        attachment_options_hash=options_hash,
+    )
+
+
+def _empty_material_cache_stats(enabled: bool) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "hit_count": 0,
+        "miss_count": 0,
+        "stale_count": 0,
+        "corrupt_count": 0,
+        "failed_count": 0,
+        "building_count": 0,
+        "building_timeout_count": 0,
+        "force_refresh_count": 0,
+        "dynamic_count": 0,
+        "built_count": 0,
+        "disabled_count": 0,
+    }
+
+
+def _record_material_cache_status(stats: dict[str, Any], status: str, *, dynamic: bool = False, built: bool = False) -> None:
+    key = f"{status}_count"
+    if key in stats:
+        stats[key] = int(stats.get(key) or 0) + 1
+    if dynamic:
+        stats["dynamic_count"] = int(stats.get("dynamic_count") or 0) + 1
+    if built:
+        stats["built_count"] = int(stats.get("built_count") or 0) + 1
+
+
+def _material_cache_meta(signature: MaterialCacheSignature | None, status: str, *, dynamic: bool = False, build_source: str = "") -> dict[str, Any]:
+    return {
+        "enabled": material_cache_enabled(),
+        "status": status,
+        "cache_key": signature.cache_key if signature else "",
+        "view_type": signature.view_type if signature else "material/full",
+        "source_hash": signature.source_hash if signature else "",
+        "attachment_hash": signature.attachment_hash if signature else "",
+        "attachment_options_hash": signature.attachment_options_hash if signature else "",
+        "dynamic_fallback": bool(dynamic),
+        "build_source": build_source,
     }
 
 
@@ -3094,6 +3557,146 @@ def _build_database_material(
     return base
 
 
+_PRIMARY_CONTEXT_FIELDS = [
+    "important_passages",
+    "policy_rules",
+    "price_rules",
+    "time_requirements",
+    "product_scope",
+    "enterprise_requirements",
+    "execution_requirements",
+]
+_AUXILIARY_CONTEXT_FIELDS = ["relation_to_primary", "relevance_score", "relevant_snippets", "usable_points"]
+
+
+def _apply_material_role_context(material: dict[str, Any], *, role: str, row: dict[str, Any], primary_keywords: list[str]) -> dict[str, Any]:
+    material["material_role"] = role
+    material["menu_code"] = row.get("menu_code") or material.get("menu_code") or ""
+    material["articleid"] = row.get("articleid") or material.get("articleid") or ""
+    material["title"] = row.get("title") or material.get("title") or ""
+    material["audittime"] = row.get("audittime") or material.get("audittime") or ""
+    material["menu_name"] = row.get("menu_name") or material.get("menu_name") or ""
+    material["source"] = row.get("source") or material.get("source") or ""
+    material["sourceurl"] = row.get("sourceurl") or material.get("sourceurl") or ""
+    material["areaname"] = row.get("areaname") or material.get("areaname") or ""
+    material["publicorg"] = row.get("publicorg") or material.get("publicorg") or ""
+    material["projectphase"] = row.get("projectphase") or material.get("projectphase") or ""
+    material["projecttype"] = row.get("projecttype") or material.get("projecttype") or ""
+    material["category"] = row.get("category") or material.get("category") or ""
+    material["summary"] = row.get("summary") or material.get("summary") or ""
+    content_text = str(material.get("content_text") or "")
+    if role == "primary":
+        for field in _AUXILIARY_CONTEXT_FIELDS:
+            material.pop(field, None)
+        material.update(
+            {
+                "updatetime": row.get("updatetime") or "",
+                "dl_project_type": row.get("dl_project_type") or "",
+                "referencenumber": row.get("referencenumber") or "",
+                "policytype": row.get("policytype") or "",
+                "belongproject": row.get("belongproject") or "",
+                "projectabbreviation": row.get("projectabbreviation") or "",
+                "content_html_length": len(str(row.get("content") or "")),
+                "content_text_length": len(content_text),
+                "key_facts": _material_key_facts(row),
+            }
+        )
+    else:
+        for field in _PRIMARY_CONTEXT_FIELDS:
+            material.pop(field, None)
+        material["usable_points"] = _material_key_facts(row)
+    _enhance_material_for_stage4(material, primary_keywords)
+    return material
+
+
+def _build_database_material_for_prepare(
+    *,
+    role: str,
+    row: dict[str, Any],
+    attachments: list[dict[str, Any]],
+    warnings: list[str],
+    attachment_options: dict[str, Any],
+    primary_keywords: list[str],
+    material_cache_stats: dict[str, Any],
+) -> dict[str, Any]:
+    cache_enabled = material_cache_enabled()
+    signature: MaterialCacheSignature | None = None
+    read_status = "disabled"
+    if cache_enabled:
+        signature = _material_cache_signature(row, attachments, attachment_options, "material/full")
+        read_result = _material_cache_repository().read_payload(signature, force_refresh=bool(attachment_options.get("force_refresh")))
+        read_status = read_result.status
+        if read_result.status == "hit" and read_result.payload:
+            material = copy.deepcopy(read_result.payload)
+            _apply_material_role_context(material, role=role, row=row, primary_keywords=primary_keywords)
+            material["material_cache"] = _material_cache_meta(signature, "hit")
+            _record_material_cache_status(material_cache_stats, "hit")
+            return material
+    material = _build_database_material(
+        role=role,
+        row=row,
+        attachments=attachments,
+        warnings=warnings,
+        attachment_options=attachment_options,
+    )
+    _apply_material_role_context(material, role=role, row=row, primary_keywords=primary_keywords)
+    if cache_enabled:
+        material["material_cache"] = _material_cache_meta(signature, read_status, dynamic=True)
+        _record_material_cache_status(material_cache_stats, read_status, dynamic=True)
+    else:
+        _record_material_cache_status(material_cache_stats, "disabled", dynamic=True)
+    return material
+
+
+def _build_and_store_material_cache_views(
+    *,
+    row: dict[str, Any],
+    attachments: list[dict[str, Any]],
+    attachment_options: dict[str, Any],
+    levels: list[str],
+    role: str,
+    primary_keywords: list[str],
+    force_refresh: bool = False,
+    build_source: str = "api",
+) -> tuple[int, list[dict[str, Any]]]:
+    repo = _material_cache_repository()
+    warnings: list[str] = []
+    material = _build_database_material(
+        role=role,
+        row=row,
+        attachments=attachments,
+        warnings=warnings,
+        attachment_options=attachment_options,
+    )
+    _apply_material_role_context(material, role=role, row=row, primary_keywords=primary_keywords)
+    built_count = 0
+    results: list[dict[str, Any]] = []
+    for view_type in levels:
+        if view_type not in SUPPORTED_MATERIAL_VIEW_TYPES:
+            results.append({"view_type": view_type, "status": "invalid_view_type"})
+            continue
+        signature = _material_cache_signature(row, attachments, attachment_options, view_type)
+        read = repo.read_payload(signature, force_refresh=force_refresh)
+        if read.status == "hit" and not force_refresh:
+            results.append({"view_type": view_type, "status": "hit", "cache_key": signature.cache_key})
+            continue
+        try:
+            repo.mark_building(signature, build_source=build_source)
+            payload = build_material_compression_view(material, view_type)
+            repo.write_ready(
+                signature,
+                payload,
+                diagnostics={"warnings": warnings, "payload_chars": len(json.dumps(payload, ensure_ascii=False))},
+                build_source=build_source,
+            )
+            built_count += 1
+            results.append({"view_type": view_type, "status": "built", "cache_key": signature.cache_key})
+        except Exception as exc:  # noqa: BLE001
+            repo.mark_failed(signature, exc.__class__.__name__, str(exc), build_source=build_source)
+            results.append({"view_type": view_type, "status": "failed", "cache_key": signature.cache_key, "error": exc.__class__.__name__})
+    return built_count, results
+
+
 def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
     primary_keys, auxiliary_keys, error = _validate_material_selection(req)
     if error is not None:
@@ -3117,31 +3720,32 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
     attachments_by_key = _fetch_database_attachments(all_keys)
     attachment_options = _attachment_request_options(req)
     warnings: list[str] = []
+    primary_keywords = _primary_topic_keywords([rows_by_key[key] for key in primary_keys])
+    material_cache_stats = _empty_material_cache_stats(material_cache_enabled())
     primary_materials = [
-        _build_database_material(
+        _build_database_material_for_prepare(
             role="primary",
             row=rows_by_key[key],
             attachments=attachments_by_key.get(key, []),
             warnings=warnings,
             attachment_options=attachment_options,
+            primary_keywords=primary_keywords,
+            material_cache_stats=material_cache_stats,
         )
         for key in primary_keys
     ]
     auxiliary_materials = [
-        _build_database_material(
+        _build_database_material_for_prepare(
             role="auxiliary",
             row=rows_by_key[key],
             attachments=attachments_by_key.get(key, []),
             warnings=warnings,
             attachment_options=attachment_options,
+            primary_keywords=primary_keywords,
+            material_cache_stats=material_cache_stats,
         )
         for key in auxiliary_keys
     ]
-    primary_keywords = _primary_topic_keywords([rows_by_key[key] for key in primary_keys])
-    for material in primary_materials:
-        _enhance_material_for_stage4(material, primary_keywords)
-    for material in auxiliary_materials:
-        _enhance_material_for_stage4(material, primary_keywords)
     attachment_count = sum(len(item.get("attachments") or []) for item in [*primary_materials, *auxiliary_materials])
     combined_key_facts: list[dict[str, str]] = []
     for material in primary_materials:
@@ -3163,8 +3767,10 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
         "combined_key_facts": combined_key_facts,
         "report_focus": _unique(report_focus)[:20],
         "warnings": warnings,
+        "material_cache_stats": material_cache_stats,
     }
     pack.update(_build_stage4_pack_fields(primary_materials, auxiliary_materials, combined_key_facts, pack["report_focus"]))
+    pack = annotate_evidence_pack_v3_lite(pack)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
     _write_database_evidence_pack(pack)
     return pack
@@ -3195,6 +3801,14 @@ def memory_ui():
     return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
+@app.get("/ops-diagnostics-ui")
+def ops_diagnostics_ui():
+    path = Path(__file__).resolve().parent / "static" / "ops_diagnostics.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="ops diagnostics UI not found")
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
 def _memory_response(document, *, backup_name: str = "", warning: str = "") -> MemoryResponse:
     return MemoryResponse(
         success=True,
@@ -3207,6 +3821,19 @@ def _memory_response(document, *, backup_name: str = "", warning: str = "") -> M
         write_protection_enabled=document.write_protection_enabled,
         backup_name=backup_name,
         warning=warning,
+    )
+
+
+def _memory_item_response(item: MemoryItem) -> MemoryItemResponse:
+    return MemoryItemResponse(
+        id=item.id,
+        title=item.title,
+        content=item.content,
+        status=item.status,
+        scopes=list(item.scopes),
+        kind=item.kind,
+        created_at=item.created_at,
+        updated_at=item.updated_at,
     )
 
 
@@ -3261,6 +3888,35 @@ def put_candidate_memory(req: MemoryUpdateRequest, request: Request):
     except MemoryContentError as exc:
         return _memory_error(exc)
     return _memory_response(result.document, backup_name=result.backup_name)
+
+
+@app.get("/memory/items", response_model=MemoryItemsResponse)
+def list_memory_items() -> MemoryItemsResponse:
+    store = MemoryItemStore(memory_items_path())
+    return MemoryItemsResponse(
+        items=[_memory_item_response(item) for item in store.load_items()],
+        write_protection_enabled=write_protection_enabled(),
+    )
+
+
+@app.put("/memory/items/{item_id}", response_model=MemoryItemSaveResponse)
+def put_memory_item(item_id: str, req: MemoryItemUpdateRequest, request: Request):
+    try:
+        require_write_token(request.headers.get("X-Memory-Write-Token"))
+        item = MemoryItem(
+            id=item_id,
+            title=req.title,
+            content=req.content,
+            status=req.status,
+            scopes=req.scopes,
+            kind=req.kind,
+        )
+        saved = MemoryItemStore(memory_items_path()).upsert_item(item)
+    except MemoryTokenError as exc:
+        return _memory_token_error(exc)
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"success": False, "error": {"code": "MEMORY_ITEM_INVALID", "message": str(exc)}})
+    return MemoryItemSaveResponse(item=_memory_item_response(saved), write_protection_enabled=write_protection_enabled())
 
 
 @app.get("/records", response_model=RecordListResponse)
@@ -3387,6 +4043,95 @@ def prepare_analysis(req: SelectionPreviewRequest):
         warnings=list(result.get("warnings") or []),
         evidence_pack=result,
     )
+
+
+def _material_cache_summary(items: list[dict[str, Any]]) -> dict[str, int]:
+    summary = {f"{status}_count": 0 for status in ["hit", "miss", "stale", "corrupt", "failed", "building", "building_timeout", "force_refresh", "built", "invalid_view_type"]}
+    for item in items:
+        status = str(item.get("status") or "")
+        key = f"{status}_count"
+        if key in summary:
+            summary[key] += 1
+    summary["item_count"] = len(items)
+    return summary
+
+
+def _load_selected_material_rows_for_cache(req: SelectionPreviewRequest) -> tuple[list[tuple[str, tuple[str, str], dict[str, Any], list[dict[str, Any]], str]], dict[str, Any], JSONResponse | None]:
+    primary_keys, auxiliary_keys, error = _validate_material_selection(req)
+    if error is not None:
+        return [], {}, error
+    all_keys = list(dict.fromkeys([*primary_keys, *auxiliary_keys]))
+    rows_by_key = _fetch_database_material_rows(all_keys)
+    missing = [key for key in all_keys if key not in rows_by_key]
+    if missing:
+        missing_text = ", ".join(f"{menu_code}/{articleid}" for menu_code, articleid in missing)
+        return [], {}, _selection_error(422, "MATERIAL_NOT_FOUND", f"所选文章不存在或状态不可用: {missing_text}")
+    attachments_by_key = _fetch_database_attachments(all_keys)
+    attachment_options = _attachment_request_options(req)
+    selected: list[tuple[str, tuple[str, str], dict[str, Any], list[dict[str, Any]], str]] = []
+    for key in primary_keys:
+        selected.append(("primary", key, rows_by_key[key], attachments_by_key.get(key, []), "primary"))
+    for key in auxiliary_keys:
+        selected.append(("auxiliary", key, rows_by_key[key], attachments_by_key.get(key, []), "auxiliary"))
+    return selected, attachment_options, None
+
+
+@app.post("/analysis/material-cache/check", response_model=None)
+def check_material_cache(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
+    selected, attachment_options, error = _load_selected_material_rows_for_cache(req)
+    if error is not None:
+        return error
+    enabled = material_cache_enabled()
+    repo = _material_cache_repository() if enabled else None
+    items: list[dict[str, Any]] = []
+    for role, key, row, attachments, _context_role in selected:
+        for view_type in SUPPORTED_MATERIAL_VIEW_TYPES:
+            signature = _material_cache_signature(row, attachments, attachment_options, view_type)
+            status = repo.read_payload(signature).status if repo else "disabled"
+            items.append(
+                {
+                    "menu_code": key[0],
+                    "articleid": key[1],
+                    "role": role,
+                    "view_type": view_type,
+                    "status": status,
+                    "cache_key": signature.cache_key,
+                }
+            )
+    return {"success": True, "enabled": enabled, "summary": _material_cache_summary(items), "items": items}
+
+
+@app.post("/analysis/material-cache/build", response_model=None)
+def build_selected_material_cache(req: MaterialCacheBuildRequest) -> dict[str, Any] | JSONResponse:
+    selected, attachment_options, error = _load_selected_material_rows_for_cache(req)
+    if error is not None:
+        return error
+    if not material_cache_enabled():
+        return {"success": True, "enabled": False, "summary": {"item_count": 0, "built_count": 0, "disabled_count": len(selected)}, "items": []}
+    levels = [level for level in req.levels if level in SUPPORTED_MATERIAL_VIEW_TYPES]
+    if not levels:
+        return _analysis_error(422, "MATERIAL_CACHE_INVALID_LEVELS", "缓存视图类型无效")
+    primary_rows = [row for role, _key, row, _attachments, _context_role in selected if role == "primary"]
+    primary_keywords = _primary_topic_keywords(primary_rows or [row for _role, _key, row, _attachments, _context_role in selected])
+    items: list[dict[str, Any]] = []
+    built_count = 0
+    for role, key, row, attachments, context_role in selected:
+        built, results = _build_and_store_material_cache_views(
+            row=row,
+            attachments=attachments,
+            attachment_options=attachment_options,
+            levels=levels,
+            role=context_role,
+            primary_keywords=primary_keywords,
+            force_refresh=bool(req.force_refresh_cache),
+            build_source="selected_api",
+        )
+        built_count += built
+        for item in results:
+            items.append({"menu_code": key[0], "articleid": key[1], "role": role, **item})
+    summary = _material_cache_summary(items)
+    summary["built_count"] = built_count
+    return {"success": True, "enabled": True, "summary": summary, "items": items}
 
 
 @app.get("/analysis/packs/{pack_id}")
@@ -3558,6 +4303,19 @@ def _execute_analysis_run_background(
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
             result = run_local_workflow(pack, run_id)
+            try:
+                current_record = _read_analysis_run(run_id)
+                if current_record.get("status") != "running":
+                    logger.warning(
+                        "analysis_run_late_local_result_ignored run_id=%s pack_id=%s current_status=%s",
+                        run_id,
+                        pack_id,
+                        current_record.get("status") or "",
+                    )
+                    return
+                record = current_record
+            except HTTPException:
+                pass
             record.update(result)
             record["success"] = True
             record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -3692,7 +4450,8 @@ def _execute_analysis_run_background(
             )
             return
     except HTTPException:
-        pass
+        current_record = record
+    record = current_record
     record.update(result)
     record["success"] = True
     record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
@@ -3706,18 +4465,116 @@ def _execute_analysis_run_background(
     )
 
 
-@app.post("/analysis/run")
-def run_analysis(req: AnalysisRunRequest):
-    pack_id = req.pack_id.strip()
-    try:
-        _read_database_evidence_pack(pack_id)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
+def _analysis_run_response_from_record(record: dict[str, Any]) -> AnalysisRunResponse:
+    quality_check = record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {}
+    return AnalysisRunResponse(
+        success=bool(record.get("success", True)),
+        run_id=str(record.get("run_id") or ""),
+        pack_id=str(record.get("pack_id") or ""),
+        status=str(record.get("status") or ""),
+        workflow_run_id=str(record.get("workflow_run_id") or ""),
+        report_title=str(record.get("report_title") or ""),
+        quality_passed=quality_check.get("passed"),
+        version=int(record.get("version") or 1),
+        warnings=list(record.get("warnings") or record.get("generation_warnings") or []),
+        input_hash=str(record.get("input_hash") or ""),
+        idempotency_reused=bool(record.get("idempotency_reused")),
+    )
 
-    report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(req.use_report_memory)
+
+def _make_analysis_run_control_event(
+    action: str,
+    *,
+    source_run_id: str,
+    target_run_id: str = "",
+    status_before: str = "",
+    status_after: str = "",
+) -> dict[str, Any]:
+    return {
+        "action": action,
+        "source_run_id": source_run_id,
+        "target_run_id": target_run_id,
+        "status_before": status_before,
+        "status_after": status_after,
+        "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
+    }
+
+
+def _append_analysis_run_control_event(record: dict[str, Any], event: dict[str, Any]) -> None:
+    events = list(record.get("control_events") or [])
+    events.append(event)
+    record["control_events"] = events[-20:]
+
+
+def _start_analysis_run_record(
+    pack_id: str,
+    *,
+    use_report_memory: bool = False,
+    control_action: str = "",
+    source_run_id: str = "",
+    source_status: str = "",
+) -> dict[str, Any]:
+    pack_id = pack_id.strip()
+    pack_for_memory = _read_database_evidence_pack(pack_id)
+    report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(use_report_memory, pack_for_memory)
     backend = _selected_workflow_backend()
+    input_hash = _analysis_run_input_hash(
+        pack_id=pack_id,
+        backend=backend.value,
+        use_report_memory=bool(use_report_memory),
+        memory_metadata=memory_metadata,
+    )
+    if not control_action:
+        with _ANALYSIS_RUN_CREATE_LOCK:
+            _recover_stale_pending_analysis_runs()
+            existing_record = _find_active_analysis_run_by_input_hash(input_hash)
+            if existing_record:
+                logger.info(
+                    "analysis_run_idempotency_reused run_id=%s pack_id=%s input_hash=%s",
+                    existing_record.get("run_id") or "",
+                    pack_id,
+                    input_hash,
+                )
+                return _mark_analysis_run_idempotency_reuse(existing_record)
+            return _create_analysis_run_record(
+                pack_id=pack_id,
+                backend=backend,
+                report_memory_snapshot=report_memory_snapshot,
+                memory_metadata=memory_metadata,
+                memory_warnings=memory_warnings,
+                input_hash=input_hash,
+                use_report_memory=use_report_memory,
+                control_action=control_action,
+                source_run_id=source_run_id,
+                source_status=source_status,
+            )
+    return _create_analysis_run_record(
+        pack_id=pack_id,
+        backend=backend,
+        report_memory_snapshot=report_memory_snapshot,
+        memory_metadata=memory_metadata,
+        memory_warnings=memory_warnings,
+        input_hash=input_hash,
+        use_report_memory=use_report_memory,
+        control_action=control_action,
+        source_run_id=source_run_id,
+        source_status=source_status,
+    )
+
+
+def _create_analysis_run_record(
+    *,
+    pack_id: str,
+    backend: WorkflowBackend,
+    report_memory_snapshot: str,
+    memory_metadata: dict[str, Any],
+    memory_warnings: list[str],
+    input_hash: str,
+    use_report_memory: bool = False,
+    control_action: str = "",
+    source_run_id: str = "",
+    source_status: str = "",
+) -> dict[str, Any]:
     run_id = _make_analysis_run_id(pack_id)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
     record: dict[str, Any] = {
@@ -3738,8 +4595,23 @@ def run_analysis(req: AnalysisRunRequest):
         "created_at": now,
         "updated_at": now,
         "error_message": "",
+        "input_hash": input_hash,
+        "idempotency_reused": False,
+        "idempotency_duplicate_count": 0,
         **memory_metadata,
     }
+    if control_action and source_run_id:
+        record[f"{control_action}_of"] = source_run_id
+        _append_analysis_run_control_event(
+            record,
+            _make_analysis_run_control_event(
+                control_action,
+                source_run_id=source_run_id,
+                target_run_id=run_id,
+                status_before=source_status,
+                status_after="running",
+            ),
+        )
     _write_analysis_run(record)
     logger.info(
         "analysis_run_started run_id=%s pack_id=%s use_report_memory=%s report_memory_applied=%s report_memory_chars=%s memory_read_failed=%s",
@@ -3753,19 +4625,197 @@ def run_analysis(req: AnalysisRunRequest):
 
     threading.Thread(
         target=_execute_analysis_run_background,
-        args=(pack_id, run_id, report_memory_snapshot, bool(req.use_report_memory)),
+        args=(pack_id, run_id, report_memory_snapshot, bool(use_report_memory)),
         daemon=True,
     ).start()
-    return AnalysisRunResponse(
+    return record
+
+
+def _run_operation_not_allowed(action: str, status: str, allowed_statuses: set[str]) -> JSONResponse:
+    allowed = ", ".join(sorted(allowed_statuses))
+    return _analysis_error(
+        409,
+        "RUN_OPERATION_NOT_ALLOWED",
+        f"当前 analysis run 状态不允许执行 {action}",
+        f"status={status or 'unknown'} allowed={allowed}",
+    )
+
+
+@app.post("/analysis/run")
+def run_analysis(req: AnalysisRunRequest):
+    try:
+        record = _start_analysis_run_record(req.pack_id, use_report_memory=bool(req.use_report_memory))
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
+    return _analysis_run_response_from_record(record)
+
+
+@app.post("/analysis/runs/{run_id}/cancel", response_model=AnalysisRunControlResponse)
+def cancel_analysis_run(run_id: str) -> AnalysisRunControlResponse | JSONResponse:
+    try:
+        record = _read_analysis_run(run_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
+    record = _maybe_finalize_timed_out_analysis_run(record)
+    current_status = str(record.get("status") or "")
+    allowed = {"created", "running"}
+    if current_status not in allowed:
+        return _run_operation_not_allowed("cancel", current_status, allowed)
+
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    record.update(
+        {
+            "success": False,
+            "status": "cancelled",
+            "cancel_requested": True,
+            "cancelled_at": now,
+            "updated_at": now,
+            "finished_at": now,
+            "error_message": "报告生成已取消",
+            "error_detail": "",
+        }
+    )
+    _append_analysis_run_control_event(
+        record,
+        _make_analysis_run_control_event(
+            "cancel",
+            source_run_id=str(record.get("run_id") or run_id),
+            status_before=current_status,
+            status_after="cancelled",
+        ),
+    )
+    _write_analysis_run(record)
+    logger.info("analysis_run_cancelled run_id=%s pack_id=%s", run_id, record.get("pack_id") or "")
+    return AnalysisRunControlResponse(
         success=True,
-        run_id=run_id,
-        pack_id=pack_id,
-        status="running",
+        action="cancel",
+        run_id=str(record.get("run_id") or run_id),
+        pack_id=str(record.get("pack_id") or ""),
+        status="cancelled",
         workflow_run_id=str(record.get("workflow_run_id") or ""),
-        report_title=str(record.get("report_title") or ""),
-        quality_passed=(record.get("quality_check") or {}).get("passed") if isinstance(record.get("quality_check"), dict) else None,
-        version=int(record.get("version") or 1),
         warnings=list(record.get("warnings") or record.get("generation_warnings") or []),
+    )
+
+
+@app.post("/analysis/runs/{run_id}/retry", response_model=AnalysisRunControlResponse)
+def retry_analysis_run(run_id: str) -> AnalysisRunControlResponse | JSONResponse:
+    try:
+        source_record = _read_analysis_run(run_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
+    source_record = _maybe_finalize_timed_out_analysis_run(source_record)
+    source_status = str(source_record.get("status") or "")
+    allowed = {"failed"}
+    if source_status not in allowed:
+        return _run_operation_not_allowed("retry", source_status, allowed)
+
+    pack_id = str(source_record.get("pack_id") or "")
+    try:
+        new_record = _start_analysis_run_record(
+            pack_id,
+            use_report_memory=bool(source_record.get("use_report_memory")),
+            control_action="retry",
+            source_run_id=str(source_record.get("run_id") or run_id),
+            source_status=source_status,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
+
+    source_record["retried_by"] = str(new_record.get("run_id") or "")
+    source_record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+    _append_analysis_run_control_event(
+        source_record,
+        _make_analysis_run_control_event(
+            "retry",
+            source_run_id=str(source_record.get("run_id") or run_id),
+            target_run_id=str(new_record.get("run_id") or ""),
+            status_before=source_status,
+            status_after=str(new_record.get("status") or "running"),
+        ),
+    )
+    _write_analysis_run(source_record)
+    logger.info(
+        "analysis_run_retry_started source_run_id=%s new_run_id=%s pack_id=%s",
+        run_id,
+        new_record.get("run_id") or "",
+        pack_id,
+    )
+    return AnalysisRunControlResponse(
+        success=True,
+        action="retry",
+        run_id=str(source_record.get("run_id") or run_id),
+        new_run_id=str(new_record.get("run_id") or ""),
+        pack_id=pack_id,
+        status=str(new_record.get("status") or "running"),
+        workflow_run_id=str(new_record.get("workflow_run_id") or ""),
+        warnings=list(new_record.get("warnings") or new_record.get("generation_warnings") or []),
+    )
+
+
+@app.post("/analysis/runs/{run_id}/resume", response_model=AnalysisRunControlResponse)
+def resume_analysis_run(run_id: str) -> AnalysisRunControlResponse | JSONResponse:
+    try:
+        source_record = _read_analysis_run(run_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
+    source_record = _maybe_finalize_timed_out_analysis_run(source_record)
+    source_status = str(source_record.get("status") or "")
+    allowed = {"cancelled"}
+    if source_status not in allowed:
+        return _run_operation_not_allowed("resume", source_status, allowed)
+
+    pack_id = str(source_record.get("pack_id") or "")
+    try:
+        new_record = _start_analysis_run_record(
+            pack_id,
+            use_report_memory=bool(source_record.get("use_report_memory")),
+            control_action="resume",
+            source_run_id=str(source_record.get("run_id") or run_id),
+            source_status=source_status,
+        )
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
+
+    source_record["resumed_by"] = str(new_record.get("run_id") or "")
+    source_record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+    _append_analysis_run_control_event(
+        source_record,
+        _make_analysis_run_control_event(
+            "resume",
+            source_run_id=str(source_record.get("run_id") or run_id),
+            target_run_id=str(new_record.get("run_id") or ""),
+            status_before=source_status,
+            status_after=str(new_record.get("status") or "running"),
+        ),
+    )
+    _write_analysis_run(source_record)
+    logger.info(
+        "analysis_run_resume_started source_run_id=%s new_run_id=%s pack_id=%s",
+        run_id,
+        new_record.get("run_id") or "",
+        pack_id,
+    )
+    return AnalysisRunControlResponse(
+        success=True,
+        action="resume",
+        run_id=str(source_record.get("run_id") or run_id),
+        new_run_id=str(new_record.get("run_id") or ""),
+        pack_id=pack_id,
+        status=str(new_record.get("status") or "running"),
+        workflow_run_id=str(new_record.get("workflow_run_id") or ""),
+        warnings=list(new_record.get("warnings") or new_record.get("generation_warnings") or []),
     )
 
 
@@ -3858,7 +4908,7 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
 
     analysis_highlight = req.analysis_highlight if req.analysis_highlight is not None else _env_bool("ENABLE_ANALYSIS_HIGHLIGHT", True)
     revision_id = _make_revision_id(run_id)
-    revision_memory_snapshot, revision_memory_metadata, revision_memory_warnings = _resolve_report_memory_snapshot(bool(record.get("use_report_memory")))
+    revision_memory_snapshot, revision_memory_metadata, revision_memory_warnings = _resolve_report_memory_snapshot(bool(record.get("use_report_memory")), pack)
     original_memory_hash = str(record.get("report_memory_hash") or "")
     revision_memory_hash = str(revision_memory_metadata.get("report_memory_hash") or "")
     revision_memory_hash_changed = bool(original_memory_hash and revision_memory_hash and original_memory_hash != revision_memory_hash)
@@ -3913,6 +4963,10 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
         "memory_read_failed": bool(revision_memory_metadata.get("memory_read_failed")),
         "report_memory_truncated": bool(revision_memory_metadata.get("report_memory_truncated")),
         "report_memory_hash_changed": revision_memory_hash_changed,
+        "used_memory_ids": list(revision_memory_metadata.get("used_memory_ids") or []),
+        "memory_item_count": int(revision_memory_metadata.get("memory_item_count") or 0),
+        "memory_item_chars": int(revision_memory_metadata.get("memory_item_chars") or 0),
+        "memory_items_read_failed": bool(revision_memory_metadata.get("memory_items_read_failed")),
     }
     record.update(
         {
@@ -3924,6 +4978,10 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
             "quality_check": quality_check,
             "warnings": warnings,
             "generation_warnings": warnings,
+            "used_memory_ids": list(revision_memory_metadata.get("used_memory_ids") or []),
+            "memory_item_count": int(revision_memory_metadata.get("memory_item_count") or 0),
+            "memory_item_chars": int(revision_memory_metadata.get("memory_item_chars") or 0),
+            "memory_items_read_failed": bool(revision_memory_metadata.get("memory_items_read_failed")),
             "user_feedback_modified": True,
             "last_revision": revision_record,
             "updated_at": revision_record["created_at"],
