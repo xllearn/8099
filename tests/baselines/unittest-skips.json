@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "42dc624604391bddf2c930e94c80dfc47c3e1591",
+  "local": {
+    "python": "3.14",
+    "tests_run": 186,
+    "expected_skips": []
+  },
+  "container": {
+    "python": "3.11",
+    "tests_run": 186,
+    "expected_skips": [
+      {
+        "test": "test_vbp_topic_rules.VbpTopicRulesTests.test_feature_flags_are_documented_in_env_and_compose",
+        "reason": "repository root config files are not packaged in this runtime image"
+      }
+    ]
+  }
+}

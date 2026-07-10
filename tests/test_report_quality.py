@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
+from unittest.mock import patch
 
 from app.main import (
     CheckedExportReportRequest,
@@ -553,15 +555,16 @@ class LocalReportQualityTests(unittest.TestCase):
             ],
         )
 
-        response = export_report_checked(
-            CheckedExportReportRequest(
-                report_ir=report,
-                qa_output='{"status":"pass","issues":[],"unsupported_claims":[],"history_leakage":[],"missing_rules":[],"language_issues":[],"fix_instructions":[],"summary":"模型认为通过"}',
-                report_text="",
-                evidence_text=rich_procurement_evidence(),
-                history_text="",
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            response = export_report_checked(
+                CheckedExportReportRequest(
+                    report_ir=report,
+                    qa_output='{"status":"pass","issues":[],"unsupported_claims":[],"history_leakage":[],"missing_rules":[],"language_issues":[],"fix_instructions":[],"summary":"模型认为通过"}',
+                    report_text="",
+                    evidence_text=rich_procurement_evidence(),
+                    history_text="",
+                )
             )
-        )
 
         self.assertFalse(response.success)
         self.assertTrue(response.blocked)

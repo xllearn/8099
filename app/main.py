@@ -87,6 +87,10 @@ DEFAULT_MAX_COMBINED_CHARS = 120_000
 CHATFLOW_SAFE_MAX_COMBINED_CHARS = 60_000
 DEFAULT_MAX_ATTACHMENTS = 25
 DEFAULT_REPORT_TITLE = "医药器械采购项目分析报告"
+WORD_EXPORT_DISABLED_CODE = "WORD_EXPORT_DISABLED"
+WORD_EXPORT_DISABLED_MESSAGE = "Word 发布当前已暂停"
+WORD_EXPORT_LOCATOR_FIELDS = ("word_download_url", "download_url", "word_filename")
+WORD_EXPORT_METADATA_FIELDS = ("word_exported_at",)
 DEFAULT_DISCLAIMER = (
     "本文基于互联网公开资料进行整理，目的在于传递分享信息，仅供读者参考之用。"
     "本网站不保证信息的准确性、有效性、及时性和完整性。"
@@ -599,7 +603,11 @@ ATTACHMENT_FIELDS = [
 async def log_requests(request: Request, call_next):
     started = time.perf_counter()
     try:
-        response = await call_next(request)
+        word_endpoint = _word_export_route_template(request.method, request.url.path)
+        if word_endpoint and not _word_export_enabled():
+            response = _word_export_disabled_response(word_endpoint)
+        else:
+            response = await call_next(request)
     except Exception:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.exception(
@@ -631,6 +639,7 @@ def health() -> dict[str, Any]:
         "public_base_url": public_base_url,
         "report_dir_configured": bool((os.getenv("REPORT_DIR") or "").strip()),
         "report_dir": str(REPORT_DIR),
+        "word_export_enabled": _word_export_enabled(),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
         "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
     }
@@ -656,6 +665,27 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _url_analyze_enabled() -> bool:
     return _env_bool("ENABLE_URL_ANALYZE", False)
+
+
+def _word_export_enabled() -> bool:
+    return _env_bool("ENABLE_WORD_EXPORT", False)
+
+
+def _word_export_disabled_response(endpoint: str) -> JSONResponse:
+    logger.warning("word_export_disabled endpoint=%s", endpoint)
+    response = _analysis_error(503, WORD_EXPORT_DISABLED_CODE, WORD_EXPORT_DISABLED_MESSAGE)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _word_export_route_template(method: str, path: str) -> str:
+    if method == "POST" and path in {"/report/export", "/report/export_checked"}:
+        return path
+    if method == "GET" and path.startswith("/analysis/runs/") and path.endswith("/download"):
+        return "/analysis/runs/{run_id}/download"
+    if method == "GET" and path.startswith("/download/"):
+        return "/download/{filename}"
+    return ""
 
 
 def _project_notice_priority_enabled() -> bool:
@@ -2741,7 +2771,7 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
         fallback_used = True
 
     deliverable = _is_explicitly_deliverable(normalized, raw_status, report_markdown)
-    word_export_available = bool(report_markdown)
+    word_export_available = bool(report_markdown and _word_export_enabled())
     final_word_export_available = bool(word_export_available and deliverable)
     draft_word_export_available = bool(word_export_available and not final_word_export_available)
     needs_manual_review = bool(raw_status == "needs_manual_review" or quality_gate.get("deliverable_status") == "needs_manual_review")
@@ -2810,6 +2840,15 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
             "timings": _normalize_run_timings(normalized.get("timings")),
         }
     )
+    if not _word_export_enabled():
+        for field in WORD_EXPORT_LOCATOR_FIELDS:
+            if field in normalized:
+                normalized[field] = ""
+        for field in WORD_EXPORT_METADATA_FIELDS:
+            if field in normalized:
+                normalized[field] = ""
+        if "word_generated" in normalized:
+            normalized["word_generated"] = False
     return normalized
 
 
@@ -4880,6 +4919,8 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
 
 @app.get("/analysis/runs/{run_id}/download")
 def download_analysis_run_report(run_id: str):
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/analysis/runs/{run_id}/download")
     try:
         record = _read_analysis_run(run_id)
     except HTTPException as exc:
@@ -5262,7 +5303,9 @@ async def analyze_v2(req: AnalyzeV2Request) -> AnalyzeV2Response:
 
 
 @app.post("/report/export", response_model=ExportReportResponse)
-async def export_report(req: ExportReportRequest) -> ExportReportResponse:
+async def export_report(req: ExportReportRequest) -> ExportReportResponse | JSONResponse:
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/report/export")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
     try:
@@ -5318,7 +5361,9 @@ def render_report_v2(req: RenderReportRequest) -> RenderReportResponse:
 
 
 @app.post("/report/export_checked", response_model=CheckedExportReportResponse)
-def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportReportResponse:
+def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportReportResponse | JSONResponse:
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/report/export_checked")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
     try:
@@ -5489,6 +5534,8 @@ def _download_url(filename: str) -> str:
 def download_report(filename: str):
     from fastapi.responses import FileResponse
 
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/download/{filename}")
     safe = Path(filename).name
     path = REPORT_DIR / safe
     if not path.exists():

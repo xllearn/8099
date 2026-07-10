@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import yaml
+from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import (
@@ -270,14 +271,15 @@ class ReportV2GateTests(unittest.TestCase):
         self.assertFalse(response.needs_fix)
 
     def test_export_checked_blocks_when_strict_and_qa_status_not_pass(self) -> None:
-        response = export_report_checked(
-            CheckedExportReportRequest(
-                report_ir=sample_report_ir(),
-                qa_status="needs_fix",
-                qa_result={"summary": "needs manual confirmation"},
-                strict_quality=True,
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            response = export_report_checked(
+                CheckedExportReportRequest(
+                    report_ir=sample_report_ir(),
+                    qa_status="needs_fix",
+                    qa_result={"summary": "needs manual confirmation"},
+                    strict_quality=True,
+                )
             )
-        )
 
         self.assertFalse(response.success)
         self.assertTrue(response.blocked)
@@ -285,7 +287,9 @@ class ReportV2GateTests(unittest.TestCase):
         self.assertIn("needs manual confirmation", response.qa_summary)
 
     def test_export_checked_exports_when_qa_status_pass(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(main_module, "REPORT_DIR", Path(tmpdir)):
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
             response = export_report_checked(
                 CheckedExportReportRequest(
                     report_ir=sample_report_ir(),
@@ -298,6 +302,104 @@ class ReportV2GateTests(unittest.TestCase):
         self.assertTrue(response.success)
         self.assertFalse(response.blocked)
         self.assertIn("/download/", response.download_url)
+
+
+class WordExportFuseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.client = TestClient(main_module.app)
+
+    @staticmethod
+    def _export_payload() -> dict:
+        return {
+            "report_ir": sample_report_ir().model_dump(),
+            "strict_quality": False,
+        }
+
+    def test_word_export_disabled_blocks_every_export_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            existing = Path(tmpdir) / "existing.docx"
+            existing.write_bytes(b"existing Word document")
+            responses = [
+                self.client.post("/report/export", json=self._export_payload()),
+                self.client.post(
+                    "/report/export_checked",
+                    json={**self._export_payload(), "qa_status": "pass"},
+                ),
+                self.client.get("/analysis/runs/run_missing/download"),
+                self.client.get("/download/existing.docx"),
+            ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["error"]["code"], "WORD_EXPORT_DISABLED")
+
+    def test_disabled_export_creates_no_file_or_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            response = self.client.post("/report/export", json=self._export_payload())
+            created_files = list(Path(tmpdir).iterdir())
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(created_files, [])
+        self.assertNotIn("/download/", response.text)
+
+    def test_disabled_export_returns_503_before_request_body_validation(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            responses = [
+                self.client.post(
+                    "/report/export",
+                    content="{invalid-json",
+                    headers={"Content-Type": "application/json"},
+                ),
+                self.client.post("/report/export_checked", json={"report_ir": {"sections": "invalid"}}),
+            ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json()["error"]["code"], "WORD_EXPORT_DISABLED")
+
+    def test_disabled_download_blocks_preexisting_docx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            existing = Path(tmpdir) / "existing.docx"
+            existing.write_bytes(b"existing Word document")
+            response = self.client.get("/download/existing.docx")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "WORD_EXPORT_DISABLED")
+
+    def test_render_endpoints_remain_available_when_word_export_disabled(self) -> None:
+        payload = self._export_payload()
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            responses = [
+                self.client.post("/report/render", json=payload),
+                self.client.post("/report/render_v2", json=payload),
+            ]
+
+        for response in responses:
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json()["success"])
+            self.assertTrue(response.json()["report_markdown"])
+
+    def test_health_exposes_word_export_disabled(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["word_export_enabled"])
+
+    def test_enabled_word_export_preserves_existing_export_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            response = self.client.post("/report/export", json=self._export_payload())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["download_url"].endswith(".docx"))
 
 
 class WorkflowYamlV2Tests(unittest.TestCase):

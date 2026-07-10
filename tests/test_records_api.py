@@ -1871,7 +1871,7 @@ class RecordsApiTests(unittest.TestCase):
             "input_strategy",
             "timings",
         }
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir)
             run_dir.mkdir(parents=True, exist_ok=True)
             (run_dir / "run_legacy1234.json").write_text(json.dumps(legacy), encoding="utf-8")
@@ -1903,7 +1903,7 @@ class RecordsApiTests(unittest.TestCase):
             "quality_gate": {"deliverable_status": "deliverable", "blocking_issues": []},
             "remaining_issues": [],
         }
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True):
                 main_module._write_analysis_run(record)
                 saved = main_module._read_analysis_run("run_schemaok1")
@@ -1918,6 +1918,93 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(saved["blocking_issue_codes"], [])
         self.assertEqual(saved["provider"], "dify")
         self.assertIn("export_check_ms", saved["timings"])
+
+    def test_analysis_run_flags_and_word_locators_are_cleared_when_word_export_disabled(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_fused1234",
+            "pack_id": "pack_fused1234",
+            "status": "finished",
+            "report_markdown": "# Report\n\nA complete report body.",
+            "quality_check": {"passed": True, "issues": []},
+            "quality_gate": {"deliverable_status": "deliverable", "blocking_issues": []},
+            "word_export_available": True,
+            "draft_word_export_available": True,
+            "final_word_export_available": True,
+            "word_download_url": "http://example.test/download/report.docx",
+            "download_url": "http://example.test/download/report.docx",
+            "word_filename": "report.docx",
+            "word_generated": True,
+            "word_exported_at": "2026-07-10 10:00:00",
+        }
+
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertTrue(normalized["deliverable"])
+        self.assertFalse(normalized["needs_manual_review"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertEqual(normalized["word_download_url"], "")
+        self.assertEqual(normalized["download_url"], "")
+        self.assertEqual(normalized["word_filename"], "")
+        self.assertFalse(normalized["word_generated"])
+        self.assertEqual(normalized["word_exported_at"], "")
+
+    def test_analysis_run_quality_state_is_unchanged_when_word_export_disabled(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_review1234",
+            "pack_id": "pack_review1234",
+            "status": "needs_manual_review",
+            "report_markdown": "# Draft\n\nA report body that needs review.",
+            "quality_check": {"passed": False, "issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}]},
+            "quality_gate": {
+                "deliverable_status": "needs_manual_review",
+                "blocking_issues": [{"code": "UNSUPPORTED_FACT"}],
+            },
+            "remaining_issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}],
+        }
+
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertEqual(normalized["run_status"], "needs_manual_review")
+        self.assertTrue(normalized["needs_manual_review"])
+        self.assertFalse(normalized["deliverable"])
+        self.assertEqual(normalized["report_markdown"], record["report_markdown"])
+        self.assertIn("UNSUPPORTED_FACT", normalized["blocking_issue_codes"])
+        self.assertFalse(normalized["word_export_available"])
+
+    def test_no_report_body_never_exposes_word_flags(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(
+                {
+                    "success": True,
+                    "run_id": "run_empty1234",
+                    "status": "finished",
+                    "report_markdown": "",
+                    "quality_check": {"passed": True, "issues": []},
+                }
+            )
+
+        self.assertFalse(normalized["deliverable"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+
+    def test_analysis_run_download_returns_503_before_report_lookup_when_disabled(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False), patch.object(
+            main_module,
+            "_read_analysis_run",
+            return_value={"report_markdown": "# Should not be read"},
+        ) as read_run:
+            response = self.client.get("/analysis/runs/run_fused1234/download")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "WORD_EXPORT_DISABLED")
+        read_run.assert_not_called()
 
     def test_analysis_run_initial_response_contains_p0_1_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(
@@ -2217,7 +2304,7 @@ class RecordsApiTests(unittest.TestCase):
             ],
             "auxiliary_materials": [],
         }
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             root = main_module.Path(tmpdir)
             run_dir = root / "runs"
             pack_dir = root / "packs"
@@ -3100,7 +3187,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("长期记忆超过 15000 字符", "\n".join(status_body["warnings"]))
 
     def test_analysis_run_download_exports_markdown_docx(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             report_dir = main_module.Path(tmpdir) / "reports"
             run_dir.mkdir()
@@ -3130,7 +3217,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertGreater(len(response.content), 1000)
 
     def test_analysis_run_download_reuses_existing_docx_for_same_run_version(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             report_dir = main_module.Path(tmpdir) / "reports"
             run_dir.mkdir()
@@ -3323,7 +3410,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertNotIn("暂无法确认", cleaned)
 
     def test_analysis_run_download_rejects_not_ready_report(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             run_dir.mkdir()
             with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):

@@ -1,0 +1,44 @@
+[
+  {
+    "id": "fixed-1-shandong-incision-protector",
+    "name": "山东切口保护器项目公告",
+    "menu_code": "project_notice",
+    "articleid": "803492fa-839b-4fff-aa7c-e9c1d9a3028a",
+    "expected_attachment_count": 4,
+    "primary": [
+      {
+        "menu_code": "project_notice",
+        "articleid": "803492fa-839b-4fff-aa7c-e9c1d9a3028a"
+      }
+    ],
+    "auxiliary": []
+  },
+  {
+    "id": "fixed-2-xinjiang-imaging-cloud",
+    "name": "新疆医保影像云耗材集采项目公告",
+    "menu_code": "project_notice",
+    "articleid": "4695e7d8-9d04-4c5a-b198-00ed022bf413",
+    "expected_attachment_count": 0,
+    "primary": [
+      {
+        "menu_code": "project_notice",
+        "articleid": "4695e7d8-9d04-4c5a-b198-00ed022bf413"
+      }
+    ],
+    "auxiliary": []
+  },
+  {
+    "id": "fixed-3-coronary-stent-renewal",
+    "name": "国家冠脉支架第二轮接续项目公告",
+    "menu_code": "project_notice",
+    "articleid": "4ca0eae9-bb5f-4301-8d1a-ee4d85cc30b6",
+    "expected_attachment_count": 4,
+    "primary": [
+      {
+        "menu_code": "project_notice",
+        "articleid": "4ca0eae9-bb5f-4301-8d1a-ee4d85cc30b6"
+      }
+    ],
+    "auxiliary": []
+  }
+]
