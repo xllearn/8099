@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Protocol
 
 from app.generation.base import ReportGenerationResult
+from app.formal_body import FormalBodyDocument
+from app.formal_body_safety import sanitize_formal_body
 
 
 class RepairComponent(Protocol):
@@ -20,7 +22,26 @@ class UnsupportedFactRepairer:
 @dataclass
 class ForbiddenPhraseRepairer:
     def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
-        return result
+        safety = sanitize_formal_body(
+            FormalBodyDocument(markdown=result.report_markdown, report_ir=result.report_ir)
+        )
+        metadata = dict(result.metadata)
+        metadata.update(
+            {
+                "formal_body_present": safety.has_body,
+                "body_safety_passed": safety.safe,
+                "forbidden_phrase_hits": [
+                    {"phrase": hit.phrase, "location": hit.location} for hit in safety.hits
+                ],
+                "forbidden_phrases_removed": list(safety.removed_phrases),
+            }
+        )
+        return replace(
+            result,
+            report_markdown=safety.document.markdown,
+            report_ir=safety.document.report_ir,
+            metadata=metadata,
+        )
 
 
 @dataclass
@@ -36,7 +57,9 @@ class StructureRepairer:
 
 @dataclass
 class RepairPipeline:
-    repairers: list[RepairComponent] = field(default_factory=lambda: [UnsupportedFactRepairer(), ForbiddenPhraseRepairer(), StructureRepairer()])
+    repairers: list[RepairComponent] = field(
+        default_factory=lambda: [UnsupportedFactRepairer(), StructureRepairer(), ForbiddenPhraseRepairer()]
+    )
 
     def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
         current = result

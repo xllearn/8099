@@ -44,10 +44,18 @@ from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
 from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
+from app.formal_body import FormalBodyDocument
+from app.formal_body_safety import (
+    FormalBodySafetyError,
+    publish_docx_atomically,
+    sanitize_formal_body,
+    scan_docx,
+    scan_formal_body,
+)
 from app.generation.base import ReportGenerationResult, ReportGenerator
 from app.generation.dify_generator import DifyReportGenerator
 from app.quality_gate import QualityGate
-from app.repair_pipeline import RepairPipeline, StructureRepairer
+from app.repair_pipeline import ForbiddenPhraseRepairer, RepairPipeline, StructureRepairer
 from app.report_memory import (
     MemoryContentError,
     MemoryKind,
@@ -89,7 +97,15 @@ DEFAULT_MAX_ATTACHMENTS = 25
 DEFAULT_REPORT_TITLE = "医药器械采购项目分析报告"
 WORD_EXPORT_DISABLED_CODE = "WORD_EXPORT_DISABLED"
 WORD_EXPORT_DISABLED_MESSAGE = "Word 发布当前已暂停"
-WORD_EXPORT_LOCATOR_FIELDS = ("word_download_url", "download_url", "word_filename")
+WORD_BODY_SAFETY_FAILED_CODE = "WORD_BODY_SAFETY_FAILED"
+WORD_BODY_SAFETY_FAILED_MESSAGE = "正式报告正文未通过安全发布检查"
+WORD_EXPORT_LOCATOR_FIELDS = (
+    "word_download_url",
+    "download_url",
+    "word_filename",
+    "word_file_path",
+    "word_path",
+)
 WORD_EXPORT_METADATA_FIELDS = ("word_exported_at",)
 DEFAULT_DISCLAIMER = (
     "本文基于互联网公开资料进行整理，目的在于传递分享信息，仅供读者参考之用。"
@@ -215,6 +231,7 @@ class ExportReportRequest(BaseModel):
     title: str = Field(default=DEFAULT_REPORT_TITLE)
     markdown: str = ""
     report_ir: ReportIR | None = None
+    evidence_text: str = ""
     strict_quality: bool = Field(default=True)
 
 
@@ -674,6 +691,18 @@ def _word_export_enabled() -> bool:
 def _word_export_disabled_response(endpoint: str) -> JSONResponse:
     logger.warning("word_export_disabled endpoint=%s", endpoint)
     response = _analysis_error(503, WORD_EXPORT_DISABLED_CODE, WORD_EXPORT_DISABLED_MESSAGE)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _word_body_safety_failed_response(endpoint: str, detail: str = "") -> JSONResponse:
+    logger.warning("word_body_safety_failed endpoint=%s", endpoint)
+    response = _analysis_error(
+        409,
+        WORD_BODY_SAFETY_FAILED_CODE,
+        WORD_BODY_SAFETY_FAILED_MESSAGE,
+        detail,
+    )
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -2570,6 +2599,8 @@ RUN_P0_FAILURE_CODES = {
     "MODEL_QA_BLOCKED",
     "FALLBACK_REPORT_USED",
     "FORBIDDEN_PHRASE_IN_REPORT",
+    "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+    "FORMAL_BODY_EMPTY",
     "EXPORT_GATE_BLOCKED",
     "AUTO_REPAIR_FAILED",
     "AUTO_REPAIR_PARTIAL",
@@ -2584,6 +2615,8 @@ RUN_FAILURE_PRIORITY = [
     "SUMMARY_ONLY_REPORT",
     "REPORT_TOO_SHORT",
     "REPORT_STRUCTURE_TOO_THIN",
+    "FORMAL_BODY_EMPTY",
+    "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
     "FORBIDDEN_PHRASE_IN_REPORT",
     "LOCAL_QUALITY_GATE_FAILED",
     "MODEL_QA_BLOCKED",
@@ -2620,6 +2653,8 @@ RUN_ISSUE_ID_CODE_MAP = {
     "Q_DIFY_FRAGMENTARY_REPORT": "DIFY_FRAGMENTARY_REPORT",
     "Q_FORBIDDEN_PHRASE": "FORBIDDEN_PHRASE_IN_REPORT",
     "Q_FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
+    "Q_FORBIDDEN_PHRASE_FORMAL_BODY": "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+    "Q_FORMAL_BODY_EMPTY": "FORMAL_BODY_EMPTY",
     "Q_AUTO_REPAIR_FAILED": "AUTO_REPAIR_FAILED",
     "Q_AUTO_REPAIR_PARTIAL": "AUTO_REPAIR_PARTIAL",
 }
@@ -2645,6 +2680,8 @@ RUN_FAILURE_REASON_LABELS = {
     "MODEL_QA_BLOCKED": "模型或工作流异常导致未达到自动交付条件。",
     "FALLBACK_REPORT_USED": "已启用后端保守兜底报告。",
     "FORBIDDEN_PHRASE_IN_REPORT": "正式报告命中禁止表达。",
+    "FORBIDDEN_PHRASE_IN_FORMAL_BODY": "正式报告正文命中禁止表达。",
+    "FORMAL_BODY_EMPTY": "正式报告正文为空。",
     "EXPORT_GATE_BLOCKED": "导出门禁阻止最终 Word 交付。",
     "AUTO_REPAIR_FAILED": "自动修复未成功。",
     "AUTO_REPAIR_PARTIAL": "自动修复仅部分成功。",
@@ -2717,11 +2754,11 @@ def _extract_quality_gate_codes(quality_gate: Any) -> list[str]:
     return _dedupe_strings(mapped)
 
 
-def _is_explicitly_deliverable(record: dict[str, Any], run_status: str, report_markdown: str) -> bool:
+def _is_explicitly_deliverable(record: dict[str, Any], run_status: str, has_formal_body: bool) -> bool:
     quality_gate = record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {}
     quality_check = record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {}
     gate_status = str(quality_gate.get("deliverable_status") or "").strip()
-    if run_status != "finished" or not report_markdown:
+    if run_status != "finished" or not has_formal_body:
         return False
     if gate_status:
         return gate_status == "deliverable"
@@ -2737,6 +2774,7 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     normalized["status"] = raw_status
 
     report_markdown = str(normalized.get("report_markdown") or "").strip()
+    report_ir = normalized.get("report_ir") if isinstance(normalized.get("report_ir"), dict) else None
     quality_check = normalized.get("quality_check") if isinstance(normalized.get("quality_check"), dict) else {"passed": None, "issues": []}
     quality_gate = normalized.get("quality_gate") if isinstance(normalized.get("quality_gate"), dict) else {}
     remaining_issues = normalized.get("remaining_issues") if isinstance(normalized.get("remaining_issues"), list) else []
@@ -2760,7 +2798,7 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     if dify_error_code:
         generation_failure_codes.append(RUN_DIFY_ERROR_CODE_MAP.get(dify_error_code, "MODEL_QA_BLOCKED"))
     generation_failure_codes.extend(code for code in _extract_issue_codes(remaining_issues) if code in {"DIFY_TIMEOUT", "DIFY_FRAGMENTARY_REPORT", "GENERATION_JSON_PARSE_FAILED", "DIFY_OUTPUT_EMPTY", "FALLBACK_REPORT_USED"})
-    if raw_status in {"failed", "needs_manual_review"} and not report_markdown and "DIFY_OUTPUT_EMPTY" not in generation_failure_codes:
+    if raw_status in {"failed", "needs_manual_review"} and not report_markdown and not report_ir and "DIFY_OUTPUT_EMPTY" not in generation_failure_codes:
         generation_failure_codes.append("DIFY_OUTPUT_EMPTY")
     generation_failure_codes = _dedupe_strings(generation_failure_codes)
 
@@ -2770,11 +2808,31 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     if any(isinstance(item, dict) and item.get("issue_id") in {"Q_DIFY_CALL_FAILED_FALLBACK", "Q_DIFY_FRAGMENTARY_REPORT"} for item in remaining_issues):
         fallback_used = True
 
-    deliverable = _is_explicitly_deliverable(normalized, raw_status, report_markdown)
-    word_export_available = bool(report_markdown and _word_export_enabled())
+    body_safety = scan_formal_body(
+        FormalBodyDocument(markdown=report_markdown, report_ir=report_ir)
+    )
+    deliverable = bool(
+        body_safety.safe
+        and _is_explicitly_deliverable(normalized, raw_status, body_safety.has_body)
+    )
+    needs_manual_review = bool(
+        raw_status == "needs_manual_review"
+        or quality_gate.get("deliverable_status") == "needs_manual_review"
+        or (raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not deliverable)
+    )
+    word_export_available = bool(
+        body_safety.safe
+        and raw_status in {"finished", "needs_manual_review"}
+        and _word_export_enabled()
+    )
+    draft_word_export_available = word_export_available
     final_word_export_available = bool(word_export_available and deliverable)
-    draft_word_export_available = bool(word_export_available and not final_word_export_available)
-    needs_manual_review = bool(raw_status == "needs_manual_review" or quality_gate.get("deliverable_status") == "needs_manual_review")
+    if raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not body_safety.safe:
+        safety_code = (
+            "FORMAL_BODY_EMPTY" if not body_safety.has_body else "FORBIDDEN_PHRASE_IN_FORMAL_BODY"
+        )
+        if safety_code not in quality_failure_codes:
+            quality_failure_codes.append(safety_code)
 
     all_codes = _dedupe_strings([*generation_failure_codes, *quality_failure_codes, *list(normalized.get("blocking_issue_codes") or [])])
     if fallback_used and "FALLBACK_REPORT_USED" not in all_codes:
@@ -2805,6 +2863,16 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     normalized.update(
         {
             "deliverable": deliverable,
+            "formal_body_present": body_safety.has_body,
+            "body_safety_passed": body_safety.safe,
+            "body_safety_failure_code": (
+                ""
+                if body_safety.safe
+                else ("FORMAL_BODY_EMPTY" if not body_safety.has_body else "FORBIDDEN_PHRASE_IN_FORMAL_BODY")
+            ),
+            "forbidden_phrase_hits": [
+                {"phrase": hit.phrase, "location": hit.location} for hit in body_safety.hits
+            ],
             "draft_word_export_available": draft_word_export_available,
             "final_word_export_available": final_word_export_available,
             "word_export_available": word_export_available,
@@ -2840,7 +2908,7 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
             "timings": _normalize_run_timings(normalized.get("timings")),
         }
     )
-    if not _word_export_enabled():
+    if not word_export_available:
         for field in WORD_EXPORT_LOCATOR_FIELDS:
             if field in normalized:
                 normalized[field] = ""
@@ -3272,7 +3340,8 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
 
 def _apply_local_quality_gate_to_dify_result(result: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
     generation_result = ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify"))
-    return QualityGate().run(generation_result, pack).to_legacy_result()
+    repaired_result = ForbiddenPhraseRepairer().run(generation_result, pack)
+    return QualityGate().run(repaired_result, pack).to_legacy_result()
 
 
 def _fallback_result_from_dify_error(
@@ -4545,6 +4614,7 @@ def _execute_analysis_run_background(
             repaired_result = RepairPipeline(
                 repairers=[
                     StructureRepairer(_repair_unusable_dify_result),
+                    ForbiddenPhraseRepairer(),
                 ]
             ).run(ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify")), pack)
             result = repaired_result.to_legacy_result()
@@ -4790,14 +4860,28 @@ def get_analysis_run_report(run_id: str) -> AnalysisRunReportResponse | JSONResp
             return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
         return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
     record = _maybe_finalize_timed_out_analysis_run(record)
-    if not record.get("report_markdown"):
+    report_markdown = str(record.get("report_markdown") or "").strip()
+    report_ir_payload = record.get("report_ir") if isinstance(record.get("report_ir"), dict) else None
+    if not report_markdown and not report_ir_payload:
         return _analysis_error(409, "REPORT_NOT_READY", "报告尚未生成完成")
+    try:
+        if report_markdown:
+            safe_report_markdown = _safe_markdown_formal_body(report_markdown)
+        else:
+            report_ir = _prepare_report_for_export(
+                ExportReportRequest(report_ir=ReportIR.model_validate(report_ir_payload), strict_quality=False)
+            )
+            safe_report_markdown = _report_ir_to_markdown(report_ir)
+    except (ValueError, FormalBodySafetyError) as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/report", str(exc)
+        )
     return AnalysisRunReportResponse(
         success=bool(record.get("success", True)),
         run_id=str(record.get("run_id") or run_id),
         pack_id=str(record.get("pack_id") or ""),
         report_title=str(record.get("report_title") or ""),
-        report_markdown=_clean_model_output(str(record.get("report_markdown") or "")),
+        report_markdown=_clean_model_output(safe_report_markdown),
         quality_check=record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {"passed": None, "issues": []},
         quality_gate=record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {},
         version=int(record.get("version") or 1),
@@ -4859,6 +4943,12 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
     )
     report_title = str(result.get("report_title") or record.get("report_title") or "")
     report_markdown = _clean_model_output(str(result.get("report_markdown") or current_report))
+    try:
+        report_markdown = _safe_markdown_formal_body(report_markdown)
+    except FormalBodySafetyError as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/revise", str(exc)
+        )
     quality_check = result.get("quality_check") if isinstance(result.get("quality_check"), dict) else {"passed": None, "issues": []}
     warnings = [*revision_memory_warnings, *list(result.get("warnings") or result.get("generation_warnings") or [])]
     if revision_memory_hash_changed:
@@ -4929,21 +5019,53 @@ def download_analysis_run_report(run_id: str):
         return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
 
     report_markdown = str(record.get("report_markdown") or "").strip()
-    if not report_markdown:
+    report_ir_payload = record.get("report_ir") if isinstance(record.get("report_ir"), dict) else None
+    if not report_markdown and not report_ir_payload:
         return _analysis_error(409, "REPORT_NOT_READY", "报告尚未生成完成")
+    if not bool(record.get("word_export_available")):
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/download",
+            str(record.get("body_safety_failure_code") or "formal body unavailable"),
+        )
+
+    report_ir: ReportIR | None = None
+    try:
+        if report_markdown:
+            report_markdown = _safe_markdown_formal_body(report_markdown)
+            report_source = report_markdown
+        else:
+            report_ir = _prepare_report_for_export(
+                ExportReportRequest(report_ir=ReportIR.model_validate(report_ir_payload), strict_quality=False)
+            )
+            report_source = json.dumps(report_ir.model_dump(), ensure_ascii=False, sort_keys=True)
+    except (ValueError, FormalBodySafetyError) as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/download", str(exc)
+        )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
     title = str(record.get("report_title") or "分析报告").strip() or "分析报告"
     version = str(record.get("version") or 1)
-    report_hash = hashlib.sha256(report_markdown.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    report_hash = hashlib.sha256(report_source.encode("utf-8", errors="ignore")).hexdigest()[:12]
     filename = f"{_safe_filename(title)}_{_safe_filename(run_id)}_v{_safe_filename(version)}_{report_hash}.docx"
     path = REPORT_DIR / filename
-    if not path.exists():
-        _markdown_to_docx(report_markdown, path, title)
-        logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
-    else:
-        logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
+    try:
+        if not path.exists():
+            if report_ir is not None:
+                _publish_report_ir_docx(report_ir, path, title)
+            else:
+                _publish_markdown_docx(report_markdown, path, title)
+            logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
+        else:
+            hits = scan_docx(path)
+            if hits:
+                raise FormalBodySafetyError("缓存 DOCX 正文安全扫描未通过")
+            logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
+    except FormalBodySafetyError as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/download", str(exc)
+        )
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -5310,14 +5432,15 @@ async def export_report(req: ExportReportRequest) -> ExportReportResponse | JSON
     _cleanup_old_reports(REPORT_DIR)
     try:
         report = _prepare_report_for_export(req)
+        _require_export_evidence(report, req.evidence_text)
         quality_issues = _quality_check_report(report)
         if req.strict_quality and quality_issues:
             raise ValueError("报告质量检查未通过：" + "；".join(quality_issues))
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _report_ir_to_docx(report, path, req.title)
+        _publish_report_ir_docx(report, path, req.title)
         logger.info("report_export_completed filename=%s", filename)
-    except ValueError as exc:
+    except (ValueError, FormalBodySafetyError) as exc:
         logger.warning("report_export_failed error=%s", str(exc)[:500])
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return ExportReportResponse(filename=filename, download_url=_download_url(filename))
@@ -5367,6 +5490,8 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
     try:
+        if not str(req.evidence_text or "").strip():
+            raise ValueError("Word 发布缺少 evidence context")
         qa = _qa_from_checked_export_request(req)
         report_for_local_qa = _prepare_report_for_export(req)
         local_qa = _quality_check_report_against_evidence(report_for_local_qa, req.evidence_text, req.history_text)
@@ -5398,7 +5523,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
             )
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _report_ir_to_docx(report, path, req.title)
+        _publish_report_ir_docx(report, path, req.title)
         logger.info("report_export_checked_completed filename=%s qa_status=%s", filename, _workflow_qa_status(qa))
         return CheckedExportReportResponse(
             success=True,
@@ -5439,8 +5564,8 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         qa_summary = _format_qa_summary(qa)
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _report_ir_to_docx(report, path, req.title)
-    except ValueError as exc:
+        _publish_report_ir_docx(report, path, req.title)
+    except (ValueError, FormalBodySafetyError) as exc:
         logger.warning("report_export_checked_failed error=%s", str(exc)[:500])
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return CheckedExportReportResponse(
@@ -5540,6 +5665,12 @@ def download_report(filename: str):
     path = REPORT_DIR / safe
     if not path.exists():
         raise HTTPException(status_code=404, detail="report file not found")
+    try:
+        hits = scan_docx(path)
+        if hits:
+            raise FormalBodySafetyError("DOCX 正文安全扫描未通过")
+    except FormalBodySafetyError as exc:
+        return _word_body_safety_failed_response("/download/{filename}", str(exc))
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -6584,7 +6715,47 @@ def _prepare_report_for_export(req: ExportReportRequest) -> ReportIR:
     else:
         report = _parse_model_output_to_report_ir(req.markdown)
     report = _normalize_report_ir(report, fallback_title=req.title)
-    return report
+    safety = sanitize_formal_body(
+        FormalBodyDocument(report_ir=report.model_dump())
+    )
+    if not safety.safe or not isinstance(safety.document.report_ir, dict):
+        if safety.hits:
+            reason = "正式正文仍包含禁用表达"
+        else:
+            reason = "正式正文为空"
+        raise ValueError(reason)
+    return ReportIR.model_validate(safety.document.report_ir)
+
+
+def _require_export_evidence(report: ReportIR, evidence_text: str) -> None:
+    if not str(evidence_text or "").strip():
+        raise ValueError("Word 发布缺少 evidence context")
+    qa = _quality_check_report_against_evidence(report, evidence_text)
+    if qa.unsupported_claims or qa.history_leakage:
+        raise ValueError("Word 发布未通过 evidence constraint")
+
+
+def _safe_markdown_formal_body(markdown: str) -> str:
+    safety = sanitize_formal_body(FormalBodyDocument(markdown=markdown))
+    if not safety.safe:
+        if safety.hits:
+            raise FormalBodySafetyError("Markdown 正文仍包含禁用表达")
+        raise FormalBodySafetyError("Markdown 正文为空")
+    return safety.document.markdown
+
+
+def _publish_report_ir_docx(report: ReportIR, path: Path, fallback_title: str) -> None:
+    publish_docx_atomically(
+        path,
+        lambda staging_path: _report_ir_to_docx(report, staging_path, fallback_title),
+    )
+
+
+def _publish_markdown_docx(markdown: str, path: Path, title: str) -> None:
+    publish_docx_atomically(
+        path,
+        lambda staging_path: _markdown_to_docx(markdown, staging_path, title),
+    )
 
 
 def _parse_model_output_to_report_ir(raw_text: str) -> ReportIR:

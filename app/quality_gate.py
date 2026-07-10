@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from app.diagnostics import build_run_diagnostics
+from app.formal_body import FormalBodyDocument
+from app.formal_body_safety import scan_formal_body
 from app.generation.base import ReportGenerationResult
 
 
@@ -58,7 +60,50 @@ class LocalEvidenceGate:
 @dataclass
 class ForbiddenPhraseGate:
     def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
-        return result
+        safety = scan_formal_body(
+            FormalBodyDocument(markdown=result.report_markdown, report_ir=result.report_ir)
+        )
+        metadata = dict(result.metadata)
+        metadata.update(
+            {
+                "formal_body_present": safety.has_body,
+                "body_safety_passed": safety.safe,
+                "forbidden_phrase_hits": [
+                    {"phrase": hit.phrase, "location": hit.location} for hit in safety.hits
+                ],
+            }
+        )
+        if safety.safe:
+            return dataclass_replace(result, metadata=metadata)
+
+        issue_id = "Q_FORMAL_BODY_EMPTY" if not safety.has_body else "Q_FORBIDDEN_PHRASE_FORMAL_BODY"
+        issue = {
+            "issue_id": issue_id,
+            "severity": "blocker",
+            "problem_type": "formal_body_safety",
+            "report_text": "",
+            "source_basis": "evidence_pack",
+            "fix_instruction": "Formal body safety gate blocked Word publication.",
+        }
+        quality_check = dict(result.quality_check or {"passed": None, "issues": []})
+        issues = list(quality_check.get("issues") or [])
+        if not any(isinstance(item, dict) and item.get("issue_id") == issue_id for item in issues):
+            issues.append(issue)
+        quality_check["passed"] = False
+        quality_check["issues"] = issues
+        remaining_issues = list(result.remaining_issues or [])
+        if not any(isinstance(item, dict) and item.get("issue_id") == issue_id for item in remaining_issues):
+            remaining_issues.append(issue)
+        metadata["status"] = "needs_manual_review"
+        metadata["body_safety_failure_code"] = (
+            "FORMAL_BODY_EMPTY" if not safety.has_body else "FORBIDDEN_PHRASE_IN_FORMAL_BODY"
+        )
+        return dataclass_replace(
+            result,
+            quality_check=quality_check,
+            remaining_issues=remaining_issues,
+            metadata=metadata,
+        )
 
 
 @dataclass

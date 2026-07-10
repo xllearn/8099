@@ -80,6 +80,64 @@ class GenerationPipelineTests(unittest.TestCase):
         self.assertEqual(gated.provider, "test-provider")
         self.assertIn("quality_gate", gated.metadata)
 
+    def test_repair_pipeline_deletes_forbidden_segments_before_quality_gate(self) -> None:
+        provider_result = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_title="项目公告分析",
+            report_markdown="# 项目公告分析\n\n公告明确申报截止时间。\n\n以上内容需复核。",
+            report_ir={
+                "title": "项目公告分析",
+                "lead_paragraphs": ["公告明确申报截止时间。", "资料未显示其他时间。"],
+                "sections": [],
+            },
+            quality_check={"passed": True, "issues": []},
+            metadata={"status": "finished"},
+        )
+
+        repaired = RepairPipeline().run(provider_result, {"memory_items": ["需人工核验"]})
+        gated = QualityGate().run(repaired, {})
+
+        self.assertNotIn("以上内容需复核", repaired.report_markdown)
+        self.assertEqual(repaired.report_ir["lead_paragraphs"], ["公告明确申报截止时间。"])
+        self.assertTrue(gated.metadata["formal_body_present"])
+        self.assertTrue(gated.metadata["body_safety_passed"])
+        self.assertEqual(gated.metadata["forbidden_phrase_hits"], [])
+
+    def test_quality_gate_fails_closed_when_cleaning_leaves_no_formal_body(self) -> None:
+        provider_result = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_title="项目公告分析",
+            report_markdown="# 项目公告分析\n\n需人工核验。",
+            quality_check={"passed": True, "issues": []},
+            metadata={"status": "finished"},
+        )
+
+        gated = QualityGate().run(RepairPipeline().run(provider_result, {}), {})
+
+        self.assertFalse(gated.metadata["formal_body_present"])
+        self.assertFalse(gated.metadata["body_safety_passed"])
+        self.assertEqual(gated.metadata["status"], "needs_manual_review")
+        self.assertFalse(gated.quality_check["passed"])
+        self.assertIn("Q_FORMAL_BODY_EMPTY", {item["issue_id"] for item in gated.remaining_issues})
+
+    def test_quality_gate_fails_closed_when_phrase_spans_markdown_lines(self) -> None:
+        provider_result = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_title="项目公告分析",
+            report_markdown="# 项目公告分析\n\n公告明确申报时间。\n\n需人工\n核验。",
+            quality_check={"passed": True, "issues": []},
+            metadata={"status": "finished"},
+        )
+
+        gated = QualityGate().run(RepairPipeline().run(provider_result, {}), {})
+
+        self.assertFalse(gated.metadata["body_safety_passed"])
+        self.assertEqual(gated.metadata["body_safety_failure_code"], "FORBIDDEN_PHRASE_IN_FORMAL_BODY")
+        self.assertFalse(gated.quality_check["passed"])
+
     def test_background_run_uses_configured_generator_abstraction(self) -> None:
         pack = {
             "pack_id": "pack_abstract",
@@ -108,7 +166,7 @@ class GenerationPipelineTests(unittest.TestCase):
                 provider="dify",
                 provider_run_id="workflow-from-generator",
                 report_title="抽象生成报告",
-                report_markdown="## 核心结论\n\n主材料正文。",
+                report_markdown="## 核心结论\n\n主材料正文。\n\n以上内容需复核。",
                 quality_check={"passed": True, "issues": []},
                 metadata={"status": "finished", "workflow_run_id": "workflow-from-generator"},
             )
@@ -138,6 +196,9 @@ class GenerationPipelineTests(unittest.TestCase):
         self.assertEqual(saved["workflow_run_id"], "workflow-from-generator")
         self.assertEqual(saved["provider_run_id"], "workflow-from-generator")
         self.assertGreater(len(saved["report_markdown"]), 0)
+        self.assertNotIn("以上内容需复核", saved["report_markdown"])
+        self.assertTrue(saved["formal_body_present"])
+        self.assertTrue(saved["body_safety_passed"])
         fake_generator.generate.assert_called_once()
 
 

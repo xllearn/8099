@@ -11,6 +11,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 import app.main as main_module
+from app.formal_body_safety import scan_docx
 from app.main import (
     AnalyzeV2Request,
     CheckedExportReportRequest,
@@ -277,6 +278,7 @@ class ReportV2GateTests(unittest.TestCase):
                     report_ir=sample_report_ir(),
                     qa_status="needs_fix",
                     qa_result={"summary": "needs manual confirmation"},
+                    evidence_text=WordExportFuseTests._evidence_text(),
                     strict_quality=True,
                 )
             )
@@ -295,13 +297,16 @@ class ReportV2GateTests(unittest.TestCase):
                     report_ir=sample_report_ir(),
                     qa_status="pass",
                     qa_result={"summary": "ok"},
+                    evidence_text=WordExportFuseTests._evidence_text(),
                     strict_quality=True,
                 )
             )
+            hits = scan_docx(Path(tmpdir) / response.filename)
 
         self.assertTrue(response.success)
         self.assertFalse(response.blocked)
         self.assertIn("/download/", response.download_url)
+        self.assertEqual(hits, ())
 
 
 class WordExportFuseTests(unittest.TestCase):
@@ -309,9 +314,22 @@ class WordExportFuseTests(unittest.TestCase):
         self.client = TestClient(main_module.app)
 
     @staticmethod
+    def _evidence_text() -> str:
+        return "\n".join(
+            [
+                "Medical procurement notice report",
+                "The notice discloses procurement scope, reporting requirements, and execution rules for suppliers.",
+                "Suppliers should follow the disclosed reporting path, deadline, and price requirements.",
+                "Key Schedule Item Requirement Registration Submit before the disclosed deadline",
+                "Check registration documents and price evidence before submission.",
+            ]
+        )
+
+    @staticmethod
     def _export_payload() -> dict:
         return {
             "report_ir": sample_report_ir().model_dump(),
+            "evidence_text": WordExportFuseTests._evidence_text(),
             "strict_quality": False,
         }
 
@@ -400,6 +418,87 @@ class WordExportFuseTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json()["download_url"].endswith(".docx"))
+
+    def test_enabled_export_without_evidence_context_fails_closed(self) -> None:
+        payload = self._export_payload()
+        payload.pop("evidence_text")
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            response = self.client.post("/report/export", json=payload)
+            created = list(Path(tmpdir).rglob("*.docx"))
+
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("/download/", response.text)
+        self.assertEqual(created, [])
+
+    def test_enabled_export_removes_forbidden_segment_before_atomic_publish(self) -> None:
+        report = sample_report_ir().model_copy(deep=True)
+        report.lead_paragraphs.append("以上内容需复核。")
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            response = self.client.post(
+                "/report/export",
+                json={
+                    "report_ir": report.model_dump(),
+                    "evidence_text": self._evidence_text(),
+                    "strict_quality": False,
+                },
+            )
+            body = response.json()
+            files = list(Path(tmpdir).glob("*.docx"))
+            hits = scan_docx(files[0]) if files else ()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(hits, ())
+        self.assertIn("/download/", body["download_url"])
+
+    def test_enabled_export_rejects_missing_formal_body_without_file_or_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            response = self.client.post(
+                "/report/export",
+                json={
+                    "report_ir": {"title": "只有标题", "sections": []},
+                    "evidence_text": self._evidence_text(),
+                    "strict_quality": False,
+                },
+            )
+            created = list(Path(tmpdir).rglob("*.docx"))
+
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("/download/", response.text)
+        self.assertEqual(created, [])
+
+    def test_atomic_publish_failure_returns_no_download_locator_or_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), patch(
+            "app.formal_body_safety.os.replace", side_effect=OSError("replace failed")
+        ):
+            response = self.client.post("/report/export", json=self._export_payload())
+            created = list(Path(tmpdir).rglob("*.docx"))
+
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("/download/", response.text)
+        self.assertEqual(created, [])
+
+    def test_direct_download_blocks_unsafe_preexisting_docx(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "REPORT_DIR", Path(tmpdir)
+        ), patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            path = Path(tmpdir) / "unsafe.docx"
+            doc = main_module.Document()
+            doc.add_paragraph("该结论需人工核验。")
+            doc.save(path)
+            response = self.client.get("/download/unsafe.docx")
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "WORD_BODY_SAFETY_FAILED")
+        self.assertNotIn("/download/", response.text)
 
 
 class WorkflowYamlV2Tests(unittest.TestCase):

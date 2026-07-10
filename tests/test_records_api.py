@@ -1912,7 +1912,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertTrue(saved["deliverable"])
         self.assertTrue(saved["word_export_available"])
         self.assertTrue(saved["final_word_export_available"])
-        self.assertFalse(saved["draft_word_export_available"])
+        self.assertTrue(saved["draft_word_export_available"])
         self.assertFalse(saved["needs_manual_review"])
         self.assertEqual(saved["primary_failure_code"], "")
         self.assertEqual(saved["blocking_issue_codes"], [])
@@ -1986,6 +1986,10 @@ class RecordsApiTests(unittest.TestCase):
                     "status": "finished",
                     "report_markdown": "",
                     "quality_check": {"passed": True, "issues": []},
+                    "quality_gate": {"deliverable_status": "deliverable"},
+                    "word_download_url": "http://example.test/download/empty.docx",
+                    "download_url": "http://example.test/download/empty.docx",
+                    "word_filename": "empty.docx",
                 }
             )
 
@@ -1993,6 +1997,70 @@ class RecordsApiTests(unittest.TestCase):
         self.assertFalse(normalized["word_export_available"])
         self.assertFalse(normalized["draft_word_export_available"])
         self.assertFalse(normalized["final_word_export_available"])
+        self.assertEqual(normalized["word_download_url"], "")
+        self.assertEqual(normalized["download_url"], "")
+        self.assertEqual(normalized["word_filename"], "")
+
+    def test_unsafe_formal_body_fails_closed_and_clears_download_locators(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_unsafe1234",
+            "status": "finished",
+            "report_markdown": "# 报告\n\n该结论需人工核验。",
+            "quality_check": {"passed": True, "issues": []},
+            "quality_gate": {"deliverable_status": "deliverable"},
+            "word_download_url": "http://example.test/download/unsafe.docx",
+            "download_url": "http://example.test/download/unsafe.docx",
+            "word_filename": "unsafe.docx",
+            "word_generated": True,
+        }
+
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertFalse(normalized["deliverable"])
+        self.assertTrue(normalized["needs_manual_review"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertEqual(normalized["word_download_url"], "")
+        self.assertEqual(normalized["download_url"], "")
+        self.assertEqual(normalized["word_filename"], "")
+        self.assertFalse(normalized["word_generated"])
+
+    def test_failed_run_with_safe_body_does_not_allow_draft_word(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(
+                {
+                    "success": False,
+                    "run_id": "run_failed_body",
+                    "status": "failed",
+                    "report_markdown": "# 报告\n\n公告明确了申报时间。",
+                    "quality_check": {"passed": False, "issues": []},
+                }
+            )
+
+        self.assertFalse(normalized["deliverable"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+
+    def test_finished_quality_failure_with_safe_body_requires_manual_review(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(
+                {
+                    "success": True,
+                    "run_id": "run_quality_failed",
+                    "status": "finished",
+                    "report_markdown": "# 报告\n\n公告明确了申报时间。",
+                    "quality_check": {"passed": False, "issues": []},
+                }
+            )
+
+        self.assertTrue(normalized["needs_manual_review"])
+        self.assertTrue(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertFalse(normalized["deliverable"])
 
     def test_analysis_run_download_returns_503_before_report_lookup_when_disabled(self) -> None:
         with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False), patch.object(
@@ -3225,7 +3293,9 @@ class RecordsApiTests(unittest.TestCase):
 
             def fake_markdown_to_docx(markdown: str, path: main_module.Path, title: str) -> None:
                 calls.append((markdown, title))
-                path.write_bytes(b"PK\x03\x04cached docx content")
+                doc = Document()
+                doc.add_paragraph(markdown)
+                doc.save(path)
 
             with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
                 main_module._write_analysis_run(
@@ -3250,6 +3320,108 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(len(calls), 1)
         self.assertEqual(first.content, second.content)
+
+    def test_analysis_run_download_blocks_unsafe_formal_body_without_creating_word(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_unsafe_download",
+                        "pack_id": "pack_test",
+                        "status": "finished",
+                        "report_title": "不安全报告",
+                        "report_markdown": "# 不安全报告\n\n该结论需人工核验。",
+                        "quality_check": {"passed": True, "issues": []},
+                        "quality_gate": {"deliverable_status": "deliverable"},
+                    }
+                )
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
+                main_module, "REPORT_DIR", report_dir
+            ):
+                response = self.client.get("/analysis/runs/run_unsafe_download/download")
+
+            created = list(report_dir.rglob("*.docx")) if report_dir.exists() else []
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "WORD_BODY_SAFETY_FAILED")
+        self.assertNotIn("/download/", response.text)
+        self.assertEqual(created, [])
+
+    def test_report_ir_only_run_state_and_download_are_consistent(self) -> None:
+        report_ir = {
+            "title": "结构化报告",
+            "lead_paragraphs": ["公告明确了申报时间和执行要求。"],
+            "sections": [],
+            "enterprise_tips": [],
+        }
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_report_ir_only",
+                        "pack_id": "pack_report_ir_only",
+                        "status": "finished",
+                        "report_ir": report_ir,
+                        "quality_check": {"passed": True, "issues": []},
+                        "quality_gate": {"deliverable_status": "deliverable"},
+                    }
+                )
+                state = main_module._read_analysis_run("run_report_ir_only")
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
+                main_module, "REPORT_DIR", report_dir
+            ):
+                response = self.client.get("/analysis/runs/run_report_ir_only/download")
+                created = list(report_dir.glob("*.docx"))
+                hits = main_module.scan_docx(created[0]) if created else ()
+                report_response = self.client.get("/analysis/runs/run_report_ir_only/report")
+
+        self.assertTrue(state["deliverable"])
+        self.assertTrue(state["draft_word_export_available"])
+        self.assertTrue(state["final_word_export_available"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(hits, ())
+        self.assertEqual(report_response.status_code, 200)
+        self.assertIn("公告明确了申报时间和执行要求", report_response.json()["report_markdown"])
+
+    def test_report_ir_only_failure_codes_use_formal_body_not_markdown_presence(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            review = main_module._normalize_analysis_run_schema(
+                {
+                    "run_id": "run_ir_review",
+                    "status": "needs_manual_review",
+                    "report_ir": {
+                        "title": "结构化报告",
+                        "lead_paragraphs": ["公告明确了执行要求。"],
+                        "sections": [],
+                    },
+                    "quality_check": {"passed": False, "issues": []},
+                }
+            )
+            unsafe = main_module._normalize_analysis_run_schema(
+                {
+                    "run_id": "run_ir_unsafe",
+                    "status": "finished",
+                    "report_ir": {
+                        "title": "结构化报告",
+                        "lead_paragraphs": ["该内容需人工核验。"],
+                        "sections": [],
+                    },
+                    "quality_check": {"passed": True, "issues": []},
+                    "quality_gate": {"deliverable_status": "deliverable"},
+                }
+            )
+
+        self.assertNotIn("DIFY_OUTPUT_EMPTY", review["generation_failure_codes"])
+        self.assertIn("FORBIDDEN_PHRASE_IN_FORMAL_BODY", unsafe["quality_failure_codes"])
 
     def test_markdown_docx_uses_manual_report_style_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

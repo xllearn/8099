@@ -58,6 +58,26 @@ class FixedRegressionRunnerTests(unittest.TestCase):
         self.assertTrue(payload["report_ir"]["sections"])
         self.assertFalse(payload["strict_quality"])
 
+    def test_runner_requires_word_export_enabled_for_b1_5(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        runner.validate_expected_word_export(True, "enabled")
+        with self.assertRaises(ValueError):
+            runner.validate_expected_word_export(False, "enabled")
+
+    def test_formal_export_probe_wraps_real_run_body_and_real_evidence_pack(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        payload = runner.build_formal_export_payload(
+            "# 真实报告\n\n公告明确了执行要求。",
+            "真实报告",
+            {"pack_id": "pack_real", "primary_materials": [{"content_text": "公告明确了执行要求。"}]},
+        )
+
+        self.assertNotIn("markdown", payload)
+        self.assertIn("公告明确了执行要求。", payload["report_ir"]["lead_paragraphs"])
+        self.assertIn("pack_real", payload["evidence_text"])
+
     def test_runner_rejects_any_download_url_or_new_docx_when_disabled(self) -> None:
         from scripts import run_fixed_regression as runner
 
@@ -78,7 +98,13 @@ class FixedRegressionRunnerTests(unittest.TestCase):
             "file_download": 503,
         }
 
-        for field in ("word_download_url", "download_url", "word_filename"):
+        for field in (
+            "word_download_url",
+            "download_url",
+            "word_filename",
+            "word_file_path",
+            "word_path",
+        ):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 runner.validate_disabled_word_contract(
                     {**safe_payload, field: "http://example.test/download/report.docx"},
@@ -88,6 +114,100 @@ class FixedRegressionRunnerTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             runner.validate_disabled_word_contract(safe_payload, endpoint_statuses, ["new-report.docx"])
+
+    def test_runner_accepts_enabled_deliverable_word_contract(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        runner.validate_enabled_word_contract(
+            {
+                "deliverable": True,
+                "needs_manual_review": False,
+                "word_export_available": True,
+                "draft_word_export_available": True,
+                "final_word_export_available": True,
+            },
+            {
+                "run_download": 200,
+                "report_export": 200,
+                "report_export_checked": 200,
+                "file_download": 200,
+            },
+            ["run.docx", "export.docx", "checked.docx"],
+            {"run.docx": [], "export.docx": [], "checked.docx": []},
+            [],
+        )
+
+    def test_runner_accepts_enabled_manual_review_draft_contract(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        runner.validate_enabled_word_contract(
+            {
+                "deliverable": False,
+                "needs_manual_review": True,
+                "word_export_available": True,
+                "draft_word_export_available": True,
+                "final_word_export_available": False,
+            },
+            {
+                "run_download": 200,
+                "report_export": 200,
+                "report_export_checked": 200,
+                "file_download": 200,
+            },
+            ["run.docx"],
+            {"run.docx": []},
+            [],
+        )
+
+    def test_runner_rejects_enabled_word_contradiction_hits_or_staging_residue(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        payload = {
+            "deliverable": True,
+            "needs_manual_review": False,
+            "word_export_available": True,
+            "draft_word_export_available": True,
+            "final_word_export_available": True,
+        }
+        statuses = {
+            "run_download": 200,
+            "report_export": 200,
+            "report_export_checked": 200,
+            "file_download": 200,
+        }
+        with self.assertRaises(ValueError):
+            runner.validate_enabled_word_contract(
+                {**payload, "draft_word_export_available": False},
+                statuses,
+                ["run.docx"],
+                {"run.docx": []},
+                [],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_enabled_word_contract(
+                payload,
+                statuses,
+                ["run.docx"],
+                {"run.docx": ["需人工核验"]},
+                [],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_enabled_word_contract(
+                payload,
+                statuses,
+                ["run.docx"],
+                {"run.docx": []},
+                [".word-staging-leaked"],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_enabled_word_contract(
+                payload,
+                statuses,
+                ["run.docx"],
+                {"run.docx": []},
+                [],
+                formal_body_hits=["需人工核验"],
+            )
 
     def test_docx_observation_requires_existing_report_directory(self) -> None:
         from scripts import run_fixed_regression as runner
