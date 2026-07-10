@@ -39,7 +39,6 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field, HttpUrl
 from pypdf import PdfReader
 
-from app.analysis_history import AnalysisHistoryStore
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
@@ -2495,103 +2494,6 @@ def _analysis_run_dir() -> Path:
     return _database_evidence_pack_dir().parent / "analysis_runs"
 
 
-def _analysis_history_enabled() -> bool:
-    return _env_bool("ENABLE_ANALYSIS_HISTORY", True)
-
-
-def _analysis_history_dir() -> Path:
-    configured = (os.getenv("ANALYSIS_HISTORY_DIR") or "").strip()
-    if configured:
-        return Path(configured)
-    return _analysis_run_dir().parent / "analysis_history"
-
-
-def _analysis_history_store() -> AnalysisHistoryStore:
-    return AnalysisHistoryStore(_analysis_history_dir())
-
-
-def _analysis_run_material_metadata(pack: dict[str, Any] | None) -> dict[str, Any]:
-    primary_materials = [
-        item for item in list((pack or {}).get("primary_materials") or []) if isinstance(item, dict)
-    ]
-    source_records: list[dict[str, str]] = []
-    for material in primary_materials:
-        menu_code = str(material.get("menu_code") or "").strip()
-        articleid = str(material.get("articleid") or "").strip()
-        if not menu_code or not articleid:
-            continue
-        source_records.append(
-            {
-                "record_id": f"{menu_code}:{articleid}",
-                "notice_id": f"{menu_code}:{articleid}",
-                "menu_code": menu_code,
-                "menu_name": str(material.get("menu_name") or "").strip(),
-                "articleid": articleid,
-                "title": str(material.get("title") or "").strip(),
-            }
-        )
-    if not source_records:
-        return {}
-    first = source_records[0]
-    return {**first, "source_records": source_records}
-
-
-def _enrich_analysis_run_history_record(record: dict[str, Any]) -> dict[str, Any]:
-    enriched = dict(record)
-    if enriched.get("record_id") and enriched.get("articleid"):
-        return enriched
-    pack_id = str(enriched.get("pack_id") or "").strip()
-    if not pack_id:
-        return enriched
-    try:
-        metadata = _analysis_run_material_metadata(_read_database_evidence_pack(pack_id))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "analysis_history_pack_metadata_unavailable run_id=%s pack_id=%s error_type=%s",
-            enriched.get("run_id") or "",
-            pack_id,
-            exc.__class__.__name__,
-        )
-        return enriched
-    for key, value in metadata.items():
-        if enriched.get(key) in (None, "", []):
-            enriched[key] = value
-    return enriched
-
-
-def _record_analysis_run_history(record: dict[str, Any]) -> None:
-    if not _analysis_history_enabled():
-        return
-    try:
-        store = _analysis_history_store()
-        status = str(record.get("status") or record.get("run_status") or "").strip()
-        run_id = str(record.get("run_id") or "").strip()
-        if status == "running" and store.get_run(run_id) is None:
-            store.record_run_created(record)
-        else:
-            store.record_run_updated(record)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "analysis_history_write_failed run_id=%s status=%s error_type=%s",
-            record.get("run_id") or "",
-            record.get("status") or "",
-            exc.__class__.__name__,
-        )
-
-
-def _record_analysis_word_export(record: dict[str, Any], download_url: str) -> None:
-    if not _analysis_history_enabled():
-        return
-    try:
-        _analysis_history_store().record_word_exported(record, download_url)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "analysis_history_word_export_failed run_id=%s error_type=%s",
-            record.get("run_id") or "",
-            exc.__class__.__name__,
-        )
-
-
 def _safe_run_id(run_id: str) -> str:
     if not re.fullmatch(r"run_[A-Za-z0-9_-]{8,80}", run_id or ""):
         raise HTTPException(status_code=404, detail="analysis run not found")
@@ -2924,7 +2826,6 @@ def _write_analysis_run(record: dict[str, Any]) -> None:
         record.get("status") or "",
         path,
     )
-    _record_analysis_run_history(record)
 
 
 def _read_analysis_run(run_id: str) -> dict[str, Any]:
@@ -4723,7 +4624,6 @@ def run_analysis(req: AnalysisRunRequest):
     report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(req.use_report_memory, pack_for_memory)
     run_id = _make_analysis_run_id(pack_id)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    material_metadata = _analysis_run_material_metadata(pack_for_memory)
     record: dict[str, Any] = {
         "success": True,
         "run_id": run_id,
@@ -4740,7 +4640,6 @@ def run_analysis(req: AnalysisRunRequest):
         "created_at": now,
         "updated_at": now,
         "error_message": "",
-        **material_metadata,
         **memory_metadata,
     }
     record = _normalize_analysis_run_schema(record)
@@ -4798,96 +4697,6 @@ def run_analysis(req: AnalysisRunRequest):
         input_strategy=str(record.get("input_strategy") or ""),
         timings=record.get("timings") if isinstance(record.get("timings"), dict) else {},
     )
-
-
-@app.get("/analysis/history", response_model=None)
-def list_analysis_history(
-    articleid: str = "",
-    record_id: str = "",
-    notice_id: str = "",
-    pack_id: str = "",
-    status: str = "",
-    provider: str = "",
-    q: str = "",
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-) -> dict[str, Any] | JSONResponse:
-    if not _analysis_history_enabled():
-        return {
-            "success": True,
-            "enabled": False,
-            "total": 0,
-            "items": [],
-            "limit": limit,
-            "offset": offset,
-        }
-    try:
-        items, total = _analysis_history_store().list_runs(
-            articleid=articleid,
-            record_id=record_id,
-            notice_id=notice_id,
-            pack_id=pack_id,
-            status=status,
-            provider=provider,
-            query=q,
-            limit=limit,
-            offset=offset,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("analysis_history_list_failed error_type=%s", exc.__class__.__name__)
-        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
-    return {
-        "success": True,
-        "enabled": True,
-        "total": total,
-        "items": items,
-        "limit": limit,
-        "offset": offset,
-    }
-
-
-@app.post("/analysis/history/rebuild", response_model=None)
-def rebuild_analysis_history() -> dict[str, Any] | JSONResponse:
-    if not _analysis_history_enabled():
-        return {"success": True, "enabled": False, "total": 0, "skipped": 0}
-    records: list[dict[str, Any]] = []
-    skipped = 0
-    for path in sorted(_analysis_run_dir().glob("run_*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("run JSON must be an object")
-            records.append(_enrich_analysis_run_history_record(_normalize_analysis_run_schema(data)))
-        except Exception as exc:  # noqa: BLE001
-            skipped += 1
-            logger.warning(
-                "analysis_history_rebuild_run_skipped path=%s error_type=%s",
-                path,
-                exc.__class__.__name__,
-            )
-    try:
-        total = _analysis_history_store().rebuild(records)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("analysis_history_rebuild_failed error_type=%s", exc.__class__.__name__)
-        return _analysis_error(500, "ANALYSIS_HISTORY_REBUILD_FAILED", "重建分析历史失败")
-    return {"success": True, "enabled": True, "total": total, "skipped": skipped}
-
-
-@app.get("/analysis/history/{run_id}", response_model=None)
-def get_analysis_history(run_id: str) -> dict[str, Any] | JSONResponse:
-    if not _analysis_history_enabled():
-        return _analysis_error(404, "ANALYSIS_HISTORY_DISABLED", "分析历史功能未启用")
-    try:
-        safe_run_id = _safe_run_id(run_id)
-        item = _analysis_history_store().get_run(safe_run_id)
-    except HTTPException as exc:
-        return _analysis_error(exc.status_code, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("analysis_history_detail_failed run_id=%s error_type=%s", run_id, exc.__class__.__name__)
-        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
-    if item is None:
-        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
-    return {"success": True, "enabled": True, "item": item}
 
 
 @app.get("/analysis/runs/{run_id}")
@@ -5094,23 +4903,6 @@ def download_analysis_run_report(run_id: str):
         logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
     else:
         logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
-    download_url = f"/analysis/runs/{run_id}/download"
-    record.update(
-        {
-            "word_download_url": download_url,
-            "word_exported_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
-            "word_generated": True,
-        }
-    )
-    try:
-        _write_analysis_run(record)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "analysis_run_word_export_metadata_save_failed run_id=%s error_type=%s",
-            run_id,
-            exc.__class__.__name__,
-        )
-    _record_analysis_word_export(record, download_url)
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
