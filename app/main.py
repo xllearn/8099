@@ -42,6 +42,11 @@ from pypdf import PdfReader
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
+from app.analysis_history import (
+    AnalysisHistoryStore,
+    HistoryTopologyError,
+    enrich_record_with_pack_identity,
+)
 from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
 from app.formal_body import FormalBodyDocument
@@ -2553,6 +2558,71 @@ def _analysis_run_dir() -> Path:
     return _database_evidence_pack_dir().parent / "analysis_runs"
 
 
+def _analysis_history_enabled() -> bool:
+    return _env_bool("ENABLE_ANALYSIS_HISTORY", True)
+
+
+def _analysis_history_dir() -> Path:
+    configured = (os.getenv("ANALYSIS_HISTORY_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    return _analysis_run_dir().parent / "analysis_history"
+
+
+def _analysis_history_store() -> AnalysisHistoryStore:
+    return AnalysisHistoryStore(_analysis_history_dir())
+
+
+def _record_analysis_history(record: dict[str, Any]) -> None:
+    if not _analysis_history_enabled():
+        return
+    try:
+        _analysis_history_store().record_run(record)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_history_write_failed run_id=%s error_type=%s",
+            str(record.get("run_id") or ""),
+            exc.__class__.__name__,
+        )
+
+
+def _record_analysis_word_download(
+    record: dict[str, Any], download_url: str, filename: str
+) -> None:
+    if not _analysis_history_enabled():
+        return
+    try:
+        _analysis_history_store().record_word_downloaded(
+            record,
+            download_url=download_url,
+            filename=filename,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_history_word_write_failed run_id=%s error_type=%s",
+            str(record.get("run_id") or ""),
+            exc.__class__.__name__,
+        )
+
+
+def _history_item_for_response(item: dict[str, Any]) -> dict[str, Any]:
+    response_item = dict(item)
+    if _word_export_enabled():
+        return response_item
+    response_item.update(
+        {
+            "word_generated": False,
+            "word_download_available": False,
+            "word_export_available": False,
+            "draft_word_export_available": False,
+            "final_word_export_available": False,
+            "word_download_url": "",
+            "word_filename": "",
+        }
+    )
+    return response_item
+
+
 def _safe_run_id(run_id: str) -> str:
     if not re.fullmatch(r"run_[A-Za-z0-9_-]{8,80}", run_id or ""):
         raise HTTPException(status_code=404, detail="analysis run not found")
@@ -2925,14 +2995,20 @@ def _write_analysis_run(record: dict[str, Any]) -> None:
     run_id = str(record.get("run_id") or "")
     path = _analysis_run_path(run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(
-        "analysis_run_saved run_id=%s pack_id=%s status=%s path=%s",
-        run_id,
-        record.get("pack_id") or "",
-        record.get("status") or "",
-        path,
-    )
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        _record_analysis_history(record)
+        os.replace(temp_path, path)
+        logger.info(
+            "analysis_run_saved run_id=%s pack_id=%s status=%s path=%s",
+            run_id,
+            record.get("pack_id") or "",
+            record.get("status") or "",
+            path,
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _read_analysis_run(run_id: str) -> dict[str, Any]:
@@ -4733,6 +4809,7 @@ def run_analysis(req: AnalysisRunRequest):
     report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(req.use_report_memory, pack_for_memory)
     run_id = _make_analysis_run_id(pack_id)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    material_metadata = enrich_record_with_pack_identity({}, pack_for_memory)
     record: dict[str, Any] = {
         "success": True,
         "run_id": run_id,
@@ -4749,6 +4826,7 @@ def run_analysis(req: AnalysisRunRequest):
         "created_at": now,
         "updated_at": now,
         "error_message": "",
+        **material_metadata,
         **memory_metadata,
     }
     record = _normalize_analysis_run_schema(record)
@@ -4806,6 +4884,88 @@ def run_analysis(req: AnalysisRunRequest):
         input_strategy=str(record.get("input_strategy") or ""),
         timings=record.get("timings") if isinstance(record.get("timings"), dict) else {},
     )
+
+
+@app.get("/analysis/history", response_model=None)
+def list_analysis_history(
+    articleid: str = "",
+    record_id: str = "",
+    notice_id: str = "",
+    menu_code: str = "",
+    pack_id: str = "",
+    status: str = "",
+    provider: str = "",
+    q: str = "",
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any] | JSONResponse:
+    if not _analysis_history_enabled():
+        return {
+            "success": True,
+            "enabled": False,
+            "total": 0,
+            "items": [],
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
+        }
+    try:
+        items, total = _analysis_history_store().list_runs(
+            articleid=articleid,
+            record_id=record_id,
+            notice_id=notice_id,
+            menu_code=menu_code,
+            pack_id=pack_id,
+            status=status,
+            provider=provider,
+            query=q,
+            page=page,
+            page_size=page_size,
+        )
+    except HistoryTopologyError:
+        return _analysis_error(
+            503,
+            "ANALYSIS_HISTORY_SINGLE_WORKER_REQUIRED",
+            "分析历史仅支持单 worker 写入拓扑",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis_history_list_failed error_type=%s", exc.__class__.__name__)
+        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
+    return {
+        "success": True,
+        "enabled": True,
+        "total": total,
+        "items": [_history_item_for_response(item) for item in items],
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
+
+
+@app.get("/analysis/history/{run_id}", response_model=None)
+def get_analysis_history(run_id: str) -> dict[str, Any] | JSONResponse:
+    if not _analysis_history_enabled():
+        return _analysis_error(404, "ANALYSIS_HISTORY_DISABLED", "分析历史功能未启用")
+    try:
+        item = _analysis_history_store().get_run(_safe_run_id(run_id))
+    except HistoryTopologyError:
+        return _analysis_error(
+            503,
+            "ANALYSIS_HISTORY_SINGLE_WORKER_REQUIRED",
+            "分析历史仅支持单 worker 写入拓扑",
+        )
+    except HTTPException as exc:
+        return _analysis_error(exc.status_code, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_history_detail_failed run_id=%s error_type=%s",
+            run_id,
+            exc.__class__.__name__,
+        )
+        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
+    if item is None:
+        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    return {"success": True, "enabled": True, "item": _history_item_for_response(item)}
 
 
 @app.get("/analysis/runs/{run_id}")
@@ -5066,6 +5226,11 @@ def download_analysis_run_report(run_id: str):
         return _word_body_safety_failed_response(
             "/analysis/runs/{run_id}/download", str(exc)
         )
+    _record_analysis_word_download(
+        record,
+        f"/analysis/runs/{run_id}/download",
+        filename,
+    )
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
