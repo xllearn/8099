@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -19,6 +22,29 @@ if str(ROOT) not in sys.path:
 
 from app.formal_body import FormalBodyDocument  # noqa: E402
 from app.formal_body_safety import scan_docx, scan_formal_body  # noqa: E402
+from app.attachment_fetcher import (  # noqa: E402
+    DEFAULT_ATTACHMENT_DOWNLOAD_BASE_URL,
+    build_attachment_auth_headers,
+)
+from app.offline_quality_evaluator import (  # noqa: E402
+    ARTIFACT_SCHEMA_VERSION,
+    TIMING_FIELDS,
+    compare_run_history,
+    sha256_file,
+    sha256_json,
+    validate_sample_contract,
+    verify_snapshot_replay,
+)
+from app.regression_manifest import (  # noqa: E402
+    attachment_identity,
+    build_manifest_contract,
+    excluded_cases,
+    load_manifest as load_regression_manifest,
+    manifest_sha256,
+    normalize_source_text,
+    select_cases,
+    verify_record_fingerprint,
+)
 
 DEFAULT_MANIFEST = ROOT / "tests" / "fixtures" / "8099_regression_cases.json"
 TERMINAL_STATUSES = {"finished", "failed", "needs_manual_review"}
@@ -57,30 +83,101 @@ FORBIDDEN_PHRASES = (
     "待核实",
 )
 
+def _text_only_attachment_hash(attachment: Mapping[str, Any]) -> dict[str, Any]:
+    parsed_text = normalize_source_text(attachment.get("parsed_text"))
+    if not parsed_text.strip():
+        raise ValueError("attachment content requires raw bytes or non-empty parsed text")
+    content = b"TEXT_ONLY\n" + parsed_text.encode("utf-8")
+    return {
+        "content_sha256": hashlib.sha256(content).hexdigest(),
+        "content_hash_source": "text_only",
+        "content_length": len(parsed_text.encode("utf-8")),
+        "verifier": "normalized_text_sha256_v1",
+    }
 
-def load_cases(path: Path = DEFAULT_MANIFEST) -> list[dict[str, Any]]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, list) or not data:
-        raise ValueError("fixed regression manifest must contain a non-empty list")
-    cases: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for raw in data:
-        if not isinstance(raw, dict):
-            raise ValueError("each fixed regression case must be an object")
-        case = dict(raw)
-        menu_code = str(case.get("menu_code") or "").strip()
-        articleid = str(case.get("articleid") or "").strip()
-        primary = case.get("primary")
-        auxiliary = case.get("auxiliary")
-        if not case.get("id") or not case.get("name") or not menu_code or not articleid:
-            raise ValueError("fixed regression case is missing identity fields")
-        if not isinstance(primary, list) or not primary or not isinstance(auxiliary, list):
-            raise ValueError(f"fixed regression case {case['id']} has invalid materials")
-        identity = (menu_code, articleid)
-        if identity in seen:
-            raise ValueError(f"duplicate fixed regression identity: {identity}")
-        seen.add(identity)
-        cases.append(case)
+
+def _attachment_content_hash(attachment: Mapping[str, Any]) -> dict[str, Any]:
+    identity = tuple(
+        str(attachment.get(field) or "")
+        for field in ("articleattid", "filename", "filesize", "uploadtime")
+    )
+    articleattid = identity[0].strip()
+    if not articleattid:
+        return _text_only_attachment_hash(attachment)
+
+    base_url = (
+        os.getenv("ATTACHMENT_DOWNLOAD_BASE_URL")
+        or DEFAULT_ATTACHMENT_DOWNLOAD_BASE_URL
+    ).strip()
+    url = (
+        base_url.format(articleattid=articleattid)
+        if "{articleattid}" in base_url
+        else f"{base_url}{articleattid}"
+    )
+    headers, _ = build_attachment_auth_headers()
+    timeout = float((os.getenv("ATTACHMENT_REQUEST_TIMEOUT") or "60").strip() or 60)
+    try:
+        max_download_mb = float(
+            (os.getenv("ATTACHMENT_MAX_DOWNLOAD_MB") or "50").strip() or 50
+        )
+    except ValueError:
+        max_download_mb = 50.0
+    max_download_bytes = max(1, int(max_download_mb * 1024 * 1024))
+    try:
+        digest = hashlib.sha256()
+        content_length = 0
+        with httpx.Client(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=headers,
+            trust_env=False,
+        ) as client:
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "").lower()
+                if "text/html" in content_type:
+                    raise ValueError("attachment endpoint returned HTML")
+                for chunk in response.iter_bytes():
+                    digest.update(chunk)
+                    content_length += len(chunk)
+                    if content_length > max_download_bytes:
+                        raise ValueError("attachment exceeds configured download limit")
+        if content_length <= 0:
+            raise ValueError("attachment endpoint returned empty content")
+        result = {
+            "content_sha256": digest.hexdigest(),
+            "content_hash_source": "raw_bytes",
+            "content_length": content_length,
+            "verifier": "stream_sha256_v1",
+        }
+    except (httpx.HTTPError, OSError, ValueError):
+        result = _text_only_attachment_hash(attachment)
+    return dict(result)
+
+
+def _attachment_content_verifications(
+    record: Mapping[str, Any],
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    verifications: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in record.get("attachments", []):
+        if not isinstance(item, Mapping):
+            continue
+        identity = attachment_identity(item)
+        if identity in verifications:
+            raise ValueError("record contains duplicate attachment identities")
+        verifications[identity] = _attachment_content_hash(item)
+    return verifications
+
+
+def load_cases(
+    path: Path = DEFAULT_MANIFEST, subset: str = "fixed3"
+) -> list[dict[str, Any]]:
+    manifest = load_regression_manifest(path)
+    cases = select_cases(manifest, subset)
+    for case in cases:
+        request = case["replay"]["request"]
+        case["primary"] = list(request["primary_materials"])
+        case["auxiliary"] = list(request["auxiliary_materials"])
     return cases
 
 
@@ -250,6 +347,130 @@ def _require_success(response: httpx.Response, operation: str) -> dict[str, Any]
     return body
 
 
+def _write_json_snapshot(
+    root: Path, relative_path: Path, value: Mapping[str, Any] | list[Any]
+) -> dict[str, str]:
+    path = root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return {"path": relative_path.as_posix(), "sha256": sha256_file(path)}
+
+
+def _write_json_atomically(path: Path, value: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _capture_and_verify_materials(
+    client: httpx.Client,
+    case: Mapping[str, Any],
+    output_root: Path,
+    sample_dir: Path,
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    captured: list[dict[str, Any]] = []
+    for expected in case["materials"]:
+        menu_code = str(expected["menu_code"])
+        articleid = str(expected["articleid"])
+        detail = _require_success(
+            client.get(f"/records/{menu_code}/{articleid}", timeout=120),
+            "record detail",
+        )
+        verifications = _attachment_content_verifications(detail)
+        actual = verify_record_fingerprint(
+            detail,
+            expected,
+            verified_attachment_content=verifications,
+        )
+        captured.append(
+            {
+                "role": str(expected["role"]),
+                "expected": dict(expected),
+                "actual": actual,
+                "record": detail,
+                "attachment_content_verification": [
+                    {"identity": list(identity), **verification}
+                    for identity, verification in sorted(verifications.items())
+                ],
+            }
+        )
+    reference = _write_json_snapshot(
+        output_root,
+        sample_dir / "materials.json",
+        {"case_id": case["id"], "materials": captured},
+    )
+    return reference, captured
+
+
+def _quality_metrics(state: Mapping[str, Any]) -> tuple[str, bool | None, int]:
+    quality_gate = state.get("quality_gate")
+    if not isinstance(quality_gate, Mapping):
+        quality_gate = {}
+    quality_check = state.get("quality_check")
+    if not isinstance(quality_check, Mapping):
+        quality_check = {}
+    quality_passed = state.get("quality_passed")
+    if quality_passed not in (True, False):
+        quality_passed = quality_check.get("passed")
+    if quality_passed not in (True, False):
+        quality_passed = None
+    if state.get("deliverable") is True and quality_passed is True:
+        quality_status = "passed"
+    elif state.get("needs_manual_review") is True:
+        quality_status = "needs_manual_review"
+    else:
+        quality_status = "failed"
+    return (
+        quality_status,
+        quality_passed,
+        int(quality_gate.get("unsupported_fact_count") or 0),
+    )
+
+
+def _history_for_run(
+    client: httpx.Client,
+    run_id: str,
+    case: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    detail = _require_success(
+        client.get(f"/analysis/history/{run_id}", timeout=60),
+        "analysis history detail",
+    )
+    item = detail.get("item")
+    if not isinstance(item, dict):
+        raise ValueError("analysis history detail did not return item")
+    listing = _require_success(
+        client.get(
+            "/analysis/history",
+            params={
+                "menu_code": case["menu_code"],
+                "articleid": case["articleid"],
+                "page": 1,
+                "page_size": 200,
+            },
+            timeout=60,
+        ),
+        "analysis history list",
+    )
+    items = listing.get("items")
+    if not isinstance(items, list) or not any(
+        isinstance(candidate, dict) and candidate.get("run_id") == run_id
+        for candidate in items
+    ):
+        raise ValueError("analysis history list does not contain the completed run")
+    return item, listing
+
+
 def _assert_disabled_response(response: httpx.Response, operation: str) -> None:
     if response.status_code != 503:
         raise ValueError(f"{operation} returned HTTP {response.status_code}, expected 503")
@@ -265,24 +486,37 @@ def run_case(
     client: httpx.Client,
     case: dict[str, Any],
     report_dir: Path | None,
+    output_root: Path,
     artifact_dir: Path,
     word_export_enabled: bool,
     timeout_seconds: int,
     poll_seconds: float,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     started = time.monotonic()
+    snapshots: dict[str, dict[str, str]] = {}
+    material_reference, captured_materials = _capture_and_verify_materials(
+        client,
+        case,
+        output_root,
+        artifact_dir.relative_to(output_root),
+    )
+    snapshots["materials"] = material_reference
     before_docx = _docx_names(report_dir)
+    replay_request = dict(case["replay"]["request"])
+    prepare_started = time.monotonic()
     prepare = _require_success(
         client.post(
             "/analysis/prepare",
-            json={
-                "primary_materials": case["primary"],
-                "auxiliary_materials": case["auxiliary"],
-                "force_refresh_attachments": False,
-            },
+            json=replay_request,
             timeout=300,
         ),
         "analysis prepare",
+    )
+    prepare_ms = int((time.monotonic() - prepare_started) * 1000)
+    sample_relative = artifact_dir.relative_to(output_root)
+    snapshots["prepare"] = _write_json_snapshot(
+        output_root, sample_relative / "prepare.json", prepare
     )
     expected_attachment_count = int(case.get("expected_attachment_count") or 0)
     if int(prepare.get("attachment_count") or 0) != expected_attachment_count:
@@ -290,6 +524,16 @@ def run_case(
             f"attachment count mismatch: expected {expected_attachment_count}, got {prepare.get('attachment_count')}"
         )
     pack_id = str(prepare.get("pack_id") or "")
+    compact_pack = _require_success(
+        client.get(f"/analysis/packs/{pack_id}", timeout=120),
+        "analysis compact pack",
+    )
+    snapshots["compact_pack"] = _write_json_snapshot(
+        output_root,
+        sample_relative / "compact-pack.json",
+        compact_pack,
+    )
+    analysis_started = time.monotonic()
     run_start = _require_success(
         client.post("/analysis/run", json={"pack_id": pack_id}, timeout=60),
         "analysis run",
@@ -307,15 +551,30 @@ def run_case(
         time.sleep(poll_seconds)
     else:
         raise TimeoutError(f"analysis run timed out after {timeout_seconds}s: {run_id}")
+    analysis_elapsed_ms = int((time.monotonic() - analysis_started) * 1000)
 
     report_payload = _require_success(
         client.get(f"/analysis/runs/{run_id}/report", timeout=120),
         "analysis report",
     )
+    diagnostics = _require_success(
+        client.get(f"/analysis/runs/{run_id}/diagnostics", timeout=120),
+        "analysis diagnostics",
+    )
+    snapshots["run"] = _write_json_snapshot(
+        output_root, sample_relative / "run.json", state
+    )
+    snapshots["report"] = _write_json_snapshot(
+        output_root, sample_relative / "report.json", report_payload
+    )
+    snapshots["diagnostics"] = _write_json_snapshot(
+        output_root, sample_relative / "diagnostics.json", diagnostics
+    )
     report_markdown = str(report_payload.get("report_markdown") or "").strip()
     if not report_markdown:
         raise ValueError("analysis report body is empty")
 
+    word_started = time.monotonic()
     render_response = client.post(
         "/report/render",
         json=build_render_probe_payload(),
@@ -355,7 +614,12 @@ def run_case(
         for name, response in downloads.items():
             if response.status_code != 200:
                 raise ValueError(f"{name} download failed with HTTP {response.status_code}: {response.text[:300]}")
-            word_scan_hits[name] = _save_and_scan_docx(response.content, artifact_dir / name)
+            downloaded_path = artifact_dir / name
+            word_scan_hits[name] = _save_and_scan_docx(response.content, downloaded_path)
+            snapshots[f"word_{Path(name).stem}"] = {
+                "path": downloaded_path.relative_to(output_root).as_posix(),
+                "sha256": sha256_file(downloaded_path),
+            }
         endpoint_responses = {
             "run_download": run_download,
             "report_export": export_response,
@@ -383,6 +647,7 @@ def run_case(
         }
         for name, response in endpoint_responses.items():
             _assert_disabled_response(response, name)
+    word_export_ms = int((time.monotonic() - word_started) * 1000)
 
     after_docx = _docx_names(report_dir)
     created_docx = sorted(after_docx - before_docx)
@@ -411,36 +676,160 @@ def run_case(
         )
     else:
         validate_disabled_word_contract(state, endpoint_statuses, created_docx)
-    return {
+    history, history_listing = _history_for_run(client, run_id, case)
+    snapshots["history"] = _write_json_snapshot(
+        output_root, sample_relative / "history.json", history
+    )
+    snapshots["history_query"] = _write_json_snapshot(
+        output_root, sample_relative / "history-query.json", history_listing
+    )
+    history_consistency = compare_run_history(
+        state,
+        history,
+        word_downloaded=endpoint_statuses.get("run_download") == 200,
+    )
+    if not history_consistency["consistent"]:
+        raise ValueError(
+            f"run/history state mismatch: {history_consistency['mismatches']}"
+        )
+    quality_status, quality_passed, unsupported_fact_count = _quality_metrics(state)
+    evidence_pack = (
+        prepare.get("evidence_pack")
+        if isinstance(prepare.get("evidence_pack"), dict)
+        else {}
+    )
+    provider = str(state.get("provider") or "").strip()
+    workflow_run_id = str(state.get("workflow_run_id") or "").strip()
+    provider_run_id = str(state.get("provider_run_id") or workflow_run_id).strip()
+    compact_pack_chars = int(state.get("compact_pack_chars") or 0)
+    input_strategy = str(state.get("input_strategy") or "").strip()
+    state_timings = state.get("timings") if isinstance(state.get("timings"), Mapping) else {}
+    total_ms = int((time.monotonic() - started) * 1000)
+    timings = {
+        "prepare_ms": prepare_ms,
+        "generation_ms": int(state_timings.get("generation_ms") or analysis_elapsed_ms),
+        "local_quality_gate_ms": int(state_timings.get("local_quality_gate_ms") or 0),
+        "repair_ms": int(state_timings.get("repair_ms") or 0),
+        "export_check_ms": int(state_timings.get("export_check_ms") or 0),
+        "word_export_ms": word_export_ms,
+        "total_ms": total_ms,
+    }
+    timings = {field: max(0, int(timings.get(field) or 0)) for field in TIMING_FIELDS}
+    metrics_complete = bool(
+        provider
+        and str(state.get("status") or state.get("run_status") or "").strip()
+        and quality_status
+        and compact_pack_chars > 0
+        and input_strategy
+        and evidence_pack
+        and (provider != "dify" or workflow_run_id)
+        and timings["total_ms"] > 0
+    )
+    if not metrics_complete:
+        raise ValueError("run result metrics are incomplete")
+    report_ir = report_payload.get("report_ir")
+    if not isinstance(report_ir, Mapping):
+        report_ir = state.get("report_ir")
+    report_section_count = (
+        len(report_ir.get("sections") or [])
+        if isinstance(report_ir, Mapping) and isinstance(report_ir.get("sections"), list)
+        else sum(1 for line in report_markdown.splitlines() if line.lstrip().startswith("#"))
+    )
+    snapshots["word_contract"] = _write_json_snapshot(
+        output_root,
+        sample_relative / "word-contract.json",
+        {
+            "word_export_enabled": word_export_enabled,
+            "endpoint_statuses": endpoint_statuses,
+            "created_docx": created_docx,
+            "staging_artifacts": staging_artifacts,
+            "download_locators": {
+                field: state.get(field)
+                for field in WORD_LOCATORS
+            },
+            "timings": timings,
+        },
+    )
+    result = {
+        "sample_id": f"{case['id']}-attempt-{attempt}",
         "case_id": case["id"],
+        "attempt": attempt,
+        "passed": True,
         "case_name": case["name"],
         "menu_code": case["menu_code"],
         "articleid": case["articleid"],
         "pack_id": pack_id,
         "run_id": run_id,
         "status": str(state.get("status") or state.get("run_status") or ""),
-        "provider": str(state.get("provider") or ""),
-        "workflow_run_id": str(state.get("workflow_run_id") or ""),
-        "compact_pack_chars": int(state.get("compact_pack_chars") or 0),
+        "provider": provider,
+        "workflow_run_id": workflow_run_id,
+        "provider_run_id": provider_run_id,
+        "compact_pack_chars": compact_pack_chars,
+        "input_strategy": input_strategy,
+        "evidence_pack_sha256": sha256_json(evidence_pack),
+        "timings": timings,
+        "quality_status": quality_status,
+        "quality_passed": quality_passed,
+        "unsupported_fact_count": unsupported_fact_count,
+        "primary_failure_code": state.get("primary_failure_code") or "",
+        "secondary_failure_codes": state.get("secondary_failure_codes") or [],
+        "quality_failure_codes": state.get("quality_failure_codes") or [],
+        "generation_failure_codes": state.get("generation_failure_codes") or [],
         "deliverable": bool(state.get("deliverable")),
         "needs_manual_review": bool(state.get("needs_manual_review")),
         "word_export_available": bool(state.get("word_export_available")),
         "draft_word_export_available": bool(state.get("draft_word_export_available")),
         "final_word_export_available": bool(state.get("final_word_export_available")),
+        "word_download_available": bool(history.get("word_download_available")),
+        "word_generated": bool(history.get("word_generated")),
         "endpoint_statuses": endpoint_statuses,
         "created_docx": created_docx,
         "word_scan_hits": word_scan_hits,
         "staging_artifacts": staging_artifacts,
         "report_chars": len(report_markdown),
+        "report_section_count": report_section_count,
         "forbidden_phrase_hits": hits,
-        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "history_consistency": history_consistency,
+        "identity_hash_complete": len(captured_materials) == len(case["materials"]),
+        "material_bindings": sorted(
+            (
+                {
+                    "role": str(item.get("role") or ""),
+                    "menu_code": str((item.get("actual") or {}).get("menu_code") or ""),
+                    "articleid": str((item.get("actual") or {}).get("articleid") or ""),
+                    "record_sha256": str(
+                        (item.get("actual") or {}).get("record_sha256") or ""
+                    ),
+                }
+                for item in captured_materials
+            ),
+            key=lambda item: (
+                item["role"],
+                item["menu_code"],
+                item["articleid"],
+            ),
+        ),
+        "metrics_complete": metrics_complete,
+        "snapshot_replayable": True,
+        "snapshots": snapshots,
+        "elapsed_seconds": round(total_ms / 1000, 3),
     }
+    validate_sample_contract(result)
+    return result
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the fixed 8099 Word-fuse regression set")
     parser.add_argument("--base-url", default="http://127.0.0.1:8099")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument("--subset", choices=("fixed3", "fixed10", "all"), default="fixed3")
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--stage", default="manual")
+    parser.add_argument(
+        "--environment",
+        choices=("server_test",),
+        default="server_test",
+    )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--report-dir", type=Path, required=True)
     parser.add_argument("--case-timeout-seconds", type=int, default=1200)
@@ -450,50 +839,119 @@ def main() -> int:
         choices=("enabled", "disabled", "auto"),
         default="enabled",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def validate_run_matrix(stage: str, subset: str, repeat: int) -> None:
+    if repeat < 1:
+        raise ValueError("--repeat must be at least 1")
+    if str(stage).strip().upper() != "S0":
+        return
+    expected_repeat = {"fixed3": 3, "fixed10": 1}.get(subset)
+    if expected_repeat is None or repeat != expected_repeat:
+        raise ValueError("S0 regression matrix requires fixed3 x3 or fixed10 x1")
+
+
+def _case_identity(case: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "case_id": str(case.get("id") or ""),
+        "menu_code": str(case.get("menu_code") or ""),
+        "articleid": str(case.get("articleid") or ""),
+    }
+
+
+def _declared_cases(manifest: Mapping[str, Any], subset: str) -> list[dict[str, str]]:
+    by_id = {str(case.get("id") or ""): case for case in manifest.get("cases", [])}
+    if subset == "all":
+        selected_ids = list(by_id)
+    else:
+        selected_ids = [str(case_id) for case_id in manifest["subsets"][subset]]
+    return [_case_identity(by_id[case_id]) for case_id in selected_ids]
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    validate_run_matrix(args.stage, args.subset, args.repeat)
 
     output_dir = args.output_dir or (
-        Path(tempfile.gettempdir()) / f"8099-fixed-regression-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        Path(tempfile.gettempdir())
+        / f"8099-{args.subset}-regression-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
     )
     output_dir.mkdir(parents=True, exist_ok=False)
-    cases = load_cases(args.manifest)
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    manifest = load_regression_manifest(args.manifest)
+    manifest_contract = build_manifest_contract(manifest)
+    cases = load_cases(args.manifest, args.subset)
+    exclusions = excluded_cases(manifest, args.subset)
+    declared_cases = _declared_cases(manifest, args.subset)
+    selected_cases = [_case_identity(case) for case in cases]
+    frozen_manifest_sha256 = manifest_sha256(manifest_contract)
     results: list[dict[str, Any]] = []
-    failures: list[dict[str, str]] = []
+    failures: list[dict[str, Any]] = []
 
     with httpx.Client(base_url=args.base_url.rstrip("/"), follow_redirects=True) as client:
         health = _require_success(client.get("/health", timeout=30), "health")
         word_export_enabled = health.get("word_export_enabled") is True
         validate_expected_word_export(word_export_enabled, args.expect_word_export)
-        for index, case in enumerate(cases, start=1):
-            print(f"[{index}/{len(cases)}] {case['id']}", flush=True)
-            try:
-                result = run_case(
-                    client,
-                    case,
-                    args.report_dir,
-                    output_dir / str(case["id"]),
-                    word_export_enabled,
-                    args.case_timeout_seconds,
-                    args.poll_seconds,
+        expected_samples = len(cases) * args.repeat
+        sample_index = 0
+        for attempt in range(1, args.repeat + 1):
+            for case in cases:
+                sample_index += 1
+                print(
+                    f"[{sample_index}/{expected_samples}] {case['id']} attempt={attempt}",
+                    flush=True,
                 )
-                results.append(result)
-            except Exception as exc:  # noqa: BLE001
-                failures.append({"case_id": str(case.get("id") or ""), "error": f"{type(exc).__name__}: {exc}"})
+                try:
+                    result = run_case(
+                        client,
+                        case,
+                        args.report_dir,
+                        output_dir,
+                        output_dir / "cases" / str(case["id"]) / f"attempt-{attempt}",
+                        word_export_enabled,
+                        args.case_timeout_seconds,
+                        args.poll_seconds,
+                        attempt,
+                    )
+                    results.append(result)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(
+                        {
+                            "sample_id": f"{case['id']}-attempt-{attempt}",
+                            "case_id": str(case.get("id") or ""),
+                            "attempt": attempt,
+                            "error": f"{type(exc).__name__}: {exc}",
+                        }
+                    )
 
     summary = {
+        "schema_version": ARTIFACT_SCHEMA_VERSION,
         "base_url": args.base_url,
         "manifest": str(args.manifest),
-        "total": len(cases),
+        "manifest_version": manifest["manifest_version"],
+        "manifest_sha256": frozen_manifest_sha256,
+        "manifest_contract": manifest_contract,
+        "stage": args.stage,
+        "environment": args.environment,
+        "subset": args.subset,
+        "repeat": args.repeat,
+        "declared_case_count": len(declared_cases),
+        "selected_case_count": len(cases),
+        "declared_cases": declared_cases,
+        "selected_cases": selected_cases,
+        "excluded_cases": exclusions,
+        "started_at": started_at,
+        "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "total": len(cases) * args.repeat,
         "passed": len(results),
         "failed": len(failures),
         "word_export_enabled": word_export_enabled,
-        "results": results,
+        "samples": results,
         "failures": failures,
     }
-    (output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    summary["snapshot_verification"] = verify_snapshot_replay(output_dir, summary)
+    _write_json_atomically(output_dir / "summary.json", summary)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
     return 0 if not failures else 1
 
