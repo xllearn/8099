@@ -107,11 +107,24 @@ class VbpQualityGateTests(unittest.TestCase):
 
     def test_non_vbp_material_bypasses_specialized_gate(self):
         pack = self.pack(vbp=False)
-        result = self.evaluate(pack=pack)
+        document = FormalBodyDocument(markdown=self.complete_markdown())
+        claim_index = build_claim_evidence_index(document, pack)
+        result = self.evaluate(pack=pack, index=claim_index)
 
         self.assertFalse(result["applicable"])
         self.assertTrue(result["passed"])
         self.assertEqual("not_applicable", result["status"])
+        self.assertEqual(
+            claim_index["metrics"]["claim_count"], result["claim_count"]
+        )
+        self.assertEqual(
+            claim_index["metrics"]["supported_claim_count"],
+            result["supported_claim_count"],
+        )
+        self.assertEqual(
+            claim_index["metrics"]["unsupported_claim_count"],
+            result["unsupported_claim_count"],
+        )
 
     def test_report_ir_sections_and_claims_use_the_same_gate_contract(self):
         from app.vbp_quality_gate import evaluate_vbp_quality

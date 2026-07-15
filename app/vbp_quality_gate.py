@@ -167,6 +167,12 @@ def evaluate_vbp_quality(
         "applicable": _pack_is_vbp(pack, loaded_rules),
     }
     if not base["applicable"]:
+        index_metrics = (
+            claim_index.get("metrics")
+            if isinstance(claim_index, dict)
+            and isinstance(claim_index.get("metrics"), dict)
+            else {}
+        )
         return {
             **base,
             "status": "not_applicable",
@@ -177,11 +183,21 @@ def evaluate_vbp_quality(
             "missing_section_ids": [],
             "applicable_topic_ids": [],
             "missing_topic_ids": [],
-            "claim_count": 0,
-            "supported_claim_count": 0,
-            "unsupported_claim_count": 0,
-            "claim_ab_support_rate": 1.0,
-            "c_independent_support_count": 0,
+            "claim_count": int(index_metrics.get("claim_count") or 0),
+            "supported_claim_count": int(
+                index_metrics.get("supported_claim_count") or 0
+            ),
+            "unsupported_claim_count": int(
+                index_metrics.get("unsupported_claim_count") or 0
+            ),
+            "claim_ab_support_rate": float(
+                index_metrics.get("ab_support_rate")
+                if index_metrics.get("ab_support_rate") is not None
+                else 1.0
+            ),
+            "c_independent_support_count": int(
+                index_metrics.get("c_independent_support_count") or 0
+            ),
             "rejected_c_support_count": 0,
         }
 
