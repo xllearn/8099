@@ -17,6 +17,10 @@ from app.vbp_quality_gate import evaluate_vbp_quality
 
 CONTROLLED_REPAIR_VERSION = "20260715-delete-only-v1"
 CONTROLLED_REPAIR_FAILURE_CODE = "CONTROLLED_REPAIR_FAILED"
+_STRUCTURAL_QUALITY_CODES = frozenset(
+    {"VBP_REQUIRED_SECTION_MISSING", "VBP_REQUIRED_TOPIC_MISSING"}
+)
+_INPUT_CLAIM_TEXTS_KEY = "_repair_input_claim_texts"
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])")
 _MARKDOWN_SENTENCE_LOCATION_RE = re.compile(r"^markdown\.line\[(\d+)]\.sentence\[(\d+)]$")
 _MARKDOWN_TABLE_LOCATION_RE = re.compile(r"^markdown\.table\[(\d+)]\.row\[(\d+)]$")
@@ -266,6 +270,7 @@ def _mark_repair_failure(
     metadata_updates: dict[str, Any] | None = None,
 ) -> ReportGenerationResult:
     metadata = dict(result.metadata)
+    metadata.pop(_INPUT_CLAIM_TEXTS_KEY, None)
     if metadata_updates:
         metadata.update(copy.deepcopy(metadata_updates))
     existing_codes = [str(item or "") for item in list(metadata.get("quality_failure_codes") or [])]
@@ -401,6 +406,14 @@ class UnsupportedFactRepairer:
                     for claim in list(claim_index.get("claims") or [])
                     if isinstance(claim, dict) and str(claim.get("claim_id") or "")
                 ),
+                _INPUT_CLAIM_TEXTS_KEY: sorted(
+                    {
+                        str(claim.get("normalized_text") or "")
+                        for claim in list(claim_index.get("claims") or [])
+                        if isinstance(claim, dict)
+                        and str(claim.get("normalized_text") or "")
+                    }
+                ),
                 "repair_new_fact_count": None,
                 "repair_new_fact_observed": False,
             }
@@ -509,11 +522,30 @@ def _finalize_controlled_repair(
         for claim in list(claim_index.get("claims") or [])
         if isinstance(claim, dict) and str(claim.get("claim_id") or "")
     }
-    new_claim_ids = sorted(output_claim_ids - input_claim_ids)
+    input_claim_texts = {
+        str(item)
+        for item in list(result.metadata.get(_INPUT_CLAIM_TEXTS_KEY) or [])
+        if str(item)
+    }
+    narrowed_claim_ids = sorted(
+        str(claim.get("claim_id") or "")
+        for claim in list(claim_index.get("claims") or [])
+        if isinstance(claim, dict)
+        and str(claim.get("claim_id") or "") not in input_claim_ids
+        and str(claim.get("normalized_text") or "")
+        and any(
+            str(claim.get("normalized_text") or "") in input_text
+            for input_text in input_claim_texts
+        )
+    )
+    new_claim_ids = sorted(
+        output_claim_ids - input_claim_ids - set(narrowed_claim_ids)
+    )
     metadata_updates.update(
         {
             "repair_new_fact_count": len(new_claim_ids),
             "repair_new_claim_ids": new_claim_ids,
+            "repair_narrowed_claim_ids": narrowed_claim_ids,
             "repair_new_fact_observed": True,
         }
     )
@@ -541,33 +573,44 @@ def _finalize_controlled_repair(
             "CONTROLLED_REPAIR_NEW_FACT_DETECTED",
             metadata_updates=metadata_updates,
         )
-    if vbp_gate.get("passed") is not True:
-        gate_codes = [
+    gate_codes = (
+        [
             str(item)
             for item in list(vbp_gate.get("blocking_issue_codes") or [])
             if str(item)
         ]
-        return _mark_repair_failure(
-            result,
-            "CONTROLLED_REPAIR_VBP_GATE_FAILED",
-            metadata_updates={
-                **metadata_updates,
-                "quality_failure_codes": list(
-                    dict.fromkeys(
-                        [
-                            *[
-                                str(item)
-                                for item in list(result.metadata.get("quality_failure_codes") or [])
-                                if str(item)
-                            ],
-                            *gate_codes,
-                        ]
-                    )
-                ),
-            },
-        )
+        if vbp_gate.get("passed") is not True
+        else []
+    )
+    if vbp_gate.get("passed") is not True:
+        evidence_safety_codes = [
+            code for code in gate_codes if code not in _STRUCTURAL_QUALITY_CODES
+        ]
+        if not gate_codes or evidence_safety_codes:
+            return _mark_repair_failure(
+                result,
+                "CONTROLLED_REPAIR_VBP_GATE_FAILED",
+                metadata_updates={
+                    **metadata_updates,
+                    "quality_failure_codes": list(
+                        dict.fromkeys(
+                            [
+                                *[
+                                    str(item)
+                                    for item in list(
+                                        result.metadata.get("quality_failure_codes") or []
+                                    )
+                                    if str(item)
+                                ],
+                                *gate_codes,
+                            ]
+                        )
+                    ),
+                },
+            )
 
     metadata = dict(result.metadata)
+    metadata.pop(_INPUT_CLAIM_TEXTS_KEY, None)
     metadata.update(metadata_updates)
     metadata.update(
         {
@@ -580,7 +623,22 @@ def _finalize_controlled_repair(
             "repair_error_type": "",
             "repair_new_fact_count": len(new_claim_ids),
             "repair_new_claim_ids": new_claim_ids,
+            "repair_narrowed_claim_ids": narrowed_claim_ids,
             "repair_new_fact_observed": True,
+            "quality_failure_codes": list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(item)
+                            for item in list(
+                                result.metadata.get("quality_failure_codes") or []
+                            )
+                            if str(item)
+                        ],
+                        *gate_codes,
+                    ]
+                )
+            ),
         }
     )
     return replace(result, metadata=metadata)

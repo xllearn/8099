@@ -363,8 +363,8 @@ class ControlledRepairPipelineTests(unittest.TestCase):
         )
         blocked_gate = {
             "passed": False,
-            "primary_failure_code": "VBP_REQUIRED_SECTION_MISSING",
-            "blocking_issue_codes": ["VBP_REQUIRED_SECTION_MISSING"],
+            "primary_failure_code": "VBP_UNSUPPORTED_CLAIM",
+            "blocking_issue_codes": ["VBP_UNSUPPORTED_CLAIM"],
         }
         with patch.dict(os.environ, self.enabled_env(), clear=False), patch(
             "app.repair_pipeline.evaluate_vbp_quality",
@@ -380,6 +380,52 @@ class ControlledRepairPipelineTests(unittest.TestCase):
             repaired.metadata["repair_failure_code"],
         )
         self.assertEqual("", repaired.metadata["word_download_url"])
+
+    def test_structural_gate_after_safe_repair_allows_draft_only_state(self):
+        from app.repair_pipeline import RepairPipeline, UnsupportedFactRepairer
+
+        result = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_markdown=self.markdown("采购周期为2年。最高有效申报价999元。"),
+            quality_check={"passed": True, "issues": []},
+            metadata={"status": "finished"},
+        )
+        blocked_gate = {
+            "passed": False,
+            "primary_failure_code": "VBP_REQUIRED_SECTION_MISSING",
+            "blocking_issue_codes": ["VBP_REQUIRED_SECTION_MISSING"],
+        }
+        with patch.dict(os.environ, self.enabled_env(), clear=False), patch(
+            "app.repair_pipeline.evaluate_vbp_quality",
+            return_value=blocked_gate,
+        ):
+            repaired = RepairPipeline(repairers=[UnsupportedFactRepairer()]).run(
+                result, self.pack()
+            )
+
+        self.assertTrue(repaired.metadata["repair_success"])
+        self.assertEqual("", repaired.metadata["repair_failure_code"])
+        record = repaired.to_legacy_result()
+        record.update(
+            {
+                "status": "needs_manual_review",
+                "quality_check": {"passed": False, "issues": []},
+                "quality_gate": {
+                    "deliverable_status": "needs_manual_review",
+                    "blocking_issue_codes": ["VBP_REQUIRED_SECTION_MISSING"],
+                },
+            }
+        )
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertTrue(normalized["formal_body_present"])
+        self.assertTrue(normalized["draft_word_export_available"])
+        self.assertTrue(normalized["word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertFalse(normalized["deliverable"])
+        self.assertTrue(normalized["needs_manual_review"])
 
     def test_new_claim_after_repair_is_detected_instead_of_declared_zero(self):
         from app.evidence_index import build_claim_evidence_index
@@ -437,6 +483,57 @@ class ControlledRepairPipelineTests(unittest.TestCase):
             repaired.metadata["repair_failure_code"],
         )
         self.assertEqual("", repaired.metadata["word_download_url"])
+
+    def test_narrowed_claim_id_after_deletion_is_not_a_new_fact(self):
+        from app.evidence_index import build_claim_evidence_index
+        from app.repair_pipeline import RepairPipeline, UnsupportedFactRepairer
+
+        markdown = self.markdown("采购周期为2年。最高有效申报价999元。")
+        result = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_markdown=markdown,
+            quality_check={"passed": True, "issues": []},
+            metadata={"status": "finished"},
+        )
+        initial_index = build_claim_evidence_index(
+            FormalBodyDocument(markdown=markdown), self.pack()
+        )
+        supported = next(
+            copy.deepcopy(claim)
+            for claim in initial_index["claims"]
+            if claim["supported"] and len(claim["normalized_text"]) > 2
+        )
+        narrowed = {
+            **copy.deepcopy(supported),
+            "claim_id": "e" * 64,
+            "normalized_text": supported["normalized_text"][1:],
+        }
+        final_index = {
+            **copy.deepcopy(initial_index),
+            "claims": [narrowed],
+            "metrics": {
+                "claim_count": 1,
+                "supported_claim_count": 1,
+                "unsupported_claim_count": 0,
+                "ab_support_rate": 1.0,
+                "c_independent_support_count": 0,
+            },
+        }
+        with patch.dict(os.environ, self.enabled_env(), clear=False), patch(
+            "app.repair_pipeline.build_claim_evidence_index",
+            side_effect=[initial_index, final_index],
+        ), patch(
+            "app.repair_pipeline.evaluate_vbp_quality",
+            return_value={"passed": True, "blocking_issue_codes": []},
+        ):
+            repaired = RepairPipeline(repairers=[UnsupportedFactRepairer()]).run(
+                result, self.pack()
+            )
+
+        self.assertTrue(repaired.metadata["repair_success"])
+        self.assertEqual(0, repaired.metadata["repair_new_fact_count"])
+        self.assertEqual(["e" * 64], repaired.metadata["repair_narrowed_claim_ids"])
 
     def test_clean_forbidden_phrase_repairer_preserves_carriers_exactly(self):
         from app.repair_pipeline import ForbiddenPhraseRepairer
