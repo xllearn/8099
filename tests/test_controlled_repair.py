@@ -103,8 +103,12 @@ class ControlledRepairPipelineTests(unittest.TestCase):
 
     def test_s2_repair_flags_are_default_off(self):
         root = main_module.Path(__file__).resolve().parents[1]
-        env_example = (root / ".env.example").read_text(encoding="utf-8")
-        compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+        env_path = root / ".env.example"
+        compose_path = root / "docker-compose.yml"
+        if not env_path.exists() or not compose_path.exists():
+            self.skipTest("repository root config files are not packaged in this runtime image")
+        env_example = env_path.read_text(encoding="utf-8")
+        compose = compose_path.read_text(encoding="utf-8")
 
         for name in ("ENABLE_UNSUPPORTED_FACT_REPAIR", "ENABLE_STRICT_DELIVERY_GATE"):
             self.assertIn(f"{name}=false", env_example)
