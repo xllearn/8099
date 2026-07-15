@@ -17,6 +17,8 @@ from docx import Document
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
+from app.pdf_table_parser import extract_pdf_tables
+
 
 KEY_COLUMN_PATTERNS = [
     "企业名称",
@@ -523,6 +525,35 @@ def _parse_pdf(content: bytes) -> str:
     return "\n".join(texts)
 
 
+def _pdf_table_summaries(tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for table in tables:
+        matrix = list(table.get("matrix") or [])
+        row_count = len(matrix)
+        column_count = max((len(row) for row in matrix if isinstance(row, list)), default=0)
+        headers = [str(value or "") for value in (matrix[0] if matrix else [])]
+        summaries.append(
+            {
+                "sheet_name": f"PDF page {int(table.get('page_no') or 0)}",
+                "page_no": int(table.get("page_no") or 0),
+                "table_index": int(table.get("table_index") or 0),
+                "row_count": row_count,
+                "column_count": column_count,
+                "headers": headers,
+                "fingerprint": str(table.get("fingerprint") or ""),
+                "summary": f"Structured PDF table with {row_count} rows and {column_count} columns.",
+                "evidence_level": "C",
+            }
+        )
+    return summaries
+
+
+def _parse_structured_pdf(content: bytes) -> dict[str, Any]:
+    result = extract_pdf_tables(content)
+    result["table_summaries"] = _pdf_table_summaries(list(result.get("tables") or []))
+    return result
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
@@ -530,10 +561,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _ocr_pdf_text(content: bytes) -> tuple[str, list[str]]:
+def _ocr_pdf_text(content: bytes, *, candidate_confirmed: bool = False) -> tuple[str, list[str]]:
     warnings: list[str] = []
-    if not _env_bool("ENABLE_PDF_OCR", True):
-        return "", ["PDF OCR 未启用"]
+    if (
+        not candidate_confirmed
+        or not _env_bool("ENABLE_PDF_OCR", False)
+        or not _env_bool("ENABLE_IMAGE_TABLE_OCR", False)
+    ):
+        return "", ["PDF OCR candidate not confirmed or OCR disabled"]
     pdftoppm = shutil.which("pdftoppm")
     tesseract = shutil.which("tesseract")
     if not pdftoppm or not tesseract:
@@ -627,6 +662,50 @@ def _too_large_metadata_result(size: int) -> dict[str, Any]:
     }
 
 
+def _structured_pdf_attachment_result(content: bytes, *, too_large: bool) -> dict[str, Any]:
+    parsed = _parse_structured_pdf(content)
+    parser_status = str(parsed.get("status") or "").strip().lower()
+    text = str(parsed.get("text") or "")
+    clean_text = _clean_text(text)
+    table_summaries = list(parsed.get("table_summaries") or [])
+    cells = list(parsed.get("cells") or [])
+    diagnostics = list(parsed.get("diagnostics") or [])
+    warnings = [str(item.get("code") or "") for item in diagnostics if item.get("code")]
+    failed = parser_status == "failed" or (not clean_text and not cells)
+    partial = parser_status == "partial" and not failed
+    statuses: list[str] = ["too_large_summary_only"] if too_large else []
+    if clean_text:
+        statuses.append("parsed_text")
+    if cells:
+        statuses.extend(["parsed_pdf_table_cells", "parsed_table_summary"])
+    if not clean_text and not cells:
+        summary = "PDF attachment did not contain usable digital text or structured tables."
+        warnings = warnings or ["PDF_EMPTY_CONTENT"]
+    elif table_summaries and not clean_text:
+        summary = "; ".join(str(item.get("summary") or "") for item in table_summaries[:3])
+    else:
+        summary = _summary_from_text(text)
+    if summary and not failed and "parsed_summary" not in statuses:
+        statuses.append("parsed_summary")
+    if failed:
+        statuses.append("parse_failed")
+    elif partial:
+        statuses.append("partial_parse")
+    return {
+        "parse_statuses": statuses,
+        "text_length": len(_clean_text(text)),
+        "summary": summary,
+        "key_facts": _extract_key_facts(text),
+        "important_sections": _important_sections_from_text(text),
+        "table_summaries": table_summaries,
+        "warnings": warnings,
+        "pdf_table_cells": cells,
+        "pdf_table_pages": list(parsed.get("pages") or []),
+        "pdf_table_diagnostics": diagnostics,
+        "pdf_table_rule_version": str(parsed.get("rule_version") or ""),
+    }
+
+
 def parse_attachment_bytes(content: bytes, filename: str, fileext: str, filesize: int | str | None = None) -> dict[str, Any]:
     ext = (fileext or os.path.splitext(filename)[1] or "").lower()
     size = int(filesize or len(content) or 0)
@@ -635,6 +714,10 @@ def parse_attachment_bytes(content: bytes, filename: str, fileext: str, filesize
     parse_statuses: list[str] = []
     text = ""
     table_summaries: list[dict[str, Any]] = []
+    structured_pdf_enabled = ext == ".pdf" and _env_bool("ENABLE_STRUCTURED_PDF_TABLES", False)
+
+    if structured_pdf_enabled:
+        return _structured_pdf_attachment_result(content, too_large=size > max_parse_bytes)
 
     if size > max_parse_bytes:
         if ext != ".pdf":
@@ -655,7 +738,13 @@ def parse_attachment_bytes(content: bytes, filename: str, fileext: str, filesize
         try:
             if ext == ".pdf":
                 text = _parse_pdf(content)
-                parse_statuses.append("parsed_text")
+                if _clean_text(text):
+                    parse_statuses.append("parsed_text")
+                else:
+                    return _failure_result(
+                        "PDF attachment did not contain usable digital text.",
+                        "PDF_EMPTY_CONTENT",
+                    )
             elif ext == ".docx":
                 text, table_summaries = _parse_docx(content)
                 parse_statuses.append("parsed_text")

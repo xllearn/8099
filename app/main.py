@@ -42,6 +42,7 @@ from pypdf import PdfReader
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
+from app.pdf_table_parser import rule_version as pdf_table_rule_version
 from app.analysis_history import (
     AnalysisHistoryStore,
     HistoryTopologyError,
@@ -57,6 +58,7 @@ from app.dify_attribution import (
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
 from app.evidence_schema import (
     EvidenceValidationError,
+    create_evidence_item,
     read_evidence_pack,
     validate_evidence_pack,
 )
@@ -4370,6 +4372,36 @@ def _attachment_unavailable_for_report(status: str) -> bool:
     return status in {"metadata_only", "network_unreachable", "download_failed", "unsupported", "parse_failed"}
 
 
+def _pdf_table_cell_evidence_item(context: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
+    engine = str(cell.get("engine") or "pdfplumber").strip() or "pdfplumber"
+    if engine != "pdfplumber":
+        raise EvidenceValidationError("only digital PDF table cells are authorized in S1b")
+    source_ref = {
+        "menu_code": str(context.get("menu_code") or ""),
+        "articleid": str(context.get("articleid") or ""),
+        "attachment_id": str(context.get("attachment_id") or context.get("articleattid") or ""),
+        "filename": str(context.get("filename") or ""),
+        "page_no": cell.get("page_no"),
+        "sheet_name": None,
+        "table_index": cell.get("table_index"),
+        "row": cell.get("row"),
+        "column": cell.get("column"),
+        "cell_range": cell.get("cell_range"),
+        "quote": str(cell.get("quote") or cell.get("value") or "")[:500],
+        "source_hash": str(cell.get("source_hash") or ""),
+        "region": cell.get("region"),
+        "bbox": None,
+    }
+    return create_evidence_item(
+        level="A",
+        kind="table_cell",
+        value=cell.get("value"),
+        source_ref=source_ref,
+        extractor_version=f"{engine}:{pdf_table_rule_version()}",
+        mandatory=False,
+    )
+
+
 def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[str, Any] | None = None) -> dict[str, Any]:
     articleattid = str(row.get("articleattid") or "")
     filename = str(row.get("filename") or "")
@@ -4415,7 +4447,15 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         metadata["core_attachment_unavailable"] = bool(core_attachment)
         return metadata
 
-    cached, cache_status = load_cached_result(metadata, force_refresh=force_refresh)
+    structured_pdf_enabled = (
+        str(metadata.get("fileext") or "").lower() == ".pdf"
+        and _env_bool("ENABLE_STRUCTURED_PDF_TABLES", False)
+    )
+    cached, cache_status = (
+        (None, "content_hash_pending")
+        if structured_pdf_enabled
+        else load_cached_result(metadata, force_refresh=force_refresh)
+    )
     metadata["cache_status"] = cache_status
     if cached:
         metadata.update(cached)
@@ -4440,6 +4480,19 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
         store_cached_result(metadata, metadata)
         return metadata
+    if structured_pdf_enabled:
+        metadata["content_sha256"] = hashlib.sha256(download.content).hexdigest()
+        cached, cache_status = load_cached_result(metadata, force_refresh=force_refresh)
+        metadata["cache_status"] = cache_status
+        if cached:
+            metadata.update(cached)
+            metadata["core_attachment"] = core_attachment
+            metadata["business_type"] = business_type
+            metadata["stored_original_file"] = False
+            metadata["core_attachment_unavailable"] = bool(
+                core_attachment and _attachment_unavailable_for_report(str(metadata.get("parse_status") or ""))
+            )
+            return metadata
     if not _env_bool("ENABLE_ATTACHMENT_PARSE", True):
         metadata["parse_status"] = "stream_parsed"
         metadata["warnings"].append("附件解析未启用，未提取摘要")
@@ -4457,6 +4510,24 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
     metadata["important_sections"] = list(parsed.get("important_sections") or [])
     metadata["table_summaries"] = list(parsed.get("table_summaries") or [])
     metadata["warnings"].extend(parsed.get("warnings") or [])
+    if "pdf_table_cells" in parsed:
+        context = {
+            "menu_code": str(row.get("menu_code") or ""),
+            "articleid": str(row.get("articleid") or ""),
+            "attachment_id": articleattid,
+            "filename": filename,
+        }
+        metadata["evidence_items"] = []
+        for cell in list(parsed.get("pdf_table_cells") or []):
+            if not isinstance(cell, dict):
+                continue
+            try:
+                metadata["evidence_items"].append(_pdf_table_cell_evidence_item(context, cell))
+            except EvidenceValidationError:
+                metadata["warnings"].append("PDF_TABLE_EVIDENCE_INVALID")
+        metadata["pdf_table_pages"] = list(parsed.get("pdf_table_pages") or [])
+        metadata["pdf_table_diagnostics"] = list(parsed.get("pdf_table_diagnostics") or [])
+        metadata["pdf_table_rule_version"] = str(parsed.get("pdf_table_rule_version") or "")
     if metadata["parse_status"] not in {"unsupported", "parse_failed"}:
         metadata["download_status"] = "stream_parsed"
     metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
@@ -4761,6 +4832,16 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
     }
     pack.update(_build_stage4_pack_fields(primary_materials, auxiliary_materials, combined_key_facts, pack["report_focus"]))
     pack = read_evidence_pack(pack)
+    pdf_table_items = [
+        item
+        for material in [*primary_materials, *auxiliary_materials]
+        for attachment in list(material.get("attachments") or [])
+        for item in list(attachment.get("evidence_items") or [])
+        if isinstance(item, dict)
+    ]
+    if pdf_table_items:
+        pack["evidence_items"] = [*list(pack.get("evidence_items") or []), *copy.deepcopy(pdf_table_items)]
+        pack = validate_evidence_pack(pack)
     pack.pop("source_evidence_schema_version", None)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
     _write_database_evidence_pack(pack)

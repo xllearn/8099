@@ -1,0 +1,19 @@
+{
+  "non_empty_cells": [
+    "Product",
+    "Code",
+    "Rate",
+    "Stent A",
+    "00123",
+    "15%",
+    "Stent B",
+    "-2.50",
+    "20 mg"
+  ],
+  "numeric_cells": [
+    "00123",
+    "15%",
+    "-2.50",
+    "20 mg"
+  ]
+}
