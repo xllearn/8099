@@ -522,6 +522,10 @@ def _metric_summary(samples: Sequence[Mapping[str, Any]], failures: Sequence[Any
     providers = Counter(str(sample.get("provider") or "") for sample in samples)
     statuses = Counter(str(sample.get("status") or "") for sample in samples)
     phrase_hits = sum(len(_flatten_phrase_hits(sample)) for sample in samples)
+    claim_count = sum(_int(sample.get("claim_count")) for sample in samples)
+    supported_claim_count = sum(
+        _int(sample.get("supported_claim_count")) for sample in samples
+    )
     return {
         "sample_count": len(samples) + len(failures),
         "completed_sample_count": len(samples),
@@ -534,6 +538,30 @@ def _metric_summary(samples: Sequence[Mapping[str, Any]], failures: Sequence[Any
         ),
         "unsupported_fact_count": sum(
             _int(sample.get("unsupported_fact_count")) for sample in samples
+        ),
+        "claim_count": claim_count,
+        "supported_claim_count": supported_claim_count,
+        "claim_ab_support_rate": (
+            supported_claim_count / claim_count if claim_count else 1.0
+        ),
+        "c_independent_support_count": sum(
+            _int(sample.get("c_independent_support_count")) for sample in samples
+        ),
+        "max_repair_count": max(
+            (_int(sample.get("repair_count")) for sample in samples),
+            default=0,
+        ),
+        "repair_failure_count": sum(
+            _bool(sample.get("repair_attempted"))
+            and not _bool(sample.get("repair_success"))
+            for sample in samples
+        ),
+        "new_fact_count": sum(_int(sample.get("new_fact_count")) for sample in samples),
+        "s2_quality_observed_count": sum(
+            _bool(sample.get("s2_quality_observed")) for sample in samples
+        ),
+        "new_fact_observed_count": sum(
+            _bool(sample.get("new_fact_observed")) for sample in samples
         ),
         "forbidden_phrase_hit_count": phrase_hits,
         "state_contradiction_count": sum(
@@ -593,6 +621,16 @@ def evaluate_artifact(artifact: Mapping[str, Any]) -> dict[str, Any]:
     )
     if len(normalized_samples) != len(samples):
         raise ValueError("artifact contains an invalid sample")
+    stage = str(artifact.get("stage") or "").strip()
+    if stage.upper().startswith("S2") or stage.upper() == "M3":
+        if any(sample.get("s2_quality_observed") is not True for sample in normalized_samples):
+            raise ValueError("S2 quality observation is required for every sample")
+        if any(
+            _bool(sample.get("repair_attempted"))
+            and sample.get("new_fact_observed") is not True
+            for sample in normalized_samples
+        ):
+            raise ValueError("S2 new fact observation is required for every repaired sample")
     excluded = _normalize_excluded_cases(artifact.get("excluded_cases"))
     declared_cases = _normalize_case_identities(
         artifact.get("declared_cases"), "declared_cases"
@@ -611,7 +649,7 @@ def evaluate_artifact(artifact: Mapping[str, Any]) -> dict[str, Any]:
         "manifest_version": str(artifact.get("manifest_version") or ""),
         "manifest_sha256": computed_manifest_sha256,
         "manifest_contract": frozen_manifest_contract,
-        "stage": str(artifact.get("stage") or ""),
+        "stage": stage,
         "environment": str(artifact.get("environment") or ""),
         "subset": str(artifact.get("subset") or ""),
         "repeat": _int(artifact.get("repeat")),
@@ -642,6 +680,20 @@ def evaluate_artifact(artifact: Mapping[str, Any]) -> dict[str, Any]:
                 "quality_status": str(sample.get("quality_status") or ""),
                 "quality_passed": sample.get("quality_passed"),
                 "unsupported_fact_count": _int(sample.get("unsupported_fact_count")),
+                "s2_quality_observed": _bool(sample.get("s2_quality_observed")),
+                "claim_count": _int(sample.get("claim_count")),
+                "supported_claim_count": _int(sample.get("supported_claim_count")),
+                "claim_ab_support_rate": _float(sample.get("claim_ab_support_rate")),
+                "c_independent_support_count": _int(
+                    sample.get("c_independent_support_count")
+                ),
+                "repair_attempted": _bool(sample.get("repair_attempted")),
+                "repair_success": _bool(sample.get("repair_success")),
+                "repair_count": _int(sample.get("repair_count")),
+                "repair_count_observed": _int(sample.get("repair_count_observed")),
+                "repair_count_violation": _bool(sample.get("repair_count_violation")),
+                "new_fact_count": _int(sample.get("new_fact_count")),
+                "new_fact_observed": _bool(sample.get("new_fact_observed")),
                 "deliverable": _bool(sample.get("deliverable")),
                 "needs_manual_review": _bool(sample.get("needs_manual_review")),
                 "primary_failure_code": str(sample.get("primary_failure_code") or ""),

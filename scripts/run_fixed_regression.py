@@ -437,6 +437,98 @@ def _quality_metrics(state: Mapping[str, Any]) -> tuple[str, bool | None, int]:
     )
 
 
+def _s2_quality_metrics(state: Mapping[str, Any]) -> dict[str, Any]:
+    claim_index = state.get("claim_evidence_index")
+    if not isinstance(claim_index, Mapping):
+        return {
+            "s2_quality_observed": False,
+            "claim_count": 0,
+            "supported_claim_count": 0,
+            "claim_ab_support_rate": 1.0,
+            "c_independent_support_count": 0,
+            "repair_attempted": bool(state.get("repair_attempted")),
+            "repair_success": bool(state.get("repair_success")),
+            "repair_count": int(state.get("repair_count") or 0),
+            "new_fact_count": int(state.get("repair_new_fact_count") or 0),
+            "observed": False,
+        }
+    index_metrics = claim_index.get("metrics")
+    if not isinstance(index_metrics, Mapping):
+        raise ValueError("S2 claim index metrics are missing")
+    claim_count = int(index_metrics.get("claim_count") or 0)
+    supported_claim_count = int(index_metrics.get("supported_claim_count") or 0)
+    unsupported_claim_count = int(index_metrics.get("unsupported_claim_count") or 0)
+    if min(claim_count, supported_claim_count, unsupported_claim_count) < 0:
+        raise ValueError("S2 claim metrics cannot be negative")
+    if supported_claim_count + unsupported_claim_count != claim_count:
+        raise ValueError("S2 claim metrics are inconsistent")
+
+    gate = state.get("vbp_quality_gate")
+    if not isinstance(gate, Mapping):
+        gate = {}
+    gate_claim_count = gate.get("claim_count")
+    gate_supported_count = gate.get("supported_claim_count")
+    if gate_claim_count is not None and int(gate_claim_count or 0) != claim_count:
+        raise ValueError("S2 gate claim_count does not match claim index")
+    if gate_supported_count is not None and int(gate_supported_count or 0) != supported_claim_count:
+        raise ValueError("S2 gate supported_claim_count does not match claim index")
+
+    c_support_count = max(
+        int(index_metrics.get("c_independent_support_count") or 0),
+        int(gate.get("c_independent_support_count") or 0),
+    )
+    repair_count = int(state.get("repair_count") or 0)
+    repair_count_observed = int(state.get("repair_count_observed") or repair_count)
+    repair_count_violation = bool(state.get("repair_count_violation")) or repair_count_observed > 1
+    new_fact_count = int(state.get("repair_new_fact_count") or 0)
+    new_fact_observed = state.get("repair_new_fact_observed") is True
+    repair_attempted = bool(state.get("repair_attempted"))
+    repair_success = bool(state.get("repair_success"))
+    if repair_count < 0 or repair_count > 1 or repair_count_observed < 0 or repair_count_violation:
+        raise ValueError("S2 repair_count must be between 0 and 1")
+    if repair_attempted and repair_count != 1:
+        raise ValueError("S2 attempted repair requires repair_count=1")
+    if repair_attempted and not repair_success:
+        raise ValueError("S2 controlled repair did not complete successfully")
+    if repair_attempted and (
+        "repair_new_fact_count" not in state
+        or state.get("repair_new_fact_count") is None
+        or not new_fact_observed
+    ):
+        raise ValueError("S2 new fact observation is required after repair")
+    if unsupported_claim_count:
+        raise ValueError("S2 formal claims are not fully supported by A/B evidence")
+    if c_support_count:
+        raise ValueError("S2 C-level evidence cannot independently support formal claims")
+    if new_fact_count:
+        raise ValueError("S2 controlled repair introduced new facts")
+
+    support_rate = (supported_claim_count / claim_count) if claim_count else 1.0
+    return {
+        "s2_quality_observed": True,
+        "claim_count": claim_count,
+        "supported_claim_count": supported_claim_count,
+        "claim_ab_support_rate": support_rate,
+        "c_independent_support_count": c_support_count,
+        "repair_attempted": repair_attempted,
+        "repair_success": repair_success,
+        "repair_count": repair_count,
+        "repair_count_observed": repair_count_observed,
+        "repair_count_violation": repair_count_violation,
+        "new_fact_count": new_fact_count,
+        "new_fact_observed": new_fact_observed,
+        "observed": True,
+    }
+
+
+def require_s2_quality_observation(stage: str, sample: Mapping[str, Any]) -> None:
+    normalized_stage = str(stage or "").strip().upper()
+    if not (normalized_stage.startswith("S2") or normalized_stage == "M3"):
+        return
+    if sample.get("s2_quality_observed") is not True:
+        raise ValueError("S2 quality observation is required")
+
+
 def _history_for_run(
     client: httpx.Client,
     run_id: str,
@@ -693,6 +785,7 @@ def run_case(
             f"run/history state mismatch: {history_consistency['mismatches']}"
         )
     quality_status, quality_passed, unsupported_fact_count = _quality_metrics(state)
+    s2_quality_metrics = _s2_quality_metrics(state)
     evidence_pack = (
         prepare.get("evidence_pack")
         if isinstance(prepare.get("evidence_pack"), dict)
@@ -771,6 +864,7 @@ def run_case(
         "quality_status": quality_status,
         "quality_passed": quality_passed,
         "unsupported_fact_count": unsupported_fact_count,
+        **{key: value for key, value in s2_quality_metrics.items() if key != "observed"},
         "primary_failure_code": state.get("primary_failure_code") or "",
         "secondary_failure_codes": state.get("secondary_failure_codes") or [],
         "quality_failure_codes": state.get("quality_failure_codes") or [],
@@ -914,6 +1008,7 @@ def main() -> int:
                         args.poll_seconds,
                         attempt,
                     )
+                    require_s2_quality_observation(args.stage, result)
                     results.append(result)
                 except Exception as exc:  # noqa: BLE001
                     failures.append(

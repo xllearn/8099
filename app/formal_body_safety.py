@@ -31,6 +31,8 @@ FORBIDDEN_PHRASES = (
     "待核实",
 )
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])")
+
 
 class FormalBodySafetyError(RuntimeError):
     pass
@@ -80,6 +82,9 @@ def scan_formal_body(document: FormalBodyDocument) -> FormalBodySafetyResult:
 
 
 def sanitize_formal_body(document: FormalBodyDocument) -> FormalBodySafetyResult:
+    original = scan_formal_body(document)
+    if not original.hits:
+        return original
     removed: list[str] = []
     markdown = _sanitize_markdown(document.markdown, removed)
     report_ir = _sanitize_report_ir(document.report_ir, removed)
@@ -164,13 +169,13 @@ def publish_docx_atomically(destination: Path, render: Callable[[Path], None]) -
 
 
 def _sanitize_markdown(markdown: str, removed: list[str]) -> str:
+    original = str(markdown or "")
+    removed_before = len(removed)
     output: list[str] = []
-    for line_index, line in enumerate(str(markdown or "").splitlines()):
-        hits = find_forbidden_phrases(line, f"markdown.line[{line_index}]")
-        if hits:
-            removed.extend(hit.phrase for hit in hits)
-            continue
-        output.append(line)
+    for line_index, line in enumerate(original.splitlines()):
+        output.append(_sanitize_text_segments(line, f"markdown.line[{line_index}]", removed))
+    if len(removed) == removed_before:
+        return original
     return re.sub(r"\n{3,}", "\n\n", "\n".join(output)).strip()
 
 
@@ -224,11 +229,20 @@ def _sanitize_report_ir(report_ir: dict[str, Any] | None, removed: list[str]) ->
 
 def _sanitize_scalar(value: Any, location: str, removed: list[str]) -> str:
     text = str(value or "")
-    hits = find_forbidden_phrases(text, location)
-    if hits:
-        removed.extend(hit.phrase for hit in hits)
-        return ""
-    return text
+    return _sanitize_text_segments(text, location, removed)
+
+
+def _sanitize_text_segments(value: str, location: str, removed: list[str]) -> str:
+    output: list[str] = []
+    changed = False
+    for segment_index, segment in enumerate(_SENTENCE_SPLIT_RE.split(value)):
+        hits = find_forbidden_phrases(segment, f"{location}.sentence[{segment_index}]")
+        if hits:
+            changed = True
+            removed.extend(hit.phrase for hit in hits)
+            continue
+        output.append(segment)
+    return "".join(output).strip() if changed else value
 
 
 def _sanitize_string_list(values: list[Any], prefix: str, removed: list[str]) -> list[str]:

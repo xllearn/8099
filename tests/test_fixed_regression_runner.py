@@ -217,6 +217,111 @@ class FixedRegressionRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner._docx_names(Path("missing-report-directory"))
 
+    def test_s2_quality_metrics_capture_support_repair_and_new_facts(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        metrics = runner._s2_quality_metrics(
+            {
+                "claim_evidence_index": {
+                    "metrics": {
+                        "claim_count": 4,
+                        "supported_claim_count": 4,
+                        "unsupported_claim_count": 0,
+                        "ab_support_rate": 1.0,
+                        "c_independent_support_count": 0,
+                    }
+                },
+                "vbp_quality_gate": {
+                    "applicable": True,
+                    "claim_count": 4,
+                    "supported_claim_count": 4,
+                    "claim_ab_support_rate": 1.0,
+                    "c_independent_support_count": 0,
+                },
+                "repair_attempted": True,
+                "repair_success": True,
+                "repair_count": 1,
+                "repair_new_fact_count": 0,
+                "repair_new_fact_observed": True,
+            }
+        )
+
+        self.assertTrue(metrics["observed"])
+        self.assertEqual(4, metrics["claim_count"])
+        self.assertEqual(4, metrics["supported_claim_count"])
+        self.assertEqual(1.0, metrics["claim_ab_support_rate"])
+        self.assertEqual(0, metrics["c_independent_support_count"])
+        self.assertEqual(1, metrics["repair_count"])
+        self.assertEqual(0, metrics["new_fact_count"])
+
+    def test_s2_quality_metrics_reject_repair_count_above_one(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        with self.assertRaisesRegex(ValueError, "repair_count"):
+            runner._s2_quality_metrics(
+                {
+                    "claim_evidence_index": {
+                        "metrics": {
+                            "claim_count": 1,
+                            "supported_claim_count": 1,
+                            "unsupported_claim_count": 0,
+                        }
+                    },
+                    "repair_count": 2,
+                }
+            )
+
+    def test_s2_quality_metrics_reject_hidden_observed_repair_overflow(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        with self.assertRaisesRegex(ValueError, "repair_count"):
+            runner._s2_quality_metrics(
+                {
+                    "claim_evidence_index": {
+                        "metrics": {
+                            "claim_count": 1,
+                            "supported_claim_count": 1,
+                            "unsupported_claim_count": 0,
+                        }
+                    },
+                    "repair_attempted": True,
+                    "repair_success": True,
+                    "repair_count": 1,
+                    "repair_count_observed": 2,
+                    "repair_count_violation": True,
+                }
+            )
+
+    def test_s2_stage_rejects_sample_without_quality_observation(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        with self.assertRaisesRegex(ValueError, "S2 quality observation"):
+            runner.require_s2_quality_observation(
+                "S2",
+                {"s2_quality_observed": False},
+            )
+
+    def test_s2_quality_metrics_require_new_fact_observation_after_repair(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        with self.assertRaisesRegex(ValueError, "new fact observation"):
+            runner._s2_quality_metrics(
+                {
+                    "claim_evidence_index": {
+                        "metrics": {
+                            "claim_count": 1,
+                            "supported_claim_count": 1,
+                            "unsupported_claim_count": 0,
+                        }
+                    },
+                    "repair_attempted": True,
+                    "repair_success": True,
+                    "repair_count": 1,
+                    "repair_new_fact_count": 0,
+                    "repair_new_fact_observed": False,
+                }
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

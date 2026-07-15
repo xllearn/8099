@@ -47,6 +47,7 @@ LAYER_FAILURE_CODES = {
         "UNCLASSIFIED",
     },
     "quality_gate": {
+        "CONTROLLED_REPAIR_FAILED",
         "VBP_RULE_CONFLICT",
         "VBP_EVIDENCE_INDEX_INVALID",
         "VBP_C_LEVEL_FACT_USED",
@@ -97,6 +98,7 @@ LAYER_CODE_PRIORITY = {
         "UNCLASSIFIED",
     ),
     "quality_gate": (
+        "CONTROLLED_REPAIR_FAILED",
         "VBP_RULE_CONFLICT",
         "VBP_EVIDENCE_INDEX_INVALID",
         "VBP_C_LEVEL_FACT_USED",

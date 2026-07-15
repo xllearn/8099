@@ -260,6 +260,58 @@ class OfflineQualityEvaluatorTests(unittest.TestCase):
         self.assertRegex(first["evaluator_rules_sha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(first["evaluator_version"])
 
+    def test_evaluator_aggregates_s2_claim_and_repair_metrics(self) -> None:
+        module = self.evaluator_module()
+        sample = self.clean_result()
+        sample.update(
+            {
+                "claim_count": 5,
+                "supported_claim_count": 5,
+                "claim_ab_support_rate": 1.0,
+                "c_independent_support_count": 0,
+                "repair_count": 1,
+                "repair_success": True,
+                "new_fact_count": 0,
+            }
+        )
+
+        evaluation = module.evaluate_artifact(self.artifact([sample]))
+
+        self.assertEqual(5, evaluation["metrics"]["claim_count"])
+        self.assertEqual(5, evaluation["metrics"]["supported_claim_count"])
+        self.assertEqual(1.0, evaluation["metrics"]["claim_ab_support_rate"])
+        self.assertEqual(0, evaluation["metrics"]["c_independent_support_count"])
+        self.assertEqual(1, evaluation["metrics"]["max_repair_count"])
+        self.assertEqual(0, evaluation["metrics"]["new_fact_count"])
+
+    def test_s2_artifact_rejects_missing_quality_observation(self) -> None:
+        module = self.evaluator_module()
+        sample = self.clean_result()
+        artifact = self.artifact([sample])
+        artifact["stage"] = "S2"
+
+        with self.assertRaisesRegex(ValueError, "S2 quality observation"):
+            module.evaluate_artifact(artifact)
+
+    def test_s2_artifact_requires_new_fact_observation_for_repaired_sample(self) -> None:
+        module = self.evaluator_module()
+        sample = self.clean_result()
+        sample.update(
+            {
+                "s2_quality_observed": True,
+                "repair_attempted": True,
+                "repair_success": True,
+                "repair_count": 1,
+                "new_fact_count": 0,
+                "new_fact_observed": False,
+            }
+        )
+        artifact = self.artifact([sample])
+        artifact["stage"] = "S2"
+
+        with self.assertRaisesRegex(ValueError, "new fact observation"):
+            module.evaluate_artifact(artifact)
+
     def test_evaluator_rejects_legacy_full_manifest_snapshot(self) -> None:
         module = self.evaluator_module()
         artifact = self.artifact([self.clean_result()])

@@ -86,7 +86,15 @@ from app.layered_diagnostics import (
     make_layer_result,
 )
 from app.quality_gate import QualityGate
-from app.repair_pipeline import ForbiddenPhraseRepairer, RepairPipeline, StructureRepairer
+from app.repair_pipeline import (
+    fail_closed_controlled_repair,
+    ForbiddenPhraseRepairer,
+    RepairPipeline,
+    StructureRepairer,
+    parse_repair_count,
+    strict_delivery_gate_enabled,
+    UnsupportedFactRepairer,
+)
 from app.vbp_facts import enrich_vbp_facts, vbp_fact_extraction_enabled
 from app.report_memory import (
     MemoryContentError,
@@ -472,6 +480,7 @@ class AnalysisRunResponse(BaseModel):
     fallback_provider: str = ""
     repair_attempted: bool = False
     repair_success: bool = False
+    repair_count: int = 0
     repair_actions: list[Any] = Field(default_factory=list)
     manual_review_reason_summary: str = ""
     final_blocking_reason: str = ""
@@ -2912,6 +2921,7 @@ RUN_STATE_MACHINE_STATUSES = {
 RUN_TERMINAL_STATUSES = {"finished", "needs_manual_review", "failed", "interrupted"}
 
 RUN_P0_FAILURE_CODES = {
+    "CONTROLLED_REPAIR_FAILED",
     "VBP_RULE_CONFLICT",
     "VBP_EVIDENCE_INDEX_INVALID",
     "VBP_C_LEVEL_FACT_USED",
@@ -2949,6 +2959,7 @@ RUN_FAILURE_PRIORITY = [
     "OUTPUT_EMPTY",
     "OUTPUT_TRUNCATED",
     "OUTPUT_SCHEMA_INVALID",
+    "CONTROLLED_REPAIR_FAILED",
     "VBP_RULE_CONFLICT",
     "VBP_EVIDENCE_INDEX_INVALID",
     "VBP_C_LEVEL_FACT_USED",
@@ -2979,6 +2990,7 @@ RUN_DEFAULT_TIMINGS = {
 }
 
 RUN_QUALITY_BLOCKING_CODE_MAP = {
+    "CONTROLLED_REPAIR_FAILED": "CONTROLLED_REPAIR_FAILED",
     "VBP_RULE_CONFLICT": "VBP_RULE_CONFLICT",
     "VBP_EVIDENCE_INDEX_INVALID": "VBP_EVIDENCE_INDEX_INVALID",
     "VBP_C_LEVEL_FACT_USED": "VBP_C_LEVEL_FACT_USED",
@@ -3007,6 +3019,7 @@ RUN_ISSUE_ID_CODE_MAP = {
     "Q_FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
     "Q_FORBIDDEN_PHRASE_FORMAL_BODY": "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
     "Q_FORMAL_BODY_EMPTY": "FORMAL_BODY_EMPTY",
+    "Q_CONTROLLED_REPAIR_FAILED": "CONTROLLED_REPAIR_FAILED",
     "Q_AUTO_REPAIR_FAILED": "AUTO_REPAIR_FAILED",
     "Q_AUTO_REPAIR_PARTIAL": "AUTO_REPAIR_PARTIAL",
 }
@@ -3032,6 +3045,7 @@ RUN_DIFY_ERROR_CODE_MAP = {
 }
 
 RUN_FAILURE_REASON_LABELS = {
+    "CONTROLLED_REPAIR_FAILED": "受控正文修复未通过发布校验。",
     "VBP_RULE_CONFLICT": "VBP 事实规则存在冲突，专项门禁未通过。",
     "VBP_EVIDENCE_INDEX_INVALID": "claim 与证据索引无效，专项门禁未通过。",
     "VBP_C_LEVEL_FACT_USED": "正式 claim 使用了不可独立支持事实的辅助信息。",
@@ -3210,6 +3224,7 @@ def _collect_failure_stages(
 
     if "quality_gate" not in blocked_layers and quality_failure_codes:
         allowed = {
+            "CONTROLLED_REPAIR_FAILED",
             "VBP_RULE_CONFLICT",
             "VBP_EVIDENCE_INDEX_INVALID",
             "VBP_C_LEVEL_FACT_USED",
@@ -3229,6 +3244,7 @@ def _collect_failure_stages(
             "EXPORT_GATE_BLOCKED",
         }
         quality_priority = (
+            "CONTROLLED_REPAIR_FAILED",
             "VBP_RULE_CONFLICT",
             "VBP_EVIDENCE_INDEX_INVALID",
             "VBP_C_LEVEL_FACT_USED",
@@ -3291,6 +3307,30 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     remaining_issues = normalized.get("remaining_issues") if isinstance(normalized.get("remaining_issues"), list) else []
     quality_issues = quality_check.get("issues") if isinstance(quality_check.get("issues"), list) else []
 
+    repair_count_raw, repair_count_raw_invalid = parse_repair_count(
+        normalized.get("repair_count")
+    )
+    observed_value = (
+        normalized.get("repair_count_observed")
+        if "repair_count_observed" in normalized
+        else repair_count_raw
+    )
+    repair_count_observed, repair_count_observed_invalid = parse_repair_count(observed_value)
+    repair_count_observed = max(repair_count_raw, repair_count_observed)
+    repair_attempted = bool(normalized.get("repair_attempted")) or repair_count_observed > 0
+    repair_count_violation = bool(
+        normalized.get("repair_count_violation")
+        or repair_count_raw_invalid
+        or repair_count_observed_invalid
+        or repair_count_observed > 1
+    )
+    repair_attempted = repair_attempted or repair_count_violation
+    if repair_attempted and repair_count_observed == 0:
+        repair_count_observed = 1
+    repair_success = bool(normalized.get("repair_success")) and not repair_count_violation
+    repair_count = 1 if repair_attempted else 0
+    repair_failed = bool(repair_attempted and not repair_success)
+
     quality_failure_codes = _dedupe_strings(
         [
             *list(normalized.get("quality_failure_codes") or []),
@@ -3303,6 +3343,8 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
         quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
     if quality_gate.get("deliverable_status") == "needs_manual_review" and not quality_failure_codes:
         quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
+    if repair_failed and "CONTROLLED_REPAIR_FAILED" not in quality_failure_codes:
+        quality_failure_codes.append("CONTROLLED_REPAIR_FAILED")
 
     generation_failure_codes = _dedupe_strings(
         [
@@ -3344,15 +3386,18 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     )
     deliverable = bool(
         body_safety.safe
+        and not repair_failed
         and _is_explicitly_deliverable(normalized, raw_status, body_safety.has_body)
     )
     needs_manual_review = bool(
         raw_status == "needs_manual_review"
         or quality_gate.get("deliverable_status") == "needs_manual_review"
+        or repair_failed
         or (raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not deliverable)
     )
     word_export_available = bool(
         body_safety.safe
+        and not repair_failed
         and raw_status in {"finished", "needs_manual_review"}
         and _word_export_enabled()
     )
@@ -3429,8 +3474,11 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
                 or ("OUTPUT_TRUNCATED" if "OUTPUT_TRUNCATED" in all_codes else "")
             ),
             "fallback_provider": str(normalized.get("fallback_provider") or ("backend_pack_fallback" if fallback_used else "")).strip(),
-            "repair_attempted": bool(normalized.get("repair_attempted")),
-            "repair_success": bool(normalized.get("repair_success")),
+            "repair_attempted": repair_attempted,
+            "repair_success": repair_success,
+            "repair_count": repair_count,
+            "repair_count_observed": repair_count_observed,
+            "repair_count_violation": repair_count_violation,
             "repair_actions": list(normalized.get("repair_actions") or []),
             "manual_review_reason_summary": reason_summary,
             "final_blocking_reason": final_blocking_reason,
@@ -4053,6 +4101,7 @@ def _quality_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> di
         or quality_check.get("passed") is False
     )
     priority = (
+        "CONTROLLED_REPAIR_FAILED",
         "VBP_RULE_CONFLICT",
         "VBP_EVIDENCE_INDEX_INVALID",
         "VBP_C_LEVEL_FACT_USED",
@@ -4118,6 +4167,7 @@ def _postprocess_generation_with_stages(
     repaired_result = RepairPipeline(
         repairers=[
             StructureRepairer(_repair_unusable_dify_result),
+            UnsupportedFactRepairer(),
             ForbiddenPhraseRepairer(),
         ]
     ).run(
@@ -5666,12 +5716,29 @@ def _execute_analysis_run_background(
             input_stages, compact = _input_pipeline_stages(pack)
             result = _postprocess_generation_with_stages(result, pack, input_stages, compact)
         except Exception as repair_exc:  # noqa: BLE001
-            logger.warning(
-                "analysis_run_repair_skipped run_id=%s pack_id=%s error_type=%s",
-                run_id,
-                pack_id,
-                repair_exc.__class__.__name__,
-            )
+            if strict_delivery_gate_enabled():
+                failed = fail_closed_controlled_repair(
+                    ReportGenerationResult.from_legacy_result(
+                        result,
+                        provider=str(result.get("provider") or "dify"),
+                    ),
+                    "CONTROLLED_REPAIR_POSTPROCESS_FAILED",
+                    error_type=repair_exc.__class__.__name__,
+                )
+                result = failed.to_legacy_result()
+                logger.error(
+                    "analysis_run_postprocess_failed_closed run_id=%s pack_id=%s error_type=%s",
+                    run_id,
+                    pack_id,
+                    repair_exc.__class__.__name__,
+                )
+            else:
+                logger.warning(
+                    "analysis_run_repair_skipped run_id=%s pack_id=%s error_type=%s",
+                    run_id,
+                    pack_id,
+                    repair_exc.__class__.__name__,
+                )
     except DifyWorkflowError as exc:
         warnings = list(record.get("warnings") or [])
         error_message = exc.message
@@ -5845,6 +5912,7 @@ def run_analysis(req: AnalysisRunRequest):
         fallback_provider=str(record.get("fallback_provider") or ""),
         repair_attempted=bool(record.get("repair_attempted")),
         repair_success=bool(record.get("repair_success")),
+        repair_count=min(1, max(0, _safe_int_value(record.get("repair_count"), 0))),
         repair_actions=list(record.get("repair_actions") or []),
         manual_review_reason_summary=str(record.get("manual_review_reason_summary") or ""),
         final_blocking_reason=str(record.get("final_blocking_reason") or ""),
