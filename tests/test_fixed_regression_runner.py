@@ -10,6 +10,38 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "8099_regression_cases.json"
 
 
 class FixedRegressionRunnerTests(unittest.TestCase):
+    def test_safe_request_retries_stale_keepalive_disconnect(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        class RequestClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def request(self, method: str, path: str, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise httpx.RemoteProtocolError(
+                        "Server disconnected without sending a response."
+                    )
+                return httpx.Response(
+                    200,
+                    json={"success": True},
+                    request=httpx.Request(method, f"http://test{path}"),
+                )
+
+        client = RequestClient()
+
+        response = runner._request_with_transport_retry(
+            client,
+            "POST",
+            "/analysis/prepare",
+            json={"primary_materials": []},
+            timeout=300,
+        )
+
+        self.assertEqual(2, client.calls)
+        self.assertEqual(200, response.status_code)
+
     def test_analysis_status_read_timeout_is_retryable(self) -> None:
         from scripts import run_fixed_regression as runner
 

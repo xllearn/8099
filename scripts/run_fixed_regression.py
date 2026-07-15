@@ -49,6 +49,7 @@ from app.regression_manifest import (  # noqa: E402
 DEFAULT_MANIFEST = ROOT / "tests" / "fixtures" / "8099_regression_cases.json"
 TERMINAL_STATUSES = {"finished", "failed", "needs_manual_review"}
 ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
+SAFE_REQUEST_ATTEMPTS = 3
 WORD_FLAGS = (
     "word_export_available",
     "draft_word_export_available",
@@ -358,6 +359,22 @@ def _require_success(response: httpx.Response, operation: str) -> dict[str, Any]
     return body
 
 
+def _request_with_transport_retry(
+    client: httpx.Client,
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> httpx.Response:
+    for attempt in range(SAFE_REQUEST_ATTEMPTS):
+        try:
+            return client.request(method, path, **kwargs)
+        except httpx.TransportError:
+            if attempt + 1 >= SAFE_REQUEST_ATTEMPTS:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+    raise RuntimeError("safe request retry loop exhausted")
+
+
 def _read_analysis_state(
     client: httpx.Client, run_id: str
 ) -> dict[str, Any] | None:
@@ -404,7 +421,12 @@ def _capture_and_verify_materials(
         menu_code = str(expected["menu_code"])
         articleid = str(expected["articleid"])
         detail = _require_success(
-            client.get(f"/records/{menu_code}/{articleid}", timeout=120),
+            _request_with_transport_retry(
+                client,
+                "GET",
+                f"/records/{menu_code}/{articleid}",
+                timeout=120,
+            ),
             "record detail",
         )
         verifications = _attachment_content_verifications(detail)
@@ -619,7 +641,9 @@ def run_case(
     replay_request = dict(case["replay"]["request"])
     prepare_started = time.monotonic()
     prepare = _require_success(
-        client.post(
+        _request_with_transport_retry(
+            client,
+            "POST",
             "/analysis/prepare",
             json=replay_request,
             timeout=300,
