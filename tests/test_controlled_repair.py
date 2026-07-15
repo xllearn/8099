@@ -106,7 +106,12 @@ class ControlledRepairPipelineTests(unittest.TestCase):
         env_path = root / ".env.example"
         compose_path = root / "docker-compose.yml"
         if not env_path.exists() or not compose_path.exists():
-            self.skipTest("repository root config files are not packaged in this runtime image")
+            from app.repair_pipeline import controlled_repair_enabled, strict_delivery_gate_enabled
+
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertFalse(controlled_repair_enabled())
+                self.assertFalse(strict_delivery_gate_enabled())
+            return
         env_example = env_path.read_text(encoding="utf-8")
         compose = compose_path.read_text(encoding="utf-8")
 
