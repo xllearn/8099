@@ -48,7 +48,18 @@ from app.analysis_history import (
     enrich_record_with_pack_identity,
 )
 from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
+from app.dify_attribution import (
+    ProviderResponseError,
+    canonical_provider_failure_code,
+    extract_provider_output,
+    provider_stage_from_exception,
+)
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
+from app.evidence_schema import (
+    EvidenceValidationError,
+    read_evidence_pack,
+    validate_evidence_pack,
+)
 from app.formal_body import FormalBodyDocument
 from app.formal_body_safety import (
     FormalBodySafetyError,
@@ -59,6 +70,11 @@ from app.formal_body_safety import (
 )
 from app.generation.base import ReportGenerationResult, ReportGenerator
 from app.generation.dify_generator import DifyReportGenerator
+from app.layered_diagnostics import (
+    FAILURE_SCHEMA_VERSION,
+    build_failure_attribution,
+    make_layer_result,
+)
 from app.quality_gate import QualityGate
 from app.repair_pipeline import ForbiddenPhraseRepairer, RepairPipeline, StructureRepairer
 from app.report_memory import (
@@ -433,6 +449,8 @@ class AnalysisRunResponse(BaseModel):
     final_word_export_available: bool = False
     word_export_available: bool = False
     needs_manual_review: bool = False
+    failure_schema_version: str = ""
+    primary_layer: str = ""
     primary_failure_code: str = ""
     secondary_failure_codes: list[str] = Field(default_factory=list)
     quality_failure_codes: list[str] = Field(default_factory=list)
@@ -938,6 +956,8 @@ def _database_pack_path(pack_id: str) -> Path:
 
 
 def _write_database_evidence_pack(pack: dict[str, Any]) -> None:
+    if pack.get("evidence_schema_version") is not None:
+        pack = validate_evidence_pack(pack)
     pack_id = str(pack.get("pack_id") or "")
     path = _database_pack_path(pack_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -950,7 +970,15 @@ def _read_database_evidence_pack(pack_id: str) -> dict[str, Any]:
     if not path.exists():
         raise HTTPException(status_code=404, detail="evidence pack not found")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return read_evidence_pack(loaded)
+    except EvidenceValidationError as exc:
+        logger.warning(
+            "database_evidence_pack_schema_failed pack_id=%s error_type=%s",
+            pack_id,
+            exc.__class__.__name__,
+        )
+        raise HTTPException(status_code=500, detail="evidence pack schema validation failed") from exc
     except Exception as exc:  # noqa: BLE001
         logger.warning("database_evidence_pack_read_failed pack_id=%s error_type=%s", pack_id, exc.__class__.__name__)
         raise HTTPException(status_code=500, detail="evidence pack read failed") from exc
@@ -2271,6 +2299,13 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
         "warnings": [_limit_text(item, 260) for item in list(pack.get("warnings") or [])[:8]],
         "generation_guidance": copy.deepcopy(pack.get("generation_guidance") or {}),
     }
+    if (
+        pack.get("evidence_schema_version") is not None
+        and pack.get("source_evidence_schema_version") != 1
+    ):
+        evidence_view = validate_evidence_pack(pack)
+        compact["evidence_schema_version"] = evidence_view["evidence_schema_version"]
+        compact["evidence_items"] = copy.deepcopy(evidence_view["evidence_items"])
     compact["evidence_budget"] = _evidence_budget_for_strategy(input_strategy, primary_count=len(primary_source), auxiliary_count=len(auxiliary_source))
     compact["generation_guidance"]["target_report_length"] = _target_report_length_guidance(primary_source, auxiliary_source)
     compact["generation_guidance"]["mandatory_sections"] = [
@@ -2661,10 +2696,13 @@ RUN_P0_FAILURE_CODES = {
     "SUMMARY_ONLY_REPORT",
     "REPORT_TOO_SHORT",
     "REPORT_STRUCTURE_TOO_THIN",
-    "DIFY_OUTPUT_EMPTY",
-    "GENERATION_JSON_PARSE_FAILED",
-    "DIFY_FRAGMENTARY_REPORT",
-    "DIFY_TIMEOUT",
+    "HTTP_ERROR",
+    "WORKFLOW_ID_MISSING",
+    "WORKFLOW_FAILED",
+    "OUTPUT_EMPTY",
+    "OUTPUT_TRUNCATED",
+    "OUTPUT_SCHEMA_INVALID",
+    "TIMEOUT",
     "LOCAL_QUALITY_GATE_FAILED",
     "MODEL_QA_BLOCKED",
     "FALLBACK_REPORT_USED",
@@ -2677,10 +2715,13 @@ RUN_P0_FAILURE_CODES = {
 }
 
 RUN_FAILURE_PRIORITY = [
-    "DIFY_TIMEOUT",
-    "DIFY_FRAGMENTARY_REPORT",
-    "GENERATION_JSON_PARSE_FAILED",
-    "DIFY_OUTPUT_EMPTY",
+    "HTTP_ERROR",
+    "TIMEOUT",
+    "WORKFLOW_FAILED",
+    "WORKFLOW_ID_MISSING",
+    "OUTPUT_EMPTY",
+    "OUTPUT_TRUNCATED",
+    "OUTPUT_SCHEMA_INVALID",
     "UNSUPPORTED_FACT",
     "SUMMARY_ONLY_REPORT",
     "REPORT_TOO_SHORT",
@@ -2720,7 +2761,7 @@ RUN_QUALITY_BLOCKING_CODE_MAP = {
 RUN_ISSUE_ID_CODE_MAP = {
     "Q_LOCAL_QUALITY_GATE": "LOCAL_QUALITY_GATE_FAILED",
     "Q_DIFY_CALL_FAILED_FALLBACK": "FALLBACK_REPORT_USED",
-    "Q_DIFY_FRAGMENTARY_REPORT": "DIFY_FRAGMENTARY_REPORT",
+    "Q_DIFY_FRAGMENTARY_REPORT": "OUTPUT_TRUNCATED",
     "Q_FORBIDDEN_PHRASE": "FORBIDDEN_PHRASE_IN_REPORT",
     "Q_FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
     "Q_FORBIDDEN_PHRASE_FORMAL_BODY": "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
@@ -2730,11 +2771,23 @@ RUN_ISSUE_ID_CODE_MAP = {
 }
 
 RUN_DIFY_ERROR_CODE_MAP = {
-    "DIFY_TIMEOUT": "DIFY_TIMEOUT",
-    "DIFY_INVALID_RESPONSE": "GENERATION_JSON_PARSE_FAILED",
-    "DIFY_OUTPUT_EMPTY": "DIFY_OUTPUT_EMPTY",
-    "DIFY_FRAGMENTARY_REPORT": "DIFY_FRAGMENTARY_REPORT",
-    "GENERATION_JSON_PARSE_FAILED": "GENERATION_JSON_PARSE_FAILED",
+    "DIFY_TIMEOUT": "TIMEOUT",
+    "DIFY_CALL_FAILED": "HTTP_ERROR",
+    "DIFY_HTTP_ERROR": "HTTP_ERROR",
+    "DIFY_REQUEST_FAILED": "HTTP_ERROR",
+    "DIFY_NOT_CONFIGURED": "HTTP_ERROR",
+    "DIFY_WORKFLOW_FAILED": "WORKFLOW_FAILED",
+    "DIFY_INVALID_RESPONSE": "OUTPUT_SCHEMA_INVALID",
+    "DIFY_OUTPUT_EMPTY": "OUTPUT_EMPTY",
+    "DIFY_FRAGMENTARY_REPORT": "OUTPUT_TRUNCATED",
+    "GENERATION_JSON_PARSE_FAILED": "OUTPUT_SCHEMA_INVALID",
+    "HTTP_ERROR": "HTTP_ERROR",
+    "WORKFLOW_ID_MISSING": "WORKFLOW_ID_MISSING",
+    "WORKFLOW_FAILED": "WORKFLOW_FAILED",
+    "OUTPUT_EMPTY": "OUTPUT_EMPTY",
+    "OUTPUT_TRUNCATED": "OUTPUT_TRUNCATED",
+    "OUTPUT_SCHEMA_INVALID": "OUTPUT_SCHEMA_INVALID",
+    "TIMEOUT": "TIMEOUT",
 }
 
 RUN_FAILURE_REASON_LABELS = {
@@ -2742,10 +2795,6 @@ RUN_FAILURE_REASON_LABELS = {
     "SUMMARY_ONLY_REPORT": "报告偏摘要化，分析深度未达到自动交付条件。",
     "REPORT_TOO_SHORT": "报告正文过短，未达到自动交付条件。",
     "REPORT_STRUCTURE_TOO_THIN": "报告结构或核心覆盖不足，未达到自动交付条件。",
-    "DIFY_OUTPUT_EMPTY": "生成链路未返回可用正文。",
-    "GENERATION_JSON_PARSE_FAILED": "生成结果解析失败。",
-    "DIFY_FRAGMENTARY_REPORT": "Dify 返回内容片段化，已转入保守处理。",
-    "DIFY_TIMEOUT": "Dify 工作流调用超时。",
     "LOCAL_QUALITY_GATE_FAILED": "本地质量门禁未通过。",
     "MODEL_QA_BLOCKED": "模型或工作流异常导致未达到自动交付条件。",
     "FALLBACK_REPORT_USED": "已启用后端保守兜底报告。",
@@ -2755,6 +2804,14 @@ RUN_FAILURE_REASON_LABELS = {
     "EXPORT_GATE_BLOCKED": "导出门禁阻止最终 Word 交付。",
     "AUTO_REPAIR_FAILED": "自动修复未成功。",
     "AUTO_REPAIR_PARTIAL": "自动修复仅部分成功。",
+    "HTTP_ERROR": "Dify 服务调用失败。",
+    "WORKFLOW_ID_MISSING": "Dify 返回结果缺少工作流标识。",
+    "WORKFLOW_FAILED": "Dify 工作流执行失败。",
+    "OUTPUT_EMPTY": "生成链路未返回可用正文。",
+    "OUTPUT_TRUNCATED": "Dify 返回正文不完整。",
+    "OUTPUT_SCHEMA_INVALID": "Dify 返回结构无法解析。",
+    "TIMEOUT": "Dify 工作流调用超时。",
+    "UNCLASSIFIED": "当前 run 未达到自动交付条件。",
 }
 
 
@@ -2768,6 +2825,15 @@ def _dedupe_strings(values: list[Any] | tuple[Any, ...] | set[Any] | None) -> li
         seen.add(text)
         result.append(text)
     return result
+
+
+def _canonical_generation_failure_code(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    if not code:
+        return ""
+    if code in RUN_P0_FAILURE_CODES:
+        return code
+    return canonical_provider_failure_code(code)
 
 
 def _safe_int_value(value: Any, default: int = 0) -> int:
@@ -2824,6 +2890,119 @@ def _extract_quality_gate_codes(quality_gate: Any) -> list[str]:
     return _dedupe_strings(mapped)
 
 
+def _collect_failure_stages(
+    record: dict[str, Any],
+    *,
+    generation_failure_codes: list[str],
+    quality_failure_codes: list[str],
+) -> list[dict[str, Any]]:
+    stages: list[dict[str, Any]] = []
+    raw_stages = record.get("failure_stages")
+    if isinstance(raw_stages, list):
+        stages.extend(item for item in raw_stages if isinstance(item, dict))
+    else:
+        existing = record.get("failure_attribution")
+        if isinstance(existing, dict) and isinstance(existing.get("layers"), dict):
+            stages.extend(
+                item
+                for item in existing["layers"].values()
+                if isinstance(item, dict)
+            )
+    provider_stage = record.get("provider_stage")
+    if isinstance(provider_stage, dict):
+        stages = [
+            item
+            for item in stages
+            if str(item.get("layer") or "").strip() != "provider"
+        ]
+        stages.append(provider_stage)
+
+    provider_stage_present = any(
+        str(item.get("layer") or "").strip() == "provider"
+        and str(item.get("status") or "").strip() in {"ok", "blocked"}
+        for item in stages
+    )
+    blocked_layers = {
+        str(item.get("layer") or "").strip()
+        for item in stages
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip() == "blocked"
+    }
+    if not provider_stage_present:
+        provider_codes: list[str] = []
+        dify_error_code = str(record.get("dify_error_code") or "").strip()
+        if dify_error_code:
+            provider_codes.append(canonical_provider_failure_code(dify_error_code))
+        provider_codes.extend(
+            canonical_provider_failure_code(code)
+            for code in generation_failure_codes
+            if code not in {"FALLBACK_REPORT_USED", "AUTO_REPAIR_FAILED", "AUTO_REPAIR_PARTIAL"}
+        )
+        provider_codes = [code for code in _dedupe_strings(provider_codes) if code]
+        if provider_codes:
+            stages.append(
+                make_layer_result(
+                    "provider",
+                    status="blocked",
+                    code=provider_codes[0],
+                )
+            )
+
+    if "cleanup" not in blocked_layers and any(
+        code in {"AUTO_REPAIR_FAILED", "AUTO_REPAIR_PARTIAL"}
+        for code in generation_failure_codes
+    ):
+        stages.append(
+            make_layer_result(
+                "cleanup",
+                status="blocked",
+                code="CLEANUP_SCHEMA_INVALID",
+            )
+        )
+
+    if "quality_gate" not in blocked_layers and quality_failure_codes:
+        allowed = {
+            "UNSUPPORTED_FACT",
+            "SUMMARY_ONLY_REPORT",
+            "REPORT_TOO_SHORT",
+            "REPORT_STRUCTURE_TOO_THIN",
+            "FORBIDDEN_PHRASE_IN_REPORT",
+            "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+            "FORMAL_BODY_EMPTY",
+            "LOCAL_QUALITY_GATE_FAILED",
+            "MODEL_QA_BLOCKED",
+            "EXPORT_GATE_BLOCKED",
+        }
+        quality_priority = (
+            "UNSUPPORTED_FACT",
+            "SUMMARY_ONLY_REPORT",
+            "REPORT_TOO_SHORT",
+            "REPORT_STRUCTURE_TOO_THIN",
+            "FORMAL_BODY_EMPTY",
+            "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+            "FORBIDDEN_PHRASE_IN_REPORT",
+            "EXPORT_GATE_BLOCKED",
+            "MODEL_QA_BLOCKED",
+            "LOCAL_QUALITY_GATE_FAILED",
+        )
+        quality_code = next(
+            (
+                code
+                for code in quality_priority
+                if code in allowed and code in quality_failure_codes
+            ),
+            "UNCLASSIFIED",
+        )
+        stages.append(
+            make_layer_result(
+                "quality_gate",
+                status="blocked",
+                code=quality_code,
+            )
+        )
+    return stages
+
+
 def _is_explicitly_deliverable(record: dict[str, Any], run_status: str, has_formal_body: bool) -> bool:
     quality_gate = record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {}
     quality_check = record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {}
@@ -2863,17 +3042,37 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
     if quality_gate.get("deliverable_status") == "needs_manual_review" and not quality_failure_codes:
         quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
 
-    generation_failure_codes = _dedupe_strings(list(normalized.get("generation_failure_codes") or []))
-    dify_error_code = str(normalized.get("dify_error_code") or "").strip()
+    generation_failure_codes = _dedupe_strings(
+        [
+            _canonical_generation_failure_code(code)
+            for code in list(normalized.get("generation_failure_codes") or [])
+        ]
+    )
+    raw_dify_error_code = str(normalized.get("dify_error_code") or "").strip()
+    dify_error_code = canonical_provider_failure_code(raw_dify_error_code) if raw_dify_error_code else ""
     if dify_error_code:
-        generation_failure_codes.append(RUN_DIFY_ERROR_CODE_MAP.get(dify_error_code, "MODEL_QA_BLOCKED"))
-    generation_failure_codes.extend(code for code in _extract_issue_codes(remaining_issues) if code in {"DIFY_TIMEOUT", "DIFY_FRAGMENTARY_REPORT", "GENERATION_JSON_PARSE_FAILED", "DIFY_OUTPUT_EMPTY", "FALLBACK_REPORT_USED"})
-    if raw_status in {"failed", "needs_manual_review"} and not report_markdown and not report_ir and "DIFY_OUTPUT_EMPTY" not in generation_failure_codes:
-        generation_failure_codes.append("DIFY_OUTPUT_EMPTY")
+        generation_failure_codes.append(dify_error_code)
+    generation_failure_codes.extend(
+        code
+        for code in _extract_issue_codes(remaining_issues)
+        if code
+        in {
+            "HTTP_ERROR",
+            "WORKFLOW_ID_MISSING",
+            "WORKFLOW_FAILED",
+            "OUTPUT_EMPTY",
+            "OUTPUT_TRUNCATED",
+            "OUTPUT_SCHEMA_INVALID",
+            "TIMEOUT",
+            "FALLBACK_REPORT_USED",
+        }
+    )
+    if raw_status in {"failed", "needs_manual_review"} and not report_markdown and not report_ir and "OUTPUT_EMPTY" not in generation_failure_codes:
+        generation_failure_codes.append("OUTPUT_EMPTY")
     generation_failure_codes = _dedupe_strings(generation_failure_codes)
 
     fallback_used = bool(normalized.get("fallback_used"))
-    if dify_error_code or "FALLBACK_REPORT_USED" in generation_failure_codes or "DIFY_FRAGMENTARY_REPORT" in generation_failure_codes:
+    if dify_error_code or "FALLBACK_REPORT_USED" in generation_failure_codes or "OUTPUT_TRUNCATED" in generation_failure_codes:
         fallback_used = True
     if any(isinstance(item, dict) and item.get("issue_id") in {"Q_DIFY_CALL_FAILED_FALLBACK", "Q_DIFY_FRAGMENTARY_REPORT"} for item in remaining_issues):
         fallback_used = True
@@ -2904,24 +3103,26 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
         if safety_code not in quality_failure_codes:
             quality_failure_codes.append(safety_code)
 
-    all_codes = _dedupe_strings([*generation_failure_codes, *quality_failure_codes, *list(normalized.get("blocking_issue_codes") or [])])
+    existing_blocking_codes = [
+        _canonical_generation_failure_code(code)
+        for code in list(normalized.get("blocking_issue_codes") or [])
+    ]
+    all_codes = _dedupe_strings([*generation_failure_codes, *quality_failure_codes, *existing_blocking_codes])
     if fallback_used and "FALLBACK_REPORT_USED" not in all_codes:
         all_codes.append("FALLBACK_REPORT_USED")
 
-    primary_failure_code = str(normalized.get("primary_failure_code") or "").strip()
-    if deliverable:
-        primary_failure_code = ""
-    elif raw_status in RUN_TERMINAL_STATUSES:
-        for code in RUN_FAILURE_PRIORITY:
-            if code in all_codes:
-                primary_failure_code = code
-                break
-        if not primary_failure_code:
-            primary_failure_code = "MODEL_QA_BLOCKED" if raw_status == "failed" else "LOCAL_QUALITY_GATE_FAILED"
-
-    secondary_failure_codes = _dedupe_strings([*list(normalized.get("secondary_failure_codes") or []), *[code for code in all_codes if code != primary_failure_code]])
-    if fallback_used and "FALLBACK_REPORT_USED" not in secondary_failure_codes and primary_failure_code != "FALLBACK_REPORT_USED":
-        secondary_failure_codes.append("FALLBACK_REPORT_USED")
+    failure_stages = _collect_failure_stages(
+        normalized,
+        generation_failure_codes=generation_failure_codes,
+        quality_failure_codes=quality_failure_codes,
+    )
+    failure_attribution = build_failure_attribution(
+        run_status=raw_status,
+        deliverable=deliverable,
+        stages=failure_stages,
+    )
+    primary_failure_code = failure_attribution["primary_failure_code"]
+    secondary_failure_codes = list(failure_attribution["secondary_failure_codes"])
 
     reason_summary = str(normalized.get("manual_review_reason_summary") or "").strip()
     final_blocking_reason = str(normalized.get("final_blocking_reason") or "").strip()
@@ -2929,6 +3130,9 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
         reason_summary = RUN_FAILURE_REASON_LABELS.get(primary_failure_code, "当前 run 未达到自动交付条件。")
     if primary_failure_code and not final_blocking_reason:
         final_blocking_reason = reason_summary
+    if not primary_failure_code:
+        reason_summary = ""
+        final_blocking_reason = ""
 
     normalized.update(
         {
@@ -2947,13 +3151,21 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
             "final_word_export_available": final_word_export_available,
             "word_export_available": word_export_available,
             "needs_manual_review": needs_manual_review,
+            "failure_schema_version": FAILURE_SCHEMA_VERSION,
+            "failure_attribution": failure_attribution,
+            "failure_stages": list(failure_attribution["layers"].values()),
+            "primary_layer": failure_attribution["primary_layer"],
             "primary_failure_code": primary_failure_code,
             "secondary_failure_codes": secondary_failure_codes,
             "quality_failure_codes": _dedupe_strings(quality_failure_codes),
             "generation_failure_codes": _dedupe_strings(generation_failure_codes),
             "blocking_issue_codes": _dedupe_strings(all_codes),
             "fallback_used": fallback_used,
-            "fallback_reason": str(normalized.get("fallback_reason") or dify_error_code or ("DIFY_FRAGMENTARY_REPORT" if "DIFY_FRAGMENTARY_REPORT" in all_codes else "")).strip(),
+            "fallback_reason": _canonical_generation_failure_code(
+                normalized.get("fallback_reason")
+                or dify_error_code
+                or ("OUTPUT_TRUNCATED" if "OUTPUT_TRUNCATED" in all_codes else "")
+            ),
             "fallback_provider": str(normalized.get("fallback_provider") or ("backend_pack_fallback" if fallback_used else "")).strip(),
             "repair_attempted": bool(normalized.get("repair_attempted")),
             "repair_success": bool(normalized.get("repair_success")),
@@ -2961,6 +3173,7 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
             "manual_review_reason_summary": reason_summary,
             "final_blocking_reason": final_blocking_reason,
             "provider": str(normalized.get("provider") or "dify").strip() or "dify",
+            "dify_error_code": dify_error_code,
             "provider_run_id": str(normalized.get("provider_run_id") or normalized.get("workflow_run_id") or "").strip(),
             "generator_version": str(normalized.get("generator_version") or "").strip(),
             "prompt_version": str(normalized.get("prompt_version") or "").strip(),
@@ -3024,12 +3237,21 @@ def _read_analysis_run(run_id: str) -> dict[str, Any]:
 
 
 class DifyWorkflowError(Exception):
-    def __init__(self, code: str, message: str, detail: str = "", status_code: int = 502):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        detail: str = "",
+        status_code: int = 502,
+        *,
+        provider_stage: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.detail = detail
         self.status_code = status_code
+        self.provider_stage = provider_stage
 
 
 def _dify_config() -> dict[str, Any]:
@@ -3045,7 +3267,19 @@ def _dify_config() -> dict[str, Any]:
     staged_max_attempts = max(1, _env_int("DIFY_STAGED_MAX_ATTEMPTS", 1))
     if not base_url or not api_key:
         logger.warning("dify_configuration_incomplete base_url_configured=%s api_key_configured=%s", bool(base_url), bool(api_key))
-        raise DifyWorkflowError("DIFY_NOT_CONFIGURED", "Dify API 配置不完整", status_code=500)
+        stage = make_layer_result(
+            "provider",
+            status="blocked",
+            code="HTTP_ERROR",
+            metrics={"configuration_complete": False},
+        )
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "Dify API 配置不完整",
+            "provider configuration incomplete",
+            status_code=500,
+            provider_stage=stage,
+        )
     return {
         "base_url": base_url,
         "api_key": api_key,
@@ -3185,37 +3419,24 @@ def _parse_json_list(value: Any) -> list[Any]:
     return [value]
 
 
-def _extract_dify_outputs(response_json: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
-    workflow_run_id = str(response_json.get("workflow_run_id") or "")
+def _extract_dify_outputs(
+    response_json: dict[str, Any],
+) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+    try:
+        workflow_run_id, output, provider_stage = extract_provider_output(response_json)
+    except ProviderResponseError as exc:
+        raise DifyWorkflowError(
+            exc.code,
+            "Dify provider response failed validation",
+            exc.code,
+            provider_stage=exc.stage,
+        ) from exc
     data = response_json.get("data") if isinstance(response_json.get("data"), dict) else {}
-    if not workflow_run_id:
-        workflow_run_id = str(data.get("id") or data.get("workflow_run_id") or "")
-    if str(data.get("status") or "").lower() in {"failed", "stopped"}:
-        raise DifyWorkflowError("DIFY_WORKFLOW_FAILED", "Dify 工作流执行失败", str(data.get("error") or data.get("status") or ""))
-    outputs = data.get("outputs") if isinstance(data.get("outputs"), dict) else response_json.get("outputs")
-    output_dict = _parse_json_object(outputs) or {}
-    candidates: list[dict[str, Any] | None] = [
-        output_dict,
-        _parse_json_object(output_dict.get("result")),
-        _parse_json_object(output_dict.get("output")),
-        _parse_json_object(output_dict.get("answer")),
-        _parse_json_object(output_dict.get("text")),
-        _parse_json_object(output_dict.get("report")),
-    ]
-    for value in output_dict.values():
-        parsed = _parse_json_object(value)
-        if parsed:
-            candidates.append(parsed)
-    for candidate in candidates:
-        if candidate and candidate.get("report_markdown"):
-            return workflow_run_id, candidate, str(data.get("status") or "")
-    if str(data.get("status") or "").lower() in {"succeeded", "finished", ""}:
-        return workflow_run_id, output_dict, str(data.get("status") or "")
-    raise DifyWorkflowError("DIFY_INVALID_RESPONSE", "Dify 返回内容缺少 report_markdown", "outputs did not contain report_markdown")
+    return workflow_run_id, output, str(data.get("status") or ""), provider_stage
 
 
 def _normalize_dify_result(response_json: dict[str, Any], pack_id: str) -> dict[str, Any]:
-    workflow_run_id, output, workflow_status = _extract_dify_outputs(response_json)
+    workflow_run_id, output, workflow_status, provider_stage = _extract_dify_outputs(response_json)
     quality_check = _parse_json_object(output.get("quality_check")) or {"passed": None, "issues": []}
     status = str(output.get("status") or "").strip() or "finished"
     if status not in {"finished", "needs_manual_review", "failed"}:
@@ -3232,6 +3453,8 @@ def _normalize_dify_result(response_json: dict[str, Any], pack_id: str) -> dict[
         "generation_warnings": warnings,
         "warnings": warnings,
         "remaining_issues": _parse_json_list(output.get("remaining_issues")),
+        "provider_stage": provider_stage,
+        "failure_stages": [provider_stage],
     }
 
 
@@ -3420,6 +3643,212 @@ def _apply_local_quality_gate_to_dify_result(result: dict[str, Any], pack: dict[
     return QualityGate().run(repaired_result, pack).to_legacy_result()
 
 
+def _set_failure_stage(result: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(result)
+    layer = str(stage.get("layer") or "")
+    stages = [
+        item
+        for item in list(updated.get("failure_stages") or [])
+        if isinstance(item, dict) and str(item.get("layer") or "") != layer
+    ]
+    stages.append(stage)
+    updated["failure_stages"] = stages
+    if layer == "provider":
+        updated["provider_stage"] = stage
+    return updated
+
+
+def _input_pipeline_stages(pack: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    materials = [
+        item
+        for key in ("primary_materials", "auxiliary_materials")
+        for item in list(pack.get(key) or [])
+        if isinstance(item, dict)
+    ]
+    attachment_count = sum(
+        len([item for item in list(material.get("attachments") or []) if isinstance(item, dict)])
+        for material in materials
+    )
+    pack_diagnostics = build_pack_diagnostics(pack)
+    unavailable = list(pack_diagnostics.get("core_attachment_unparsed_names") or [])
+    if unavailable:
+        attachment_stage = make_layer_result(
+            "attachment_parse",
+            status="blocked",
+            code="ATTACHMENT_REQUIRED_UNAVAILABLE",
+            input_value=pack,
+            output_value={"attachment_count": attachment_count, "unavailable_count": len(unavailable)},
+            metrics={"attachment_count": attachment_count, "unavailable_count": len(unavailable)},
+        )
+    elif attachment_count:
+        attachment_stage = make_layer_result(
+            "attachment_parse",
+            status="ok",
+            input_value=pack,
+            output_value={"attachment_count": attachment_count},
+            metrics={"attachment_count": attachment_count},
+        )
+    else:
+        attachment_stage = make_layer_result(
+            "attachment_parse",
+            status="skipped",
+            input_value={"pack_id": str(pack.get("pack_id") or "")},
+            output_value={"attachment_count": 0},
+            metrics={"attachment_count": 0},
+        )
+
+    compact: dict[str, Any] | None = None
+    try:
+        compact = _compact_evidence_pack_for_dify(pack)
+        compact_chars = _safe_int_value(
+            compact.get("compact_pack_chars") or compact.get("final_dify_input_chars") or 0
+        )
+        hard_limit = _safe_int_value(compact.get("hard_limit_chars") or 80_000, 80_000)
+        provenance_preserved = True
+        if pack.get("evidence_schema_version") == 2 and pack.get("source_evidence_schema_version") != 1:
+            provenance_preserved = compact.get("evidence_items") == pack.get("evidence_items")
+        if not provenance_preserved:
+            compact_stage = make_layer_result(
+                "compact",
+                status="blocked",
+                code="COMPACT_PROVENANCE_LOST",
+                input_value=pack,
+                output_value=compact,
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
+            )
+        elif compact_chars > hard_limit:
+            compact_stage = make_layer_result(
+                "compact",
+                status="blocked",
+                code="COMPACT_LIMIT_EXCEEDED",
+                input_value=pack,
+                output_value=compact,
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
+            )
+        else:
+            compact_stage = make_layer_result(
+                "compact",
+                status="ok",
+                input_value=pack,
+                output_value=compact,
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
+            )
+    except Exception as exc:  # noqa: BLE001
+        compact_stage = make_layer_result(
+            "compact",
+            status="blocked",
+            code="UNCLASSIFIED",
+            input_value=pack,
+            metrics={"error_type": exc.__class__.__name__},
+        )
+    return [attachment_stage, compact_stage], compact
+
+
+def _formal_body_stage_value(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "report_markdown": str(result.get("report_markdown") or ""),
+        "report_ir": result.get("report_ir") if isinstance(result.get("report_ir"), dict) else None,
+    }
+
+
+def _cleanup_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_body = _formal_body_stage_value(before)
+    after_body = _formal_body_stage_value(after)
+    before_has_body = bool(before_body["report_markdown"].strip() or before_body["report_ir"])
+    after_has_body = bool(after_body["report_markdown"].strip() or after_body["report_ir"])
+    if before_has_body and not after_has_body:
+        status, code = "blocked", "CLEANUP_OUTPUT_EMPTY"
+    else:
+        status, code = "ok", ""
+    return make_layer_result(
+        "cleanup",
+        status=status,
+        code=code,
+        input_value=before_body,
+        output_value=after_body,
+    )
+
+
+def _quality_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    quality_gate = after.get("quality_gate") if isinstance(after.get("quality_gate"), dict) else {}
+    quality_check = after.get("quality_check") if isinstance(after.get("quality_check"), dict) else {}
+    blocked = (
+        str(quality_gate.get("deliverable_status") or "") in {"needs_manual_review", "failed"}
+        or quality_check.get("passed") is False
+    )
+    priority = (
+        "UNSUPPORTED_FACT",
+        "SUMMARY_ONLY_REPORT",
+        "REPORT_TOO_SHORT",
+        "REPORT_STRUCTURE_TOO_THIN",
+        "FORMAL_BODY_EMPTY",
+        "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+        "FORBIDDEN_PHRASE_IN_REPORT",
+        "EXPORT_GATE_BLOCKED",
+        "MODEL_QA_BLOCKED",
+        "LOCAL_QUALITY_GATE_FAILED",
+    )
+    codes = _extract_quality_gate_codes(quality_gate)
+    code = next((item for item in priority if item in codes), "LOCAL_QUALITY_GATE_FAILED") if blocked else ""
+    return make_layer_result(
+        "quality_gate",
+        status="blocked" if blocked else "ok",
+        code=code,
+        input_value=_formal_body_stage_value(before),
+        output_value={"quality_gate": quality_gate, "quality_check": quality_check},
+    )
+
+
+def _postprocess_generation_with_stages(
+    result: dict[str, Any],
+    pack: dict[str, Any],
+    input_stages: list[dict[str, Any]] | None = None,
+    compact: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if input_stages is None:
+        input_stages, compact = _input_pipeline_stages(pack)
+    staged = dict(result)
+    for stage in input_stages:
+        staged = _set_failure_stage(staged, stage)
+    provider_stage = staged.get("provider_stage") if isinstance(staged.get("provider_stage"), dict) else None
+    if provider_stage is None:
+        provider_stage = make_layer_result(
+            "provider",
+            status="ok",
+            input_value=compact or {"pack_id": str(pack.get("pack_id") or "")},
+            output_value={
+                "provider_run_id": str(staged.get("provider_run_id") or staged.get("workflow_run_id") or ""),
+                **_formal_body_stage_value(staged),
+            },
+        )
+    elif provider_stage.get("input_artifact") is None:
+        provider_stage = dict(provider_stage)
+        provider_stage["input_artifact"] = make_layer_result(
+            "provider",
+            status=str(provider_stage.get("status") or "ok"),
+            code=str(provider_stage.get("code") or ""),
+            input_value=compact or {"pack_id": str(pack.get("pack_id") or "")},
+        )["input_artifact"]
+    staged = _set_failure_stage(staged, provider_stage)
+
+    before_cleanup = dict(staged)
+    repaired_result = RepairPipeline(
+        repairers=[
+            StructureRepairer(_repair_unusable_dify_result),
+            ForbiddenPhraseRepairer(),
+        ]
+    ).run(
+        ReportGenerationResult.from_legacy_result(staged, provider=str(staged.get("provider") or "dify")),
+        pack,
+    )
+    staged = repaired_result.to_legacy_result()
+    staged = _set_failure_stage(staged, _cleanup_pipeline_stage(before_cleanup, staged))
+
+    before_quality = dict(staged)
+    staged = _apply_local_quality_gate_to_dify_result(staged, pack)
+    return _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
+
+
 def _fallback_result_from_dify_error(
     exc: DifyWorkflowError,
     pack: dict[str, Any],
@@ -3427,11 +3856,18 @@ def _fallback_result_from_dify_error(
     *,
     apply_quality_gate: bool = True,
 ) -> dict[str, Any]:
+    provider_code = canonical_provider_failure_code(exc.code)
+    provider_stage = exc.provider_stage or make_layer_result(
+        "provider",
+        status="blocked",
+        code=provider_code,
+        metrics={"error_type": exc.__class__.__name__},
+    )
     title, markdown, fallback_warnings = _fallback_report_from_pack(pack)
     issue = {
         "issue_id": "Q_DIFY_CALL_FAILED_FALLBACK",
         "severity": "high",
-        "problem_type": exc.code,
+        "problem_type": provider_code,
         "report_text": "",
         "source_basis": "evidence_pack",
         "fix_instruction": "Dify 调用失败后已基于 evidence_pack 生成保守报告；该报告需人工复核，不得直接交付。",
@@ -3452,19 +3888,42 @@ def _fallback_result_from_dify_error(
         "generation_warnings": warnings,
         "warnings": warnings,
         "remaining_issues": [issue],
-        "dify_error_code": exc.code,
+        "dify_error_code": provider_code,
         "dify_error_message": exc.message,
         "dify_error_detail": exc.detail,
         "provider": "dify",
         "fallback_used": True,
-        "fallback_reason": exc.code,
+        "fallback_reason": provider_code,
         "fallback_provider": "backend_pack_fallback",
+        "provider_stage": provider_stage,
+        "failure_stages": [provider_stage],
     }
     if apply_quality_gate:
-        return _apply_local_quality_gate_to_dify_result(result, pack)
+        return _postprocess_generation_with_stages(result, pack)
+    input_stages, _ = _input_pipeline_stages(pack)
+    for stage in input_stages:
+        result = _set_failure_stage(result, stage)
+    result = _set_failure_stage(
+        result,
+        make_layer_result(
+            "cleanup",
+            status="ok",
+            input_value={"provider_error_code": canonical_provider_failure_code(exc.code)},
+            output_value=_formal_body_stage_value(result),
+        ),
+    )
+    result = _set_failure_stage(
+        result,
+        make_layer_result(
+            "quality_gate",
+            status="skipped",
+            input_value=_formal_body_stage_value(result),
+            output_value={"reason": "watchdog fallback persisted before quality gate"},
+        ),
+    )
     result["quality_gate"] = {
         "deliverable_status": "needs_manual_review",
-        "blocking_issue_codes": ["DIFY_TIMEOUT"],
+        "blocking_issue_codes": [provider_code],
         "summary_only_risk": False,
         "source_fidelity_score": 0,
         "analysis_depth_score": 0,
@@ -3575,29 +4034,60 @@ def _call_dify_workflow(
                 if backoff:
                     time.sleep(backoff * attempt)
                 continue
-            raise DifyWorkflowError("DIFY_TIMEOUT", "Dify 工作流调用超时", str(exc), status_code=504) from exc
+            raise DifyWorkflowError(
+                "TIMEOUT",
+                "Dify 工作流调用超时",
+                "TIMEOUT",
+                status_code=504,
+                provider_stage=provider_stage_from_exception(exc),
+            ) from exc
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            detail = f"HTTP {status}: {_truncate(exc.response.text, 300)}"
+            detail = f"HTTP {status}"
             if status in {429, 502, 503, 504} and attempt < attempts:
                 logger.warning("dify_workflow_retry_status run_id=%s pack_id=%s status=%s attempt=%s/%s", run_id, pack_id, status, attempt, attempts)
                 if backoff:
                     time.sleep(backoff * attempt)
                 continue
-            if status in {429, 503}:
-                raise DifyWorkflowError("DIFY_MODEL_BUSY", "Dify 上游模型服务繁忙", detail, status_code=502) from exc
-            raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 工作流失败", detail) from exc
+            raise DifyWorkflowError(
+                "HTTP_ERROR",
+                "调用 Dify 工作流失败",
+                detail,
+                provider_stage=provider_stage_from_exception(exc),
+            ) from exc
         except httpx.HTTPError as exc:
             if attempt < attempts:
                 logger.warning("dify_workflow_retry_http_error run_id=%s pack_id=%s attempt=%s/%s", run_id, pack_id, attempt, attempts)
                 if backoff:
                     time.sleep(backoff * attempt)
                 continue
-            raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 工作流失败", str(exc)) from exc
+            raise DifyWorkflowError(
+                "HTTP_ERROR",
+                "调用 Dify 工作流失败",
+                "HTTP_ERROR",
+                provider_stage=provider_stage_from_exception(exc),
+            ) from exc
         except json.JSONDecodeError as exc:
-            raise DifyWorkflowError("DIFY_INVALID_RESPONSE", "Dify 返回内容不是合法 JSON", str(exc)) from exc
+            stage = make_layer_result(
+                "provider",
+                status="blocked",
+                code="OUTPUT_SCHEMA_INVALID",
+                metrics={"error_type": exc.__class__.__name__},
+            )
+            raise DifyWorkflowError(
+                "OUTPUT_SCHEMA_INVALID",
+                "Dify 返回内容不是合法 JSON",
+                "OUTPUT_SCHEMA_INVALID",
+                provider_stage=stage,
+            ) from exc
     if response_json is None:
-        raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 工作流失败", "empty response")
+        stage = make_layer_result("provider", status="blocked", code="OUTPUT_EMPTY")
+        raise DifyWorkflowError(
+            "OUTPUT_EMPTY",
+            "调用 Dify 工作流失败",
+            "OUTPUT_EMPTY",
+            provider_stage=stage,
+        )
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     result = _normalize_dify_result(response_json, pack_id)
@@ -3635,10 +4125,16 @@ def _configured_report_generator() -> ReportGenerator:
             dify_fallback,
         )
         raise DifyWorkflowError(
-            "REPORT_GENERATOR_NOT_SUPPORTED",
+            "HTTP_ERROR",
             "Report generator provider is not enabled in P0.2",
-            f"provider={provider}",
+            "report generator provider is not enabled",
             status_code=500,
+            provider_stage=make_layer_result(
+                "provider",
+                status="blocked",
+                code="HTTP_ERROR",
+                metrics={"configuration_complete": False},
+            ),
         )
     if native_shadow or dify_fallback:
         logger.info(
@@ -3710,14 +4206,41 @@ def _call_dify_revision_workflow(
             response.raise_for_status()
             response_json = response.json()
     except httpx.TimeoutException as exc:
-        raise DifyWorkflowError("DIFY_TIMEOUT", "Dify 修订工作流调用超时", str(exc), status_code=504) from exc
+        raise DifyWorkflowError(
+            "TIMEOUT",
+            "Dify 修订工作流调用超时",
+            "TIMEOUT",
+            status_code=504,
+            provider_stage=provider_stage_from_exception(exc),
+        ) from exc
     except httpx.HTTPStatusError as exc:
-        detail = f"HTTP {exc.response.status_code}: {_truncate(exc.response.text, 300)}"
-        raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 修订工作流失败", detail) from exc
+        detail = f"HTTP {exc.response.status_code}"
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "调用 Dify 修订工作流失败",
+            detail,
+            provider_stage=provider_stage_from_exception(exc),
+        ) from exc
     except httpx.HTTPError as exc:
-        raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 修订工作流失败", str(exc)) from exc
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "调用 Dify 修订工作流失败",
+            "HTTP_ERROR",
+            provider_stage=provider_stage_from_exception(exc),
+        ) from exc
     except json.JSONDecodeError as exc:
-        raise DifyWorkflowError("DIFY_INVALID_RESPONSE", "Dify 修订返回内容不是合法 JSON", str(exc)) from exc
+        stage = make_layer_result(
+            "provider",
+            status="blocked",
+            code="OUTPUT_SCHEMA_INVALID",
+            metrics={"error_type": exc.__class__.__name__},
+        )
+        raise DifyWorkflowError(
+            "OUTPUT_SCHEMA_INVALID",
+            "Dify 修订返回内容不是合法 JSON",
+            "OUTPUT_SCHEMA_INVALID",
+            provider_stage=stage,
+        ) from exc
     result = _normalize_dify_result(response_json, pack_id)
     logger.info(
         "dify_revision_call_finished run_id=%s pack_id=%s status=%s elapsed_ms=%s",
@@ -4237,6 +4760,8 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
         "warnings": warnings,
     }
     pack.update(_build_stage4_pack_fields(primary_materials, auxiliary_materials, combined_key_facts, pack["report_focus"]))
+    pack = read_evidence_pack(pack)
+    pack.pop("source_evidence_schema_version", None)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
     _write_database_evidence_pack(pack)
     return pack
@@ -4576,7 +5101,7 @@ def _save_analysis_timeout_fallback_if_running(pack_id: str, run_id: str, pack: 
     try:
         evidence_pack = pack or _read_database_evidence_pack(pack_id)
         exc = DifyWorkflowError(
-            "DIFY_TIMEOUT",
+            "TIMEOUT",
             "Dify 工作流调用超时",
             f"watchdog timeout after {timeout_seconds:.1f}s",
             status_code=504,
@@ -4685,16 +5210,19 @@ def _execute_analysis_run_background(
             use_report_memory=use_report_memory,
         )
         result = generation_result.to_legacy_result()
+        inherited_warnings = [str(item) for item in list(record.get("warnings") or []) if str(item).strip()]
+        generated_warnings = [
+            str(item)
+            for item in list(result.get("generation_warnings") or result.get("warnings") or [])
+            if str(item).strip()
+        ]
+        merged_warnings = _dedupe_strings([*inherited_warnings, *generated_warnings])
+        result["generation_warnings"] = merged_warnings
+        result["warnings"] = merged_warnings
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            repaired_result = RepairPipeline(
-                repairers=[
-                    StructureRepairer(_repair_unusable_dify_result),
-                    ForbiddenPhraseRepairer(),
-                ]
-            ).run(ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify")), pack)
-            result = repaired_result.to_legacy_result()
-            result = _apply_local_quality_gate_to_dify_result(result, pack)
+            input_stages, compact = _input_pipeline_stages(pack)
+            result = _postprocess_generation_with_stages(result, pack, input_stages, compact)
         except Exception as repair_exc:  # noqa: BLE001
             logger.warning(
                 "analysis_run_repair_skipped run_id=%s pack_id=%s error_type=%s",
@@ -4705,7 +5233,7 @@ def _execute_analysis_run_background(
     except DifyWorkflowError as exc:
         warnings = list(record.get("warnings") or [])
         error_message = exc.message
-        if exc.code == "DIFY_TIMEOUT":
+        if exc.code in {"DIFY_TIMEOUT", "TIMEOUT"}:
             error_message = "Dify 工作流调用超时：证据包较大或生成/质检耗时过长"
             warnings.append("证据包较大时可能导致 Dify 超时，可减少辅助材料、缩短辅助附件摘要或稍后重试。")
         try:
@@ -4863,6 +5391,8 @@ def run_analysis(req: AnalysisRunRequest):
         final_word_export_available=bool(record.get("final_word_export_available")),
         word_export_available=bool(record.get("word_export_available")),
         needs_manual_review=bool(record.get("needs_manual_review")),
+        failure_schema_version=str(record.get("failure_schema_version") or ""),
+        primary_layer=str(record.get("primary_layer") or ""),
         primary_failure_code=str(record.get("primary_failure_code") or ""),
         secondary_failure_codes=list(record.get("secondary_failure_codes") or []),
         quality_failure_codes=list(record.get("quality_failure_codes") or []),

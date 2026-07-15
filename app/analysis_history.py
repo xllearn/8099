@@ -498,6 +498,12 @@ class AnalysisHistoryStore:
                 return value
             return old.get(key, default)
 
+        def current_or_previous(key: str, default: Any = "") -> Any:
+            if key in record:
+                value = record.get(key)
+                return default if value is None else value
+            return old.get(key, default)
+
         identities = self._material_identities(record, old)
         primary = next(
             (item for item in identities if item.get("role") == "primary"),
@@ -587,8 +593,10 @@ class AnalysisHistoryStore:
             "workflow_run_id": _text(prefer("workflow_run_id")),
             "provider_run_id": _text(prefer("provider_run_id")),
             "compact_pack_chars": _safe_int(prefer("compact_pack_chars", 0)),
-            "primary_failure_code": _text(prefer("primary_failure_code")),
-            "secondary_failure_codes": _string_list(prefer("secondary_failure_codes", [])),
+            "failure_schema_version": _text(current_or_previous("failure_schema_version")),
+            "primary_layer": _text(current_or_previous("primary_layer")),
+            "primary_failure_code": _text(current_or_previous("primary_failure_code")),
+            "secondary_failure_codes": _string_list(current_or_previous("secondary_failure_codes", [])),
             "quality_failure_codes": _string_list(prefer("quality_failure_codes", [])),
             "generation_failure_codes": _string_list(prefer("generation_failure_codes", [])),
             "blocking_issue_codes": _string_list(prefer("blocking_issue_codes", [])),

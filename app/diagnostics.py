@@ -5,6 +5,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from app.evidence_schema import EvidenceValidationError, fact_support_values, read_evidence_pack
+
 
 STEP_DEFINITIONS = [
     ("create_run", "创建任务"),
@@ -931,7 +933,11 @@ def _report_visible_text(markdown: str) -> str:
 def _pack_evidence_text(pack: dict[str, Any]) -> str:
     if not pack:
         return ""
-    return json.dumps(pack, ensure_ascii=False, default=str)
+    try:
+        values = fact_support_values(pack)
+    except EvidenceValidationError:
+        return ""
+    return json.dumps(values, ensure_ascii=False, default=str)
 
 
 def _extract_source_fact_markers(text: str) -> list[str]:
@@ -993,6 +999,31 @@ def _analysis_depth(markdown: str, evidence_text: str) -> dict[str, Any]:
     }
 
 
+def _build_ab_quality_coverage(pack: dict[str, Any], report_markdown: str) -> dict[str, Any]:
+    try:
+        view = read_evidence_pack(pack)
+    except EvidenceValidationError:
+        return {"is_report_too_short_by_coverage": False, "validated_ab_only": True}
+    markers: list[str] = []
+    seen: set[str] = set()
+    for item in view.get("evidence_items") or []:
+        if not isinstance(item, dict) or item.get("level") not in {"A", "B"} or not item.get("mandatory"):
+            continue
+        for marker in _extract_source_fact_markers(json.dumps(item.get("value"), ensure_ascii=False, default=str)):
+            compact = _compact_marker(marker)
+            if compact and compact not in seen:
+                seen.add(compact)
+                markers.append(marker)
+    report_text = _compact_marker(_report_visible_text(report_markdown))
+    missing = [marker for marker in markers if _compact_marker(marker) not in report_text]
+    return {
+        "is_report_too_short_by_coverage": bool(missing),
+        "validated_ab_only": True,
+        "validated_marker_count": len(markers),
+        "missing_validated_marker_count": len(missing),
+    }
+
+
 def _issue_text(issue: Any) -> str:
     if isinstance(issue, dict):
         return json.dumps(issue, ensure_ascii=False, default=str)
@@ -1023,8 +1054,13 @@ def _has_quality_blocker(record: dict[str, Any]) -> bool:
 
 def _build_quality_gate(record: dict[str, Any], pack: dict[str, Any], coverage: dict[str, Any]) -> dict[str, Any]:
     markdown = _text(record.get("report_markdown"))
-    has_material_evidence = bool(pack.get("primary_materials") or pack.get("auxiliary_materials"))
+    try:
+        evidence_values = fact_support_values(pack)
+    except EvidenceValidationError:
+        evidence_values = []
+    has_material_evidence = bool(evidence_values)
     if not has_material_evidence:
+        has_report = bool(markdown.strip())
         return {
             "source_fidelity_score": 100,
             "unsupported_fact_count": 0,
@@ -1032,10 +1068,20 @@ def _build_quality_gate(record: dict[str, Any], pack: dict[str, Any], coverage: 
             "summary_only_risk": False,
             "evidence_backed_analysis_count": 0,
             "analysis_sentence_count": 0,
-            "deliverable_status": "failed" if str(record.get("status") or "").lower() == "failed" or not markdown.strip() else "deliverable",
-            "blocking_issues": [],
+            "deliverable_status": "failed" if str(record.get("status") or "").lower() == "failed" or not has_report else "needs_manual_review",
+            "blocking_issues": (
+                [
+                    {
+                        "code": "LOCAL_QUALITY_GATE_FAILED",
+                        "level": "error",
+                        "message": "No validated A/B evidence is available for automatic delivery.",
+                    }
+                ]
+                if has_report
+                else []
+            ),
         }
-    evidence_text = _pack_evidence_text(pack)
+    evidence_text = json.dumps(evidence_values, ensure_ascii=False, default=str)
     blocking_issues: list[dict[str, Any]] = []
     source_issues = _source_fidelity_issues(_report_visible_text(markdown), evidence_text)
     blocking_issues.extend(source_issues)
@@ -1107,7 +1153,11 @@ def build_run_diagnostics(record: dict[str, Any], pack: dict[str, Any] | None = 
     versions = _version_items(record, report_chars)
     first_version_chars = next((int(item.get("chars") or 0) for item in versions if int(item.get("version") or 0) == 1), 0)
     coverage = _build_report_coverage(record, pack or {}, pack_diag, report_chars)
-    quality_gate = _build_quality_gate(record, pack or {}, coverage)
+    quality_gate = _build_quality_gate(
+        record,
+        pack or {},
+        _build_ab_quality_coverage(pack or {}, markdown),
+    )
 
     diagnosis = [item for item in pack_diag.get("diagnosis", []) if item.get("code") != "OK"]
     evidence_level = pack_diag["estimated_evidence_level"]

@@ -199,6 +199,15 @@ class GenerationPipelineTests(unittest.TestCase):
         self.assertNotIn("以上内容需复核", saved["report_markdown"])
         self.assertTrue(saved["formal_body_present"])
         self.assertTrue(saved["body_safety_passed"])
+        layers = saved["failure_attribution"]["layers"]
+        self.assertEqual("skipped", layers["attachment_parse"]["status"])
+        self.assertEqual("ok", layers["compact"]["status"])
+        self.assertEqual("ok", layers["provider"]["status"])
+        self.assertIn(layers["cleanup"]["status"], {"ok", "blocked"})
+        self.assertIn(layers["quality_gate"]["status"], {"ok", "blocked"})
+        for layer in ("compact", "provider", "cleanup", "quality_gate"):
+            self.assertIsNotNone(layers[layer]["input_artifact"])
+            self.assertIsNotNone(layers[layer]["output_artifact"])
         fake_generator.generate.assert_called_once()
 
 

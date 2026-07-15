@@ -2164,6 +2164,8 @@ class RecordsApiTests(unittest.TestCase):
         pack = {
             "primary_materials": [
                 {
+                    "menu_code": "project_notice",
+                    "articleid": "diagnostics-source-fidelity-1",
                     "title": "天津市执行医用耗材集采结果的通知",
                     "content_text": "天津市医保局明确自2026年6月1日起执行医用耗材集采结果，企业需关注产品范围和执行时间。",
                     "summary": "天津市执行医用耗材集采结果。",
@@ -2197,6 +2199,8 @@ class RecordsApiTests(unittest.TestCase):
         pack = {
             "primary_materials": [
                 {
+                    "menu_code": "project_notice",
+                    "articleid": "diagnostics-summary-only-1",
                     "title": "河南调整医用耗材申报挂网操作流程的通知",
                     "content_text": "河南省调整医用耗材申报挂网操作流程，企业通过联审通办提交申报。",
                     "summary": "调整申报挂网操作流程。",
@@ -2227,6 +2231,8 @@ class RecordsApiTests(unittest.TestCase):
         pack = {
             "primary_materials": [
                 {
+                    "menu_code": "project_notice",
+                    "articleid": "diagnostics-evidence-1",
                     "title": "天津市执行医用耗材集采结果的通知",
                     "content_text": "天津市医保局明确自2026年6月1日起执行医用耗材集采结果，企业需关注产品范围和执行时间。",
                     "summary": "天津市执行医用耗材集采结果。",
@@ -2392,16 +2398,17 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(saved["status"], "needs_manual_review")
         self.assertTrue(saved["success"])
         self.assertGreater(len(saved["report_markdown"]), 300)
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertIn("Q_DIFY_CALL_FAILED_FALLBACK", {item["issue_id"] for item in saved["remaining_issues"]})
         self.assertEqual(saved["run_status"], "needs_manual_review")
         self.assertFalse(saved["deliverable"])
         self.assertTrue(saved["word_export_available"])
         self.assertTrue(saved["draft_word_export_available"])
         self.assertFalse(saved["final_word_export_available"])
-        self.assertEqual(saved["primary_failure_code"], "DIFY_TIMEOUT")
-        self.assertIn("DIFY_TIMEOUT", saved["generation_failure_codes"])
-        self.assertIn("FALLBACK_REPORT_USED", saved["secondary_failure_codes"])
+        self.assertEqual(saved["primary_failure_code"], "TIMEOUT")
+        self.assertIn("TIMEOUT", saved["generation_failure_codes"])
+        self.assertNotIn("FALLBACK_REPORT_USED", saved["secondary_failure_codes"])
+        self.assertIn("FALLBACK_REPORT_USED", saved["blocking_issue_codes"])
         self.assertTrue(saved["fallback_used"])
         self.assertEqual(saved["fallback_provider"], "backend_pack_fallback")
 
@@ -2471,7 +2478,7 @@ class RecordsApiTests(unittest.TestCase):
                 saved = main_module._read_analysis_run("run_watchdog123")
 
         self.assertEqual(saved["status"], "needs_manual_review")
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertNotEqual(saved["workflow_run_id"], "late-workflow")
         self.assertGreater(len(saved["report_markdown"]), 300)
 
@@ -2540,7 +2547,7 @@ class RecordsApiTests(unittest.TestCase):
                 saved = main_module._read_analysis_run("run_full_watchdog123")
 
         self.assertEqual(saved["status"], "needs_manual_review")
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertNotEqual(saved["workflow_run_id"], "late-full-workflow")
         self.assertGreater(len(saved["report_markdown"]), 300)
 
@@ -2604,7 +2611,7 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "needs_manual_review")
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertGreater(len(saved["report_markdown"]), 300)
 
     def test_call_dify_workflow_retries_timeout_before_success(self) -> None:
@@ -2914,7 +2921,7 @@ class RecordsApiTests(unittest.TestCase):
             with self.assertRaises(main_module.DifyWorkflowError) as caught:
                 main_module._call_dify_workflow("pack_staged123", "run_staged123", {"input_strategy": "staged_generation"})
 
-        self.assertEqual(caught.exception.code, "DIFY_TIMEOUT")
+        self.assertEqual(caught.exception.code, "TIMEOUT")
         self.assertEqual(calls["count"], 1)
         self.assertEqual(calls["timeouts"], [300])
 
@@ -2954,7 +2961,7 @@ class RecordsApiTests(unittest.TestCase):
             with self.assertRaises(main_module.DifyWorkflowError) as caught:
                 main_module._call_dify_workflow("pack_blocking123", "run_blocking123", {"input_strategy": "staged_generation"})
 
-        self.assertEqual(caught.exception.code, "DIFY_TIMEOUT")
+        self.assertEqual(caught.exception.code, "TIMEOUT")
         self.assertEqual(calls["count"], 1)
         self.assertLess(time.perf_counter() - started, 1.8)
 
@@ -2964,13 +2971,15 @@ class RecordsApiTests(unittest.TestCase):
             [
                 "# Report title",
                 "## 导语",
-                "This report is a complete mocked report used to verify that a normal Dify response is persisted without fallback repair.",
+                "This report is a complete mocked report used to verify that a normal provider response is persisted without fallback repair.",
                 "## 一、Core Findings",
                 "The selected material contains enough structured content for a normal report body. "
                 "This paragraph intentionally has enough length and report structure so the fragment guard does not treat it as a partial revision output.",
                 "## 二、Analysis",
                 "The generated report includes a stable title, multiple sections, and a readable body. "
                 "It should remain finished because this test is checking persistence of a valid workflow response.",
+                "## 企业影响分析",
+                "企业需要关注执行时间和产品范围，建议按采购规则评估风险。",
             ]
         )
 
@@ -2987,10 +2996,23 @@ class RecordsApiTests(unittest.TestCase):
                 "remaining_issues": [],
             }
 
+        evidence_pack = {
+            "pack_id": "pack_20260612_abcdef1234",
+            "primary_materials": [
+                {
+                    "menu_code": "project_notice",
+                    "articleid": "normal-dify-run-1",
+                    "title": "Report title",
+                    "content_text": report_markdown,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(
             main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True
         ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_20260612_abcdef1234"}, create=True
+            main_module, "_read_database_evidence_pack", return_value=evidence_pack, create=True
         ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
             response = self.client.post("/analysis/run", json={"pack_id": "pack_20260612_abcdef1234"})
 
@@ -3222,17 +3244,36 @@ class RecordsApiTests(unittest.TestCase):
                 "workflow_run_id": "wf-memory-truncated",
                 "status": "finished",
                 "report_title": "Truncated memory report",
-                "report_markdown": "# Truncated memory report\n\n## 导语\n\nReport body with enough structure and length. " * 8,
+                "report_markdown": (
+                    "# Truncated memory report\n\n## 导语\n\nReport body with enough structure and length. " * 8
+                    + "\n\n## 企业影响分析\n\n企业需要关注执行时间和产品范围，建议按采购规则评估风险。"
+                ),
                 "version": 1,
                 "quality_check": {"passed": True, "issues": []},
                 "generation_warnings": [],
                 "remaining_issues": [],
             }
 
+        evidence_pack = {
+            "pack_id": "pack_memory_long",
+            "primary_materials": [
+                {
+                    "menu_code": "project_notice",
+                    "articleid": "memory-long-1",
+                    "title": "Truncated memory report",
+                    "content_text": (
+                        "Report body with enough structure and length. " * 8
+                        + " 企业需要关注执行时间和产品范围，建议按采购规则评估风险。"
+                    ),
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(
             main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
         ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_memory_long"}, create=True
+            main_module, "_read_database_evidence_pack", return_value=evidence_pack, create=True
         ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True), patch.dict(
             main_module.os.environ, {"MEMORY_DIR": str(main_module.Path(tmpdir) / "memory"), "REPORT_MEMORY_MAX_CHARS": "15000"}, clear=False
         ):
@@ -3725,7 +3766,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("## 导语", repaired["report_markdown"])
         self.assertEqual(repaired["remaining_issues"][0]["issue_id"], "Q_DIFY_FRAGMENTARY_REPORT")
 
-    def test_dify_success_without_report_markdown_can_be_repaired(self) -> None:
+    def test_dify_success_without_report_markdown_fails_provider_validation(self) -> None:
         raw = {
             "workflow_run_id": "wf-missing-report",
             "data": {
@@ -3737,13 +3778,11 @@ class RecordsApiTests(unittest.TestCase):
             },
         }
 
-        result = main_module._normalize_dify_result(raw, "pack_missing_report")
+        with self.assertRaises(main_module.DifyWorkflowError) as caught:
+            main_module._normalize_dify_result(raw, "pack_missing_report")
 
-        self.assertEqual(result["workflow_run_id"], "wf-missing-report")
-        self.assertEqual(result["pack_id"], "pack_missing_report")
-        self.assertEqual(result["report_markdown"], "")
-        self.assertEqual(result["quality_check"]["passed"], False)
-        self.assertEqual(result["remaining_issues"], [])
+        self.assertEqual(caught.exception.code, "OUTPUT_SCHEMA_INVALID")
+        self.assertEqual("provider", caught.exception.provider_stage["layer"])
 
     def test_fragmentary_dify_revision_gets_fallback_from_attachment_rich_pack(self) -> None:
         pack = {
@@ -3964,7 +4003,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertTrue(status_body["success"])
         self.assertEqual(status_body["status"], "needs_manual_review")
         self.assertEqual(status_body["error_message"], "Dify API 配置不完整")
-        self.assertEqual(status_body["dify_error_code"], "DIFY_NOT_CONFIGURED")
+        self.assertEqual(status_body["dify_error_code"], "HTTP_ERROR")
         self.assertEqual(report_response.status_code, 200)
         self.assertGreater(len(report_response.json()["report_markdown"]), 100)
 

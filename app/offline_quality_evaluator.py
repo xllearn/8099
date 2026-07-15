@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.diagnostics import build_run_diagnostics
+from app.evidence_schema import EVIDENCE_SCHEMA_VERSION
 from app.formal_body import FormalBodyDocument
 from app.formal_body_safety import FORBIDDEN_PHRASES, scan_docx, scan_formal_body
+from app.layered_diagnostics import FAILURE_SCHEMA_VERSION
 from app.regression_manifest import (
     MANIFEST_CONTRACT_MAX_BYTES,
     manifest_sha256 as compute_manifest_sha256,
@@ -22,7 +24,7 @@ from app.regression_manifest import (
 ARTIFACT_SCHEMA_VERSION = "8099.fixed-regression/v2"
 EVALUATION_SCHEMA_VERSION = "8099.regression-evaluation/v1"
 BASELINE_SCHEMA_VERSION = "8099.regression-baseline/v2"
-EVALUATOR_VERSION = "1.4.1"
+EVALUATOR_VERSION = "1.5.0"
 UNSUPPORTED_EVAL_VERSION = "1"
 BASELINE_ENVIRONMENT = "server_test"
 BASELINE_COVERAGE_MODES = ("full", "fixed3_only")
@@ -65,6 +67,8 @@ CONSISTENCY_FIELDS = (
     "provider",
     "workflow_run_id",
     "compact_pack_chars",
+    "failure_schema_version",
+    "primary_layer",
     "primary_failure_code",
     "word_export_available",
     "draft_word_export_available",
@@ -88,6 +92,8 @@ EVALUATOR_RULES = {
     "diagnostics_source_sha256": DIAGNOSTICS_SOURCE_SHA256,
     "manifest_contract_max_bytes": MANIFEST_CONTRACT_MAX_BYTES,
     "sample_material_binding_required": True,
+    "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
+    "failure_schema_version": FAILURE_SCHEMA_VERSION,
 }
 EVALUATOR_RULES_SHA256 = hashlib.sha256(
     json.dumps(

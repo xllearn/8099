@@ -33,6 +33,8 @@ class OfflineQualityEvaluatorTests(unittest.TestCase):
             "workflow_run_id": f"workflow-{case_id}",
             "provider_run_id": f"workflow-{case_id}",
             "compact_pack_chars": 78000,
+            "failure_schema_version": "8099.failure-attribution/v1",
+            "primary_layer": "" if deliverable else "quality_gate",
             "input_strategy": "light_compact",
             "evidence_pack_sha256": "b" * 64,
             "timings": {
@@ -427,6 +429,8 @@ class OfflineQualityEvaluatorTests(unittest.TestCase):
             "workflow_run_id": "workflow-case-1",
             "provider_run_id": "workflow-case-1",
             "compact_pack_chars": 78000,
+            "failure_schema_version": "8099.failure-attribution/v1",
+            "primary_layer": "quality_gate",
             "input_strategy": "light_compact",
             "quality_passed": False,
             "quality_check": {"passed": False, "issues": []},
