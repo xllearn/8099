@@ -76,7 +76,9 @@ def _parse_timestamp(value: Any) -> datetime | None:
 
 def _duration_ms(record: Mapping[str, Any], status: str) -> int:
     if "duration_ms" in record:
-        return _safe_int(record.get("duration_ms"))
+        explicit = _safe_int(record.get("duration_ms"))
+        if explicit > 0:
+            return explicit
     timings = record.get("timings") if isinstance(record.get("timings"), dict) else {}
     for key in ("total_ms", "elapsed_ms", "analysis_ms", "generation_ms"):
         value = _safe_int(timings.get(key))
@@ -88,6 +90,15 @@ def _duration_ms(record: Mapping[str, Any], status: str) -> int:
         if started and ended and ended >= started:
             return int((ended - started).total_seconds() * 1000)
     return 0
+
+
+def _repair_stored_duration(item: Mapping[str, Any]) -> dict[str, Any]:
+    repaired = copy.deepcopy(dict(item))
+    repaired["duration_ms"] = _duration_ms(
+        repaired,
+        _text(repaired.get("status") or repaired.get("run_status")),
+    )
+    return repaired
 
 
 def _worker_count_from_environment(environ: Mapping[str, str]) -> int:
@@ -763,7 +774,7 @@ class AnalysisHistoryStore:
             paths.append(self.events_path)
         events = self._read_events_unlocked(paths)
         runs = {
-            _text(run_id): copy.deepcopy(item)
+            _text(run_id): _repair_stored_duration(item)
             for run_id, item in (base_runs or {}).items()
             if _text(run_id) and isinstance(item, dict)
         }
@@ -779,7 +790,7 @@ class AnalysisHistoryStore:
             current_revision = _safe_int(current.get("revision") if isinstance(current, dict) else 0)
             event_revision = _safe_int(event.get("revision"))
             if event_revision >= current_revision:
-                runs[run_id] = copy.deepcopy(item)
+                runs[run_id] = _repair_stored_duration(item)
         active_events = 0
         if self.events_path.exists():
             active_events = len(self._read_events_unlocked([self.events_path]))

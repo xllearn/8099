@@ -155,6 +155,7 @@ class AnalysisHistoryTests(unittest.TestCase):
         self.assertEqual((first["revision"], second["revision"]), (1, 2))
         self.assertEqual([event["revision"] for event in events], [1, 2])
         self.assertEqual(len({event["event_id"] for event in events}), 2)
+        self.assertEqual(second["duration_ms"], 90000)
 
     def test_32_threads_do_not_lose_events_or_duplicate_event_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -269,6 +270,29 @@ class AnalysisHistoryTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertEqual(first["revision"], 2)
         self.assertEqual(first["status"], "finished")
+        self.assertEqual(first["duration_ms"], 90000)
+
+    def test_index_rebuild_repairs_legacy_zero_terminal_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = self.make_store(Path(tmpdir) / "history")
+            store.record_run(history_record("run_legacyduration", status="finished"))
+            events = store.read_events()
+            events[0]["item"]["duration_ms"] = 0
+            store.events_path.write_text(
+                "\n".join(
+                    json.dumps(event, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+                    for event in events
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            store.index_path.unlink()
+
+            store.rebuild_index_from_events()
+            item = store.get_run("run_legacyduration")
+
+        self.assertIsNotNone(item)
+        self.assertEqual(item["duration_ms"], 90000)
 
     def test_rebuild_cli_uses_run_json_and_pack_identity(self) -> None:
         self.history_module()
