@@ -67,6 +67,33 @@ class FixedRegressionRunnerTests(unittest.TestCase):
             runner._read_analysis_state(client, "run-1"),
         )
 
+    def test_run_diagnostics_retries_transport_timeout_with_slow_endpoint_budget(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        class DiagnosticsClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.timeouts: list[int] = []
+
+            def request(self, method: str, path: str, **kwargs):
+                self.calls += 1
+                self.timeouts.append(kwargs["timeout"])
+                if self.calls == 1:
+                    raise httpx.ReadTimeout("timed out")
+                return httpx.Response(
+                    200,
+                    json={"success": True, "diagnostics": {}},
+                    request=httpx.Request(method, f"http://test{path}"),
+                )
+
+        client = DiagnosticsClient()
+
+        result = runner._read_run_diagnostics(client, "run-1")
+
+        self.assertEqual({"success": True, "diagnostics": {}}, result)
+        self.assertEqual(2, client.calls)
+        self.assertEqual([300, 300], client.timeouts)
+
     def test_fixed3_manifest_contains_only_expected_project_notices(self) -> None:
         from scripts import run_fixed_regression as runner
 

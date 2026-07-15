@@ -385,6 +385,20 @@ def _read_analysis_state(
     return _require_success(response, "analysis status")
 
 
+def _read_run_diagnostics(
+    client: httpx.Client, run_id: str
+) -> dict[str, Any]:
+    return _require_success(
+        _request_with_transport_retry(
+            client,
+            "GET",
+            f"/analysis/runs/{run_id}/diagnostics",
+            timeout=300,
+        ),
+        "analysis diagnostics",
+    )
+
+
 def _write_json_snapshot(
     root: Path, relative_path: Path, value: Mapping[str, Any] | list[Any]
 ) -> dict[str, str]:
@@ -697,10 +711,7 @@ def run_case(
         client.get(f"/analysis/runs/{run_id}/report", timeout=120),
         "analysis report",
     )
-    diagnostics = _require_success(
-        client.get(f"/analysis/runs/{run_id}/diagnostics", timeout=120),
-        "analysis diagnostics",
-    )
+    diagnostics = _read_run_diagnostics(client, run_id)
     snapshots["run"] = _write_json_snapshot(
         output_root, sample_relative / "run.json", state
     )
