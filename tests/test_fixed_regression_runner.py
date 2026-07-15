@@ -3,11 +3,38 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import httpx
+
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "8099_regression_cases.json"
 
 
 class FixedRegressionRunnerTests(unittest.TestCase):
+    def test_analysis_status_read_timeout_is_retryable(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        class StatusClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get(self, path: str, timeout: int):
+                self.calls += 1
+                if self.calls == 1:
+                    raise httpx.ReadTimeout("timed out")
+                return httpx.Response(
+                    200,
+                    json={"status": "finished"},
+                    request=httpx.Request("GET", f"http://test{path}"),
+                )
+
+        client = StatusClient()
+
+        self.assertIsNone(runner._read_analysis_state(client, "run-1"))
+        self.assertEqual(
+            {"status": "finished"},
+            runner._read_analysis_state(client, "run-1"),
+        )
+
     def test_fixed3_manifest_contains_only_expected_project_notices(self) -> None:
         from scripts import run_fixed_regression as runner
 

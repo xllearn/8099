@@ -410,6 +410,39 @@ class RegressionManifestTests(unittest.TestCase):
 
         self.assertNotEqual(first["content_sha256"], second["content_sha256"])
 
+    def test_runner_retries_transient_attachment_download_timeout(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        calls = 0
+        client_type = httpx.Client
+
+        def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadTimeout("timed out", request=request)
+            return httpx.Response(
+                200,
+                content=b"recovered attachment bytes",
+                headers={"content-type": "application/octet-stream"},
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+
+        def build_client(**kwargs):
+            return client_type(transport=transport, follow_redirects=True)
+
+        with patch.object(runner.httpx, "Client", side_effect=build_client), patch.object(
+            runner.time, "sleep"
+        ):
+            receipt = runner._attachment_content_hash(
+                {"articleattid": "transient-att", "filename": "notice.xlsx"}
+            )
+
+        self.assertEqual(2, calls)
+        self.assertEqual("raw_bytes", receipt["content_hash_source"])
+
     def test_runner_attachment_receipt_contains_no_raw_bytes_or_base64(self) -> None:
         from scripts import run_fixed_regression as runner
 

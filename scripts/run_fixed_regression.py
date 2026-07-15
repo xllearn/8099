@@ -48,6 +48,7 @@ from app.regression_manifest import (  # noqa: E402
 
 DEFAULT_MANIFEST = ROOT / "tests" / "fixtures" / "8099_regression_cases.json"
 TERMINAL_STATUSES = {"finished", "failed", "needs_manual_review"}
+ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
 WORD_FLAGS = (
     "word_export_available",
     "draft_word_export_available",
@@ -123,34 +124,44 @@ def _attachment_content_hash(attachment: Mapping[str, Any]) -> dict[str, Any]:
     except ValueError:
         max_download_mb = 50.0
     max_download_bytes = max(1, int(max_download_mb * 1024 * 1024))
-    try:
-        digest = hashlib.sha256()
-        content_length = 0
-        with httpx.Client(
-            timeout=timeout,
-            follow_redirects=True,
-            headers=headers,
-            trust_env=False,
-        ) as client:
-            with client.stream("GET", url) as response:
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "").lower()
-                if "text/html" in content_type:
-                    raise ValueError("attachment endpoint returned HTML")
-                for chunk in response.iter_bytes():
-                    digest.update(chunk)
-                    content_length += len(chunk)
-                    if content_length > max_download_bytes:
-                        raise ValueError("attachment exceeds configured download limit")
-        if content_length <= 0:
-            raise ValueError("attachment endpoint returned empty content")
-        result = {
-            "content_sha256": digest.hexdigest(),
-            "content_hash_source": "raw_bytes",
-            "content_length": content_length,
-            "verifier": "stream_sha256_v1",
-        }
-    except (httpx.HTTPError, OSError, ValueError):
+    result: dict[str, Any] | None = None
+    for attempt in range(ATTACHMENT_DOWNLOAD_ATTEMPTS):
+        try:
+            digest = hashlib.sha256()
+            content_length = 0
+            with httpx.Client(
+                timeout=timeout,
+                follow_redirects=True,
+                headers=headers,
+                trust_env=False,
+            ) as client:
+                with client.stream("GET", url) as response:
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").lower()
+                    if "text/html" in content_type:
+                        raise ValueError("attachment endpoint returned HTML")
+                    for chunk in response.iter_bytes():
+                        digest.update(chunk)
+                        content_length += len(chunk)
+                        if content_length > max_download_bytes:
+                            raise ValueError("attachment exceeds configured download limit")
+            if content_length <= 0:
+                raise ValueError("attachment endpoint returned empty content")
+            result = {
+                "content_sha256": digest.hexdigest(),
+                "content_hash_source": "raw_bytes",
+                "content_length": content_length,
+                "verifier": "stream_sha256_v1",
+            }
+            break
+        except (httpx.HTTPError, OSError):
+            if attempt + 1 < ATTACHMENT_DOWNLOAD_ATTEMPTS:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            break
+        except ValueError:
+            break
+    if result is None:
         result = _text_only_attachment_hash(attachment)
     return dict(result)
 
@@ -345,6 +356,16 @@ def _require_success(response: httpx.Response, operation: str) -> dict[str, Any]
     if body.get("success") is False:
         raise ValueError(f"{operation} returned success=false: {body}")
     return body
+
+
+def _read_analysis_state(
+    client: httpx.Client, run_id: str
+) -> dict[str, Any] | None:
+    try:
+        response = client.get(f"/analysis/runs/{run_id}", timeout=60)
+    except httpx.TimeoutException:
+        return None
+    return _require_success(response, "analysis status")
 
 
 def _write_json_snapshot(
@@ -637,7 +658,10 @@ def run_case(
     deadline = time.monotonic() + timeout_seconds
     state: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        state = _require_success(client.get(f"/analysis/runs/{run_id}", timeout=60), "analysis status")
+        observed_state = _read_analysis_state(client, run_id)
+        if observed_state is None:
+            continue
+        state = observed_state
         if str(state.get("status") or state.get("run_status") or "") in TERMINAL_STATUSES:
             break
         time.sleep(poll_seconds)
