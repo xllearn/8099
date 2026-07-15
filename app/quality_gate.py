@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import os
 from typing import Any, Protocol
 
 from app.diagnostics import build_run_diagnostics
+from app.evidence_index import EvidenceIndexError, build_claim_evidence_index
 from app.formal_body import FormalBodyDocument
 from app.formal_body_safety import scan_formal_body
 from app.generation.base import ReportGenerationResult
@@ -12,6 +14,30 @@ from app.generation.base import ReportGenerationResult
 class QualityGateComponent(Protocol):
     def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
         ...
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = (os.getenv(name) or "").strip().lower()
+    return default if not value else value in {"1", "true", "yes", "on"}
+
+
+@dataclass
+class ClaimEvidenceIndexComponent:
+    def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
+        if not _env_bool("ENABLE_EVIDENCE_INDEX", False):
+            return result
+        metadata = dict(result.metadata)
+        try:
+            index = build_claim_evidence_index(
+                FormalBodyDocument(markdown=result.report_markdown, report_ir=result.report_ir),
+                pack,
+            )
+            metadata["claim_evidence_index"] = index
+            metadata["claim_index_error"] = ""
+        except EvidenceIndexError:
+            metadata["claim_evidence_index"] = None
+            metadata["claim_index_error"] = "EVIDENCE_INDEX_INVALID"
+        return dataclass_replace(result, metadata=metadata)
 
 
 @dataclass
@@ -120,7 +146,15 @@ class ExportGate:
 
 @dataclass
 class QualityGate:
-    components: list[QualityGateComponent] = field(default_factory=lambda: [LocalEvidenceGate(), ForbiddenPhraseGate(), StructureGate(), ExportGate()])
+    components: list[QualityGateComponent] = field(
+        default_factory=lambda: [
+            ClaimEvidenceIndexComponent(),
+            LocalEvidenceGate(),
+            ForbiddenPhraseGate(),
+            StructureGate(),
+            ExportGate(),
+        ]
+    )
 
     def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
         current = result

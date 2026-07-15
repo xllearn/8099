@@ -27,6 +27,8 @@ class VbpTopicRulesTests(unittest.TestCase):
         for name in (
             "ENABLE_VBP_FACT_EXTRACTION",
             "ENABLE_VBP_COMPACT_PRESERVATION",
+            "ENABLE_VBP_REPORT_RULES",
+            "ENABLE_EVIDENCE_INDEX",
         ):
             self.assertIn(f"{name}=false", env_example)
             self.assertIn(f"{name}: ${{{name}:-false}}", compose)
@@ -36,7 +38,15 @@ class VbpTopicRulesTests(unittest.TestCase):
 
         rules = load_vbp_topic_rules()
 
-        self.assertEqual(rules["version"], "2026-07-15-s1c-v1")
+        self.assertEqual(rules["version"], "2026-07-15-s2-v1")
+        self.assertEqual(rules["report_structure"]["version"], "vbp-report-structure-v1")
+        required_section_ids = {
+            item["section_id"] for item in rules["report_structure"]["required_sections"]
+        }
+        self.assertEqual(
+            {"overview", "core_rules", "actions", "impact_and_risk", "recommendations"},
+            required_section_ids,
+        )
         self.assertIn("项目公告", rules["trigger"]["menu_names"])
         topic_ids = {topic["topic_id"] for topic in rules["topics"]}
         self.assertEqual(
@@ -82,6 +92,29 @@ class VbpTopicRulesTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(VbpTopicRulesError, "presentation"):
+            validate_vbp_topic_rules(rules)
+
+    def test_vbp_rule_validation_rejects_invalid_report_structure(self) -> None:
+        from app.report_rules.schema import VbpTopicRulesError, validate_vbp_topic_rules
+
+        rules = {
+            "version": "test",
+            "trigger": {"menu_names": ["项目公告"], "title_keywords": [], "category_keywords": []},
+            "topics": [
+                {
+                    "topic_id": "quote_rules",
+                    "labels": ["报价要求"],
+                    "presentation": "dedicated_section",
+                    "failure_code": "VBP_PRICE_RULE_MISSING",
+                }
+            ],
+            "report_structure": {
+                "version": "structure-v1",
+                "required_sections": [{"section_id": "overview", "labels": []}],
+            },
+        }
+
+        with self.assertRaisesRegex(VbpTopicRulesError, "required_sections.*labels"):
             validate_vbp_topic_rules(rules)
 
     def test_vbp_rule_loading_respects_feature_flag(self) -> None:

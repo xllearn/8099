@@ -71,6 +71,25 @@ def validate_vbp_topic_rules(rules: dict[str, Any]) -> dict[str, Any]:
 
     _require_string_list(rules.get("forbidden_phrases", []), "forbidden_phrases")
     _require_string_list(rules.get("raw_object_patterns", []), "raw_object_patterns")
+
+    report_structure = rules.get("report_structure")
+    if not isinstance(report_structure, dict):
+        raise VbpTopicRulesError("report_structure must be a mapping")
+    _require_non_empty_string(report_structure.get("version"), "report_structure.version")
+    required_sections = report_structure.get("required_sections")
+    if not isinstance(required_sections, list) or not required_sections:
+        raise VbpTopicRulesError("report_structure.required_sections must be a non-empty list")
+    seen_section_ids: set[str] = set()
+    for index, section in enumerate(required_sections):
+        prefix = f"report_structure.required_sections[{index}]"
+        if not isinstance(section, dict):
+            raise VbpTopicRulesError(f"{prefix} must be a mapping")
+        _require_non_empty_string(section.get("section_id"), f"{prefix}.section_id")
+        _require_string_list(section.get("labels"), f"{prefix}.labels", allow_empty=False)
+        section_id = str(section["section_id"]).strip()
+        if section_id in seen_section_ids:
+            raise VbpTopicRulesError(f"{prefix}.section_id is duplicated: {section_id}")
+        seen_section_ids.add(section_id)
     return rules
 
 

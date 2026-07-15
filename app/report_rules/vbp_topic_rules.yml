@@ -1,4 +1,4 @@
-version: "2026-07-15-s1c-v1"
+version: "2026-07-15-s2-v1"
 
 trigger:
   menu_names: ["项目公告"]
@@ -72,3 +72,17 @@ raw_object_patterns:
   - "\"name\":"
   - "'value':"
   - "\"value\":"
+
+report_structure:
+  version: "vbp-report-structure-v1"
+  required_sections:
+    - section_id: overview
+      labels: ["公告要点", "项目概况", "导语", "核心结论"]
+    - section_id: core_rules
+      labels: ["核心规则", "采购品种", "产品范围", "报价要求", "价格机制"]
+    - section_id: actions
+      labels: ["时间节点", "操作步骤", "申报操作", "执行安排"]
+    - section_id: impact_and_risk
+      labels: ["企业影响", "风险提示", "执行关注"]
+    - section_id: recommendations
+      labels: ["企业操作建议", "操作建议", "企业建议"]
