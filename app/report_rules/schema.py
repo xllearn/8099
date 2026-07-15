@@ -58,6 +58,8 @@ def validate_vbp_topic_rules(rules: dict[str, Any]) -> dict[str, Any]:
             raise VbpTopicRulesError(f"{prefix} must be a mapping")
         for field in ("topic_id", "presentation", "failure_code"):
             _require_non_empty_string(topic.get(field), f"{prefix}.{field}")
+        if topic.get("fact_type") is not None:
+            _require_non_empty_string(topic.get("fact_type"), f"{prefix}.fact_type")
         _require_string_list(topic.get("labels", []), f"{prefix}.labels")
         presentation = str(topic["presentation"]).strip()
         if presentation not in ALLOWED_PRESENTATIONS:

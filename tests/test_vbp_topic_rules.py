@@ -24,13 +24,19 @@ class VbpTopicRulesTests(unittest.TestCase):
         ):
             self.assertIn(f"{name}=true", env_example)
             self.assertIn(f"{name}: ${{{name}:-true}}", compose)
+        for name in (
+            "ENABLE_VBP_FACT_EXTRACTION",
+            "ENABLE_VBP_COMPACT_PRESERVATION",
+        ):
+            self.assertIn(f"{name}=false", env_example)
+            self.assertIn(f"{name}: ${{{name}:-false}}", compose)
 
     def test_default_vbp_rules_file_loads_and_validates(self) -> None:
         from app.report_rules.schema import load_vbp_topic_rules
 
         rules = load_vbp_topic_rules()
 
-        self.assertEqual(rules["version"], "2026-07-09-p0.2-b")
+        self.assertEqual(rules["version"], "2026-07-15-s1c-v1")
         self.assertIn("项目公告", rules["trigger"]["menu_names"])
         topic_ids = {topic["topic_id"] for topic in rules["topics"]}
         self.assertEqual(
@@ -45,6 +51,7 @@ class VbpTopicRulesTests(unittest.TestCase):
             },
             topic_ids,
         )
+        self.assertEqual(topic_ids, {topic["fact_type"] for topic in rules["topics"]})
 
     def test_vbp_rule_validation_rejects_missing_required_topic_fields(self) -> None:
         from app.report_rules.schema import VbpTopicRulesError, validate_vbp_topic_rules

@@ -529,6 +529,165 @@ class PdfTableParserTests(unittest.TestCase):
             enabled = cache_key(base)
         self.assertNotEqual(disabled, enabled)
 
+    def test_cache_key_changes_with_pdf_table_evidence_cell_budget(self):
+        base = {"articleattid": "att-1", "filename": "table.pdf", "filesize": 10, "uploadtime": "t"}
+        with patch.dict(os.environ, {"ENABLE_VBP_COMPACT_PRESERVATION": "true", "ATTACHMENT_PDF_EVIDENCE_MAX_CELLS": "100"}, clear=False):
+            small = cache_key(base)
+        with patch.dict(os.environ, {"ENABLE_VBP_COMPACT_PRESERVATION": "true", "ATTACHMENT_PDF_EVIDENCE_MAX_CELLS": "1000"}, clear=False):
+            large = cache_key(base)
+        self.assertNotEqual(small, large)
+
+    def test_cache_key_ignores_pdf_evidence_budget_when_preservation_is_disabled(self):
+        base = {"articleattid": "att-1", "filename": "table.pdf", "filesize": 10, "uploadtime": "t"}
+        with patch.dict(os.environ, {"ENABLE_VBP_COMPACT_PRESERVATION": "false", "ATTACHMENT_PDF_EVIDENCE_MAX_CELLS": "100"}, clear=False):
+            small = cache_key(base)
+        with patch.dict(os.environ, {"ENABLE_VBP_COMPACT_PRESERVATION": "false", "ATTACHMENT_PDF_EVIDENCE_MAX_CELLS": "1000"}, clear=False):
+            large = cache_key(base)
+        self.assertEqual(small, large)
+
+    def test_pdf_table_evidence_budget_is_deterministic_and_spans_source(self):
+        cells = [
+            {
+                "value": f"cell-{index}",
+                "page_no": 1 if index < 6 else 2,
+                "table_index": 1 if index % 6 < 3 else 2,
+                "row": (index % 3) + 1,
+                "column": 1,
+                "cell_range": f"R{(index % 3) + 1}C1",
+                "quote": f"cell-{index}",
+                "source_hash": hashlib.sha256(b"pdf").hexdigest(),
+                "region": {"x0": 0, "y0": 0, "x1": 10, "y1": 10, "page_width": 100, "page_height": 100},
+                "engine": "pdfplumber",
+            }
+            for index in range(12)
+        ]
+
+        first = main_module._select_pdf_table_evidence_cells(cells, limit=5)
+        second = main_module._select_pdf_table_evidence_cells(cells, limit=5)
+
+        self.assertEqual(first, second)
+        self.assertEqual(5, len(first))
+        self.assertEqual({1, 2}, {item["page_no"] for item in first})
+        self.assertGreaterEqual(len({(item["page_no"], item["table_index"]) for item in first}), 3)
+
+    def test_database_attachment_records_pdf_evidence_budget_diagnostics(self):
+        content = b"pdf-budget-content"
+        cells = [
+            {
+                "value": f"cell-{index}",
+                "page_no": 1 if index < 4 else 2,
+                "table_index": 1,
+                "row": index + 1,
+                "column": 1,
+                "cell_range": f"R{index + 1}C1",
+                "quote": f"cell-{index}",
+                "source_hash": hashlib.sha256(content).hexdigest(),
+                "region": {"x0": 0, "y0": 0, "x1": 10, "y1": 10, "page_width": 100, "page_height": 100},
+                "engine": "pdfplumber",
+            }
+            for index in range(8)
+        ]
+        parsed = {
+            "parse_statuses": ["parsed_text", "parsed_pdf_table_cells", "parsed_summary"],
+            "text_length": 12,
+            "summary": "summary",
+            "key_facts": [],
+            "important_sections": [],
+            "table_summaries": [{"summary": "table summary", "evidence_level": "C"}],
+            "warnings": [],
+            "pdf_table_cells": cells,
+            "pdf_table_pages": [{"page_no": 1, "status": "parsed"}, {"page_no": 2, "status": "parsed"}],
+            "pdf_table_diagnostics": [],
+            "pdf_table_rule_version": "20260715-text-pdf-v1",
+        }
+        attachment = {
+            "menu_code": "project_notice",
+            "articleid": "article-1",
+            "articleattid": "attachment-1",
+            "filename": "large-table.pdf",
+            "fileext": ".pdf",
+            "filesize": len(content),
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "ENABLE_STRUCTURED_PDF_TABLES": "true",
+                "ENABLE_VBP_COMPACT_PRESERVATION": "true",
+                "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ATTACHMENT_PDF_EVIDENCE_MAX_CELLS": "3",
+            },
+            clear=False,
+        ), patch.object(
+            main_module,
+            "fetch_attachment_bytes",
+            return_value=AttachmentDownloadResult("downloaded", "none", content=content),
+        ), patch.object(main_module, "parse_attachment_bytes", return_value=parsed):
+            metadata = main_module._database_attachment_metadata(attachment)
+
+        self.assertEqual(3, len(metadata["evidence_items"]))
+        self.assertEqual(8, metadata["pdf_table_evidence_total_cell_count"])
+        self.assertEqual(3, metadata["pdf_table_evidence_cell_count"])
+        self.assertEqual(5, metadata["pdf_table_evidence_omitted_count"])
+        self.assertIn("PDF_TABLE_EVIDENCE_CELL_LIMIT_REACHED", metadata["warnings"])
+
+    def test_database_attachment_preserves_all_pdf_cells_when_preservation_is_disabled(self):
+        content = b"pdf-budget-disabled"
+        cells = [
+            {
+                "value": f"cell-{index}",
+                "page_no": 1,
+                "table_index": 1,
+                "row": index + 1,
+                "column": 1,
+                "cell_range": f"R{index + 1}C1",
+                "quote": f"cell-{index}",
+                "source_hash": hashlib.sha256(content).hexdigest(),
+                "region": {"x0": 0, "y0": 0, "x1": 10, "y1": 10, "page_width": 100, "page_height": 100},
+                "engine": "pdfplumber",
+            }
+            for index in range(8)
+        ]
+        parsed = {
+            "parse_statuses": ["parsed_text", "parsed_pdf_table_cells", "parsed_summary"],
+            "text_length": 12,
+            "summary": "summary",
+            "key_facts": [],
+            "important_sections": [],
+            "table_summaries": [],
+            "warnings": [],
+            "pdf_table_cells": cells,
+            "pdf_table_pages": [{"page_no": 1, "status": "parsed"}],
+            "pdf_table_diagnostics": [],
+            "pdf_table_rule_version": "20260715-text-pdf-v1",
+        }
+        attachment = {
+            "menu_code": "project_notice",
+            "articleid": "article-1",
+            "articleattid": "attachment-1",
+            "filename": "large-table.pdf",
+            "fileext": ".pdf",
+            "filesize": len(content),
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "ENABLE_STRUCTURED_PDF_TABLES": "true",
+                "ENABLE_VBP_COMPACT_PRESERVATION": "false",
+                "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ATTACHMENT_PDF_EVIDENCE_MAX_CELLS": "3",
+            },
+            clear=False,
+        ), patch.object(
+            main_module,
+            "fetch_attachment_bytes",
+            return_value=AttachmentDownloadResult("downloaded", "none", content=content),
+        ), patch.object(main_module, "parse_attachment_bytes", return_value=parsed):
+            metadata = main_module._database_attachment_metadata(attachment)
+
+        self.assertEqual(8, len(metadata["evidence_items"]))
+        self.assertNotIn("pdf_table_evidence_omitted_count", metadata)
+        self.assertNotIn("PDF_TABLE_EVIDENCE_CELL_LIMIT_REACHED", metadata["warnings"])
+
     def test_page_and_character_caps_produce_explicit_degradation(self):
         pages = [_FakePage(1, "12345", []), _FakePage(2, "67890", [])]
         result = self.extract(pages, max_pages=1, max_chars=3)

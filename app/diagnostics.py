@@ -482,6 +482,11 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
     compression_ratio = None
     if final_dify_input_chars:
         compression_ratio = round(original_pack_chars / final_dify_input_chars, 4)
+    mandatory_retention = (
+        dict(dify_pack.get("mandatory_evidence_retention") or {})
+        if dify_pack
+        else {}
+    )
 
     return {
         "primary_count": len(primary),
@@ -511,6 +516,14 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         "core_attachment_unparsed_names": core_unparsed_names,
         "attachment_analysis_impact": bool(core_unparsed_names),
         "compression_applied": bool(dify_pack.get("compression_applied")) if dify_pack else False,
+        "secondary_compression": bool(dify_pack.get("secondary_compression")) if dify_pack else False,
+        "secondary_compression_tier": str(dify_pack.get("second_pass_tier") or "") if dify_pack else "",
+        "secondary_compression_first_pass_chars": int(dify_pack.get("second_pass_first_pass_chars") or 0) if dify_pack else 0,
+        "mandatory_evidence_total": int(mandatory_retention.get("total") or 0),
+        "mandatory_evidence_retained": int(mandatory_retention.get("retained") or 0),
+        "mandatory_evidence_missing_count": len(list(mandatory_retention.get("missing_ids") or [])),
+        "mandatory_evidence_retention_rate": mandatory_retention.get("rate"),
+        "mandatory_evidence_retention_status": str(mandatory_retention.get("status") or "not_available"),
         "detail_preserved": bool(dify_pack.get("detail_preserved", True)) if dify_pack else True,
         "primary_detail_preserved": bool(dify_pack.get("primary_detail_preserved", True)) if dify_pack else True,
         "core_attachment_detail_preserved": bool(dify_pack.get("core_attachment_detail_preserved", True)) if dify_pack else True,

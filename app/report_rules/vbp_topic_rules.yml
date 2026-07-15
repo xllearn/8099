@@ -1,4 +1,4 @@
-version: "2026-07-09-p0.2-b"
+version: "2026-07-15-s1c-v1"
 
 trigger:
   menu_names: ["项目公告"]
@@ -7,24 +7,28 @@ trigger:
 
 topics:
   - topic_id: procurement_varieties
+    fact_type: procurement_varieties
     labels: ["采购品种", "采购范围", "产品范围"]
     presentation: bullet
     required_when_evidence_present: true
     failure_code: VBP_REQUIRED_TOPIC_MISSING
 
   - topic_id: procurement_cycle
+    fact_type: procurement_cycle
     labels: ["采购周期", "采购期限", "协议期"]
     presentation: bullet
     required_when_evidence_present: true
     failure_code: VBP_REQUIRED_TOPIC_MISSING
 
   - topic_id: alliance_provinces
+    fact_type: alliance_provinces
     labels: ["联盟省份", "联盟地区", "参与省份"]
     presentation: bullet
     required_when_evidence_present: true
     failure_code: VBP_REQUIRED_TOPIC_MISSING
 
   - topic_id: group_price_table
+    fact_type: group_price_table
     labels: ["分组", "分组规则", "最高有效申报价", "报价上限"]
     presentation: table
     required_when_evidence_present: true
@@ -32,18 +36,21 @@ topics:
     failure_code: VBP_CORE_TABLE_MISSING
 
   - topic_id: quote_rules
+    fact_type: quote_rules
     labels: ["报价要求", "报价规则", "申报价", "挂网价", "最低中选价"]
     presentation: dedicated_section
     required_when_evidence_present: true
     failure_code: VBP_PRICE_RULE_MISSING
 
   - topic_id: selection_rules
+    fact_type: selection_rules
     labels: ["拟中选规则", "中选规则", "中选资格"]
     presentation: dedicated_section
     required_when_evidence_present: true
     failure_code: VBP_SELECTION_RULE_MISSING
 
   - topic_id: agreed_purchase_volume
+    fact_type: agreed_purchase_volume
     labels: ["约定采购量", "采购需求量", "待分配量"]
     presentation: dedicated_section
     required_when_evidence_present: true

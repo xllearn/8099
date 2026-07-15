@@ -43,6 +43,14 @@ from app.attachment_cache import cleanup_cache, load_cached_result, store_cached
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
 from app.pdf_table_parser import rule_version as pdf_table_rule_version
+from app.compact_pack import (
+    CompactPolicyError,
+    annotate_secondary_compression,
+    mandatory_evidence_retention,
+    protected_evidence_items,
+    reduce_optional_evidence,
+    secondary_compression_plan,
+)
 from app.analysis_history import (
     AnalysisHistoryStore,
     HistoryTopologyError,
@@ -79,6 +87,7 @@ from app.layered_diagnostics import (
 )
 from app.quality_gate import QualityGate
 from app.repair_pipeline import ForbiddenPhraseRepairer, RepairPipeline, StructureRepairer
+from app.vbp_facts import enrich_vbp_facts, vbp_fact_extraction_enabled
 from app.report_memory import (
     MemoryContentError,
     MemoryKind,
@@ -1595,21 +1604,12 @@ def _compact_material_for_dify(
 
 
 def _second_pass_window(first_pass_chars: int, target_max_chars: int) -> dict[str, Any]:
-    if first_pass_chars <= target_max_chars + 10_000:
-        tier = "light"
-        floor_delta = 2_000
-        ceiling_delta = 500
-    elif first_pass_chars <= 150_000:
-        tier = "medium"
-        floor_delta = 10_000
-        ceiling_delta = 1_000
-    else:
-        tier = "strong"
-        floor_delta = 5_000
-        ceiling_delta = 1_000
-    ceiling = max(1_000, target_max_chars - ceiling_delta)
-    floor = min(ceiling, max(1_000, target_max_chars - floor_delta))
-    return {"tier": tier, "floor": floor, "ceiling": ceiling}
+    plan = secondary_compression_plan(first_pass_chars, hard_limit=target_max_chars)
+    return {
+        "tier": plan["tier"],
+        "floor": plan["target_floor_chars"],
+        "ceiling": plan["target_ceiling_chars"],
+    }
 
 
 def _profile_table_summary_for_dify(
@@ -1712,8 +1712,10 @@ def _profile_attachment_for_dify(
     keep_field_stats: bool = False,
     field_stats_field_limit: int = 0,
     minimal_table: bool = False,
+    preserve_key_facts: bool = False,
+    preserve_all_table_headers: bool = False,
 ) -> dict[str, Any]:
-    return {
+    compact = {
         "articleattid": attachment.get("articleattid") or "",
         "filename": attachment.get("filename") or "",
         "fileext": attachment.get("fileext") or "",
@@ -1725,7 +1727,9 @@ def _profile_attachment_for_dify(
         "cache_status": attachment.get("cache_status") or "",
         "text_length": attachment.get("text_length") or 0,
         "summary": _limit_text(attachment.get("summary"), summary_limit),
-        "key_facts": [_limit_text(item, 180) for item in list(attachment.get("key_facts") or [])[:key_fact_limit]],
+        "key_facts": copy.deepcopy(list(attachment.get("key_facts") or []))
+        if preserve_key_facts
+        else [_limit_text(item, 180) for item in list(attachment.get("key_facts") or [])[:key_fact_limit]],
         "important_sections": [_limit_text(item, section_chars) for item in list(attachment.get("important_sections") or [])[:section_limit]],
         "table_summaries": [
             _profile_table_summary_for_dify(
@@ -1743,15 +1747,118 @@ def _profile_attachment_for_dify(
         ],
         "evidence_value_score": int(attachment.get("evidence_value_score") or _evidence_value_score_attachment(attachment, role=role)),
     }
+    if preserve_all_table_headers:
+        compact["table_header_catalog"] = list(
+            dict.fromkeys(
+                str(header)
+                for table in list(attachment.get("table_summaries") or [])
+                if isinstance(table, dict)
+                for header in list(table.get("headers") or [])
+                if str(header)
+            )
+        )
+    return compact
 
 
 def _attachment_summary_entries(compact: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for material in compact.get("primary_materials") or []:
-        for summary in material.get("attachment_summaries") or []:
-            if isinstance(summary, dict):
-                entries.append(summary)
+    for materials in (
+        compact.get("primary_materials") or [],
+        compact.get("auxiliary_materials") or [],
+    ):
+        for material in materials:
+            for summary in material.get("attachment_summaries") or []:
+                if isinstance(summary, dict):
+                    entries.append(summary)
     return entries
+
+
+def _build_attachment_fidelity_catalog(compact: dict[str, Any]) -> list[dict[str, Any]]:
+    records: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    fact_tokens: dict[tuple[str, str, str, str, str], set[str]] = {}
+    header_tokens: dict[tuple[str, str, str, str, str], set[str]] = {}
+    summary_lengths: dict[tuple[str, str, str, str, str], int] = {}
+    for role, materials in (
+        ("primary", compact.get("primary_materials") or []),
+        ("auxiliary", compact.get("auxiliary_materials") or []),
+    ):
+        for material in materials:
+            menu_code = str(material.get("menu_code") or "")
+            articleid = str(material.get("articleid") or "")
+            for field in ("attachments", "attachment_summaries"):
+                for attachment in material.get(field) or []:
+                    if not isinstance(attachment, dict):
+                        continue
+                    key = (
+                        role,
+                        menu_code,
+                        articleid,
+                        str(attachment.get("articleattid") or ""),
+                        str(attachment.get("filename") or ""),
+                    )
+                    if key not in records:
+                        records[key] = {
+                            "role": role,
+                            "menu_code": menu_code,
+                            "articleid": articleid,
+                            "articleattid": key[3],
+                            "filename": key[4],
+                            "summary": "",
+                            "key_facts": [],
+                            "table_headers": [],
+                        }
+                        fact_tokens[key] = set()
+                        header_tokens[key] = set()
+                        summary_lengths[key] = 0
+                    summary = str(attachment.get("summary") or "")
+                    if len(summary) > summary_lengths[key]:
+                        records[key]["summary"] = _limit_text(summary, 160)
+                        summary_lengths[key] = len(summary)
+                    for fact in list(attachment.get("key_facts") or []):
+                        token = json.dumps(fact, ensure_ascii=False, sort_keys=True)
+                        if token not in fact_tokens[key]:
+                            fact_tokens[key].add(token)
+                            records[key]["key_facts"].append(copy.deepcopy(fact))
+                    headers = list(attachment.get("table_header_catalog") or [])
+                    headers.extend(
+                        header
+                        for table in list(attachment.get("table_summaries") or [])
+                        if isinstance(table, dict)
+                        for header in list(table.get("headers") or [])
+                    )
+                    for header in headers:
+                        value = str(header)
+                        if not value.strip() or value in header_tokens[key]:
+                            continue
+                        header_tokens[key].add(value)
+                        records[key]["table_headers"].append(value)
+    return list(records.values())
+
+
+def _apply_minimal_attachment_fidelity_profile(compact: dict[str, Any]) -> None:
+    for role, materials in (
+        ("primary", compact.get("primary_materials") or []),
+        ("auxiliary", compact.get("auxiliary_materials") or []),
+    ):
+        for material in materials:
+            for field in ("attachments", "attachment_summaries"):
+                material[field] = [
+                    _profile_attachment_for_dify(
+                        attachment,
+                        role=role,
+                        summary_limit=160,
+                        key_fact_limit=0,
+                        section_limit=0,
+                        section_chars=0,
+                        table_limit=0,
+                        table_header_limit=0,
+                        table_key_column_limit=0,
+                        table_summary_limit=0,
+                        table_business_limit=0,
+                    )
+                    for attachment in list(material.get(field) or [])
+                    if isinstance(attachment, dict)
+                ]
 
 
 _SECOND_PASS_TEXT_TRIM_EXCLUDED_KEYS = {
@@ -1874,28 +1981,34 @@ def _trim_attachment_summary_texts_to_target(
 
 
 def _apply_attachment_summary_profile(compact: dict[str, Any], *, summary_limit: int, profile: dict[str, Any]) -> None:
-    for material in compact.get("primary_materials") or []:
-        summaries = material.get("attachment_summaries") or []
-        material["attachment_summaries"] = [
-            _profile_attachment_for_dify(
-                summary,
-                role="primary",
-                summary_limit=summary_limit,
-                key_fact_limit=int(profile["key_fact_limit"]),
-                section_limit=int(profile["section_limit"]),
-                section_chars=int(profile["section_chars"]),
-                table_limit=int(profile["table_limit"]),
-                table_header_limit=int(profile["table_header_limit"]),
-                table_key_column_limit=int(profile["table_key_column_limit"]),
-                table_summary_limit=int(profile["table_summary_limit"]),
-                table_business_limit=int(profile["table_business_limit"]),
-                keep_field_stats=bool(profile.get("keep_field_stats")),
-                field_stats_field_limit=int(profile.get("field_stats_field_limit") or 0),
-                minimal_table=bool(profile.get("minimal_table")),
-            )
-            for summary in summaries[: int(profile["attachment_summary_limit"])]
-            if isinstance(summary, dict)
-        ]
+    for role, materials in (
+        ("primary", compact.get("primary_materials") or []),
+        ("auxiliary", compact.get("auxiliary_materials") or []),
+    ):
+        for material in materials:
+            summaries = material.get("attachment_summaries") or []
+            material["attachment_summaries"] = [
+                _profile_attachment_for_dify(
+                    summary,
+                    role=role,
+                    summary_limit=summary_limit,
+                    key_fact_limit=int(profile["key_fact_limit"]),
+                    section_limit=int(profile["section_limit"]),
+                    section_chars=int(profile["section_chars"]),
+                    table_limit=int(profile["table_limit"]),
+                    table_header_limit=int(profile["table_header_limit"]),
+                    table_key_column_limit=int(profile["table_key_column_limit"]),
+                    table_summary_limit=int(profile["table_summary_limit"]),
+                    table_business_limit=int(profile["table_business_limit"]),
+                    keep_field_stats=bool(profile.get("keep_field_stats")),
+                    field_stats_field_limit=int(profile.get("field_stats_field_limit") or 0),
+                    minimal_table=bool(profile.get("minimal_table")),
+                    preserve_key_facts=bool(profile.get("preserve_key_facts")),
+                    preserve_all_table_headers=bool(profile.get("preserve_all_table_headers")),
+                )
+                for summary in summaries[: int(profile["attachment_summary_limit"])]
+                if isinstance(summary, dict)
+            ]
 
 
 def _max_attachment_summary_table_headers(compact: dict[str, Any]) -> int:
@@ -1962,10 +2075,23 @@ def _compact_for_dify_hard_limit_second_pass(
     *,
     target_max_chars: int,
     compression_reason: list[str],
+    first_pass_chars_override: int | None = None,
+    preserve_structure: bool = False,
 ) -> bool:
-    first_pass_chars = _refresh_dify_char_fields(compact)
-    if first_pass_chars <= target_max_chars:
+    current_chars = _refresh_dify_char_fields(compact)
+    if current_chars <= target_max_chars:
         return False
+    first_pass_chars = int(first_pass_chars_override or current_chars)
+
+    if preserve_structure:
+        fidelity_catalog = _build_attachment_fidelity_catalog(compact)
+        if fidelity_catalog:
+            compact["attachment_fidelity_catalog_version"] = "8099.attachment-fidelity/v1"
+            compact["attachment_fidelity_catalog"] = fidelity_catalog
+        combined_key_facts = list(compact.get("combined_key_facts") or [])
+        if combined_key_facts:
+            compact["combined_key_fact_catalog"] = copy.deepcopy(combined_key_facts)
+        _refresh_dify_char_fields(compact)
 
     omitted_content = compact.setdefault("omitted_content", [])
     compact["second_pass_compression_applied"] = True
@@ -2052,6 +2178,10 @@ def _compact_for_dify_hard_limit_second_pass(
         },
         ]
     )
+    if preserve_structure:
+        for profile in profiles:
+            profile["preserve_key_facts"] = True
+            profile["preserve_all_table_headers"] = True
     attachment_summaries_changed = False
     for profile in profiles:
         if _fit_attachment_summary_profile_to_target(compact, target_ceiling=effective_target_ceiling, profile=profile):
@@ -2110,6 +2240,41 @@ def _compact_for_dify_hard_limit_second_pass(
         )
 
     _refresh_dify_char_fields(compact)
+    if compact["final_dify_input_chars"] > int(window["ceiling"]) and not attachment_summaries_changed:
+        for profile in profiles:
+            if _fit_attachment_summary_profile_to_target(
+                compact,
+                target_ceiling=effective_target_ceiling,
+                profile=profile,
+            ):
+                attachment_summaries_changed = True
+                compression_reason.append(f"hard_limit_attachment_summary_compacted_{profile['name']}")
+                compression_reason.append("hard_limit_attachment_summary_compacted")
+                omitted_content.append(
+                    _omitted_content_entry(
+                        "hard_limit_attachment_summary_compacted",
+                        reason="附件主体压缩后，已重新按分级 profile 压缩 attachment_summaries 冗余字段。",
+                        risk="附件摘要保留关键事实和表格结构，省略重复字段与长文本尾部。",
+                        manual_review=True,
+                        affects_core_attachment_detail=True,
+                    )
+                )
+                break
+        _refresh_dify_char_fields(compact)
+    if preserve_structure and compact["final_dify_input_chars"] > target_max_chars:
+        _apply_minimal_attachment_fidelity_profile(compact)
+        compression_reason.append("hard_limit_attachment_fidelity_catalog_only")
+        omitted_content.append(
+            _omitted_content_entry(
+                "hard_limit_attachment_fidelity_catalog_only",
+                reason="附件结构仍超限，逐附件保留最小摘要，完整 key_facts 和有效表头由受保护目录承载。",
+                risk="重复表格摘要和附件结构字段被裁剪，受保护目录中的事实与表头不得作为新增事实来源。",
+                manual_review=True,
+                affects_core_attachment_detail=True,
+            )
+        )
+        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+        _refresh_dify_char_fields(compact)
     if compact["final_dify_input_chars"] <= target_max_chars:
         compact["compression_reason"] = list(dict.fromkeys(compression_reason))
         return True
@@ -2308,6 +2473,10 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
         evidence_view = validate_evidence_pack(pack)
         compact["evidence_schema_version"] = evidence_view["evidence_schema_version"]
         compact["evidence_items"] = copy.deepcopy(evidence_view["evidence_items"])
+    if isinstance(pack.get("vbp_facts"), list):
+        compact["vbp_facts"] = copy.deepcopy(pack["vbp_facts"])
+        compact["vbp_fact_extractor_version"] = str(pack.get("vbp_fact_extractor_version") or "")
+        compact["vbp_fact_rules_version"] = str(pack.get("vbp_fact_rules_version") or "")
     compact["evidence_budget"] = _evidence_budget_for_strategy(input_strategy, primary_count=len(primary_source), auxiliary_count=len(auxiliary_source))
     compact["generation_guidance"]["target_report_length"] = _target_report_length_guidance(primary_source, auxiliary_source)
     compact["generation_guidance"]["mandatory_sections"] = [
@@ -2550,16 +2719,54 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
             _refresh_dify_char_fields(compact)
             continue
         break
-    if _refresh_dify_char_fields(compact) > target_max_chars:
-        second_pass_applied = _compact_for_dify_hard_limit_second_pass(
-            compact,
-            target_max_chars=target_max_chars,
-            compression_reason=compression_reason,
-        )
+    first_stage_chars = _refresh_dify_char_fields(compact)
+    first_stage_evidence_items = copy.deepcopy(compact.get("evidence_items") or [])
+    compact_preservation_enabled = _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False)
+    if first_stage_chars > target_max_chars:
+        if compact_preservation_enabled:
+            compact["evidence_items"] = protected_evidence_items(first_stage_evidence_items)
+            _refresh_dify_char_fields(compact)
+            second_pass_applied = _compact_for_dify_hard_limit_second_pass(
+                compact,
+                target_max_chars=target_max_chars,
+                compression_reason=compression_reason,
+                first_pass_chars_override=first_stage_chars,
+                preserve_structure=True,
+            )
+            compact["evidence_items"] = copy.deepcopy(first_stage_evidence_items)
+            _refresh_dify_char_fields(compact)
+        else:
+            second_pass_applied = _compact_for_dify_hard_limit_second_pass(
+                compact,
+                target_max_chars=target_max_chars,
+                compression_reason=compression_reason,
+            )
         if second_pass_applied:
             primary_detail_preserved = False
             core_attachment_detail_preserved = False
             auxiliary_detail_preserved = False if any(compact.get("auxiliary_materials") or []) else auxiliary_detail_preserved
+        if compact_preservation_enabled:
+            plan = secondary_compression_plan(first_stage_chars, hard_limit=target_max_chars)
+            compact = annotate_secondary_compression(
+                compact,
+                baseline_items=first_stage_evidence_items,
+            )
+            if compact["compact_pack_chars"] > int(plan["target_ceiling_chars"]):
+                compact = reduce_optional_evidence(
+                    compact,
+                    target_ceiling_chars=int(plan["target_ceiling_chars"]),
+                    baseline_items=first_stage_evidence_items,
+                )
+            retention = mandatory_evidence_retention(first_stage_evidence_items, compact)
+            compact["mandatory_evidence_retention"] = retention
+            retention_rate = retention.get("rate")
+            if retention_rate is not None and float(retention_rate) < 0.9:
+                raise CompactPolicyError(
+                    "COMPACT_PROVENANCE_LOST",
+                    "mandatory evidence retention fell below 90 percent",
+                    metrics=retention,
+                )
+            _refresh_dify_char_fields(compact)
         if compact["final_dify_input_chars"] > target_max_chars:
             compact["omitted_content"].append(
                 _omitted_content_entry(
@@ -2582,9 +2789,20 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
     compact["detail_preserved"] = primary_detail_preserved and core_attachment_detail_preserved
     compact["compression_reason"] = list(dict.fromkeys(compression_reason))
     _refresh_dify_char_fields(compact)
+    if compact_preservation_enabled and compact["final_dify_input_chars"] > target_max_chars:
+        raise CompactPolicyError(
+            "COMPACT_LIMIT_EXCEEDED",
+            "protected compact evidence exceeds the Dify input limit",
+            metrics={
+                "compact_pack_chars": compact["final_dify_input_chars"],
+                "target_max_chars": target_max_chars,
+            },
+        )
     compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
     _refresh_dify_char_fields(compact)
     compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
+    # The ratio's serialized width can change the final JSON size.
+    _refresh_dify_char_fields(compact)
     return compact
 
 
@@ -3707,8 +3925,14 @@ def _input_pipeline_stages(pack: dict[str, Any]) -> tuple[list[dict[str, Any]], 
         )
         hard_limit = _safe_int_value(compact.get("hard_limit_chars") or 80_000, 80_000)
         provenance_preserved = True
+        retention: dict[str, Any] | None = None
         if pack.get("evidence_schema_version") == 2 and pack.get("source_evidence_schema_version") != 1:
-            provenance_preserved = compact.get("evidence_items") == pack.get("evidence_items")
+            if _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False) and compact.get("secondary_compression"):
+                validate_evidence_pack(compact)
+                retention = mandatory_evidence_retention(pack, compact)
+                provenance_preserved = retention.get("rate") is None or float(retention["rate"]) >= 0.9
+            else:
+                provenance_preserved = compact.get("evidence_items") == pack.get("evidence_items")
         if not provenance_preserved:
             compact_stage = make_layer_result(
                 "compact",
@@ -3716,7 +3940,7 @@ def _input_pipeline_stages(pack: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 code="COMPACT_PROVENANCE_LOST",
                 input_value=pack,
                 output_value=compact,
-                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit, "retention": retention},
             )
         elif compact_chars > hard_limit:
             compact_stage = make_layer_result(
@@ -3735,6 +3959,14 @@ def _input_pipeline_stages(pack: dict[str, Any]) -> tuple[list[dict[str, Any]], 
                 output_value=compact,
                 metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
             )
+    except CompactPolicyError as exc:
+        compact_stage = make_layer_result(
+            "compact",
+            status="blocked",
+            code=exc.code,
+            input_value=pack,
+            metrics=exc.metrics,
+        )
     except Exception as exc:  # noqa: BLE001
         compact_stage = make_layer_result(
             "compact",
@@ -4402,6 +4634,58 @@ def _pdf_table_cell_evidence_item(context: dict[str, Any], cell: dict[str, Any])
     )
 
 
+def _spread_indices(indices: list[int], count: int) -> list[int]:
+    if count <= 0 or not indices:
+        return []
+    if len(indices) <= count:
+        return list(indices)
+    if count == 1:
+        return [indices[0]]
+    positions = {
+        round(offset * (len(indices) - 1) / (count - 1))
+        for offset in range(count)
+    }
+    return [indices[position] for position in sorted(positions)]
+
+
+def _select_pdf_table_evidence_cells(cells: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    materialized = [cell for cell in cells if isinstance(cell, dict)]
+    budget = max(1, int(limit))
+    if len(materialized) <= budget:
+        return copy.deepcopy(materialized)
+
+    table_anchors: list[int] = []
+    seen_tables: set[tuple[int, int]] = set()
+    for index, cell in enumerate(materialized):
+        identity = (int(cell.get("page_no") or 0), int(cell.get("table_index") or 0))
+        if identity not in seen_tables:
+            seen_tables.add(identity)
+            table_anchors.append(index)
+    anchor_indices = sorted({0, len(materialized) - 1, *table_anchors})
+    selected = set(_spread_indices(anchor_indices, min(budget, len(anchor_indices))))
+
+    remaining_budget = budget - len(selected)
+    if remaining_budget > 0:
+        business_keywords = ("采购", "产品", "企业", "编码", "价格", "报价", "数量", "中选", "分组", "周期")
+        priority = [
+            index
+            for index, cell in enumerate(materialized)
+            if index not in selected
+            and (
+                int(cell.get("row") or 0) == 1
+                or any(keyword in str(cell.get("value") or "") for keyword in business_keywords)
+            )
+        ]
+        priority_budget = min(remaining_budget, len(priority))
+        selected.update(_spread_indices(priority, priority_budget))
+
+    remaining_budget = budget - len(selected)
+    if remaining_budget > 0:
+        remaining = [index for index in range(len(materialized)) if index not in selected]
+        selected.update(_spread_indices(remaining, remaining_budget))
+    return [copy.deepcopy(materialized[index]) for index in sorted(selected)]
+
+
 def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[str, Any] | None = None) -> dict[str, Any]:
     articleattid = str(row.get("articleattid") or "")
     filename = str(row.get("filename") or "")
@@ -4517,10 +4801,22 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
             "attachment_id": articleattid,
             "filename": filename,
         }
+        source_cells = [cell for cell in list(parsed.get("pdf_table_cells") or []) if isinstance(cell, dict)]
+        if _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False):
+            evidence_limit = max(1, _env_int("ATTACHMENT_PDF_EVIDENCE_MAX_CELLS", 1000))
+            selected_cells = _select_pdf_table_evidence_cells(source_cells, limit=evidence_limit)
+            omitted_cell_count = max(0, len(source_cells) - len(selected_cells))
+            metadata["pdf_table_evidence_total_cell_count"] = len(source_cells)
+            metadata["pdf_table_evidence_cell_count"] = len(selected_cells)
+            metadata["pdf_table_evidence_omitted_count"] = omitted_cell_count
+            metadata["pdf_table_evidence_limit"] = evidence_limit
+            metadata["pdf_table_evidence_selection_version"] = "8099.pdf-table-evidence-budget/v1"
+            if omitted_cell_count:
+                metadata["warnings"].append("PDF_TABLE_EVIDENCE_CELL_LIMIT_REACHED")
+        else:
+            selected_cells = copy.deepcopy(source_cells)
         metadata["evidence_items"] = []
-        for cell in list(parsed.get("pdf_table_cells") or []):
-            if not isinstance(cell, dict):
-                continue
+        for cell in selected_cells:
             try:
                 metadata["evidence_items"].append(_pdf_table_cell_evidence_item(context, cell))
             except EvidenceValidationError:
@@ -4842,6 +5138,8 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
     if pdf_table_items:
         pack["evidence_items"] = [*list(pack.get("evidence_items") or []), *copy.deepcopy(pdf_table_items)]
         pack = validate_evidence_pack(pack)
+    if vbp_fact_extraction_enabled():
+        pack = enrich_vbp_facts(pack)
     pack.pop("source_evidence_schema_version", None)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
     _write_database_evidence_pack(pack)
@@ -5116,7 +5414,14 @@ def get_analysis_pack(pack_id: str, full: bool = False) -> dict[str, Any]:
     pack = _read_database_evidence_pack(pack_id)
     if full:
         return pack
-    compact = _compact_evidence_pack_for_dify(pack)
+    try:
+        compact = _compact_evidence_pack_for_dify(pack)
+    except CompactPolicyError as exc:
+        logger.warning("analysis_pack_compaction_blocked pack_id=%s code=%s", pack_id, exc.code)
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "metrics": copy.deepcopy(exc.metrics)},
+        ) from exc
     logger.info(
         "analysis_pack_compacted_for_dify pack_id=%s full_chars=%s compact_chars=%s",
         pack_id,
@@ -5148,7 +5453,14 @@ def get_analysis_pack_summary(pack_id: str) -> dict[str, Any]:
 @app.get("/analysis/packs/{pack_id}/diagnostics")
 def get_analysis_pack_diagnostics(pack_id: str) -> dict[str, Any]:
     pack = _read_database_evidence_pack(pack_id)
-    dify_pack = _compact_evidence_pack_for_dify(pack)
+    try:
+        dify_pack = _compact_evidence_pack_for_dify(pack)
+    except CompactPolicyError as exc:
+        logger.warning("analysis_pack_diagnostics_compaction_blocked pack_id=%s code=%s", pack_id, exc.code)
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "metrics": copy.deepcopy(exc.metrics)},
+        ) from exc
     return {
         "success": True,
         "pack_id": pack.get("pack_id") or pack_id,
@@ -5613,12 +5925,18 @@ def get_analysis_run_diagnostics(run_id: str) -> dict[str, Any]:
         except HTTPException as exc:
             logger.warning("analysis_run_diagnostics_pack_missing run_id=%s pack_id=%s detail=%s", run_id, pack_id, exc.detail)
 
+    try:
+        dify_pack = _compact_evidence_pack_for_dify(pack) if pack else None
+    except CompactPolicyError as exc:
+        logger.warning("analysis_run_diagnostics_compaction_blocked run_id=%s pack_id=%s code=%s", run_id, pack_id, exc.code)
+        return _analysis_error(422, exc.code, "evidence pack compact failed")
+
     return {
         "success": True,
         "run_id": str(record.get("run_id") or run_id),
         "pack_id": pack_id,
         "status": str(record.get("status") or ""),
-        "diagnostics": build_run_diagnostics(record, pack, _compact_evidence_pack_for_dify(pack) if pack else None),
+        "diagnostics": build_run_diagnostics(record, pack, dify_pack),
     }
 
 

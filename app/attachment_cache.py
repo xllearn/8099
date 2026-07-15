@@ -61,6 +61,10 @@ def cache_key(attachment: dict[str, Any]) -> str:
         "filesize": str(attachment.get("filesize") or ""),
         "uploadtime": str(attachment.get("uploadtime") or ""),
     }
+    if _bool_env("ENABLE_VBP_COMPACT_PRESERVATION", False):
+        payload["pdf_table_evidence_max_cells"] = (
+            os.getenv("ATTACHMENT_PDF_EVIDENCE_MAX_CELLS") or "1000"
+        ).strip()
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
