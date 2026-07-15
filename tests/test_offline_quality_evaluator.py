@@ -624,6 +624,44 @@ class OfflineQualityEvaluatorTests(unittest.TestCase):
         self.assertEqual(baseline["metrics"]["identity_hash_complete_count"], 10)
         self.assertEqual(baseline["metrics"]["metrics_complete_count"], 10)
 
+    def test_fixed3_only_baseline_requires_explicit_coverage_mode(self) -> None:
+        module = self.evaluator_module()
+        fixed3_artifact = {
+            **self.artifact(
+                [
+                    {
+                        **self.clean_result(f"case-{index}"),
+                        "sample_id": f"case-{index}-attempt-{attempt}",
+                        "attempt": attempt,
+                    }
+                    for attempt in range(1, 4)
+                    for index in range(1, 4)
+                ]
+            ),
+            "subset": "fixed3",
+            "repeat": 3,
+        }
+        evaluation = module.evaluate_artifact(fixed3_artifact)
+
+        with self.assertRaisesRegex(ValueError, "fixed3/fixed10"):
+            module.freeze_baseline(
+                baseline_id="B",
+                manifest_sha256=str(evaluation["manifest_sha256"]),
+                evaluations=[evaluation],
+            )
+
+        baseline = module.freeze_baseline(
+            baseline_id="B",
+            manifest_sha256=str(evaluation["manifest_sha256"]),
+            evaluations=[evaluation],
+            coverage_mode="fixed3_only",
+        )
+
+        self.assertEqual(baseline["coverage_mode"], "fixed3_only")
+        self.assertEqual(baseline["waived_subsets"], ["fixed10"])
+        self.assertEqual(baseline["metrics"]["sample_count"], 9)
+        self.assertEqual(baseline["quality"][0]["subset"], "fixed3")
+
     def test_baseline_freeze_rejects_incomplete_fixed10_or_fixed3_matrix(self) -> None:
         module = self.evaluator_module()
         one_fixed10 = module.evaluate_artifact(self.artifact([self.clean_result()]))
@@ -1112,6 +1150,56 @@ class OfflineQualityEvaluatorTests(unittest.TestCase):
                 json.loads(baseline_path.read_text(encoding="utf-8"))["baseline_id"],
                 "B",
             )
+
+    def test_freeze_cli_supports_explicit_fixed3_only_coverage(self) -> None:
+        module = self.evaluator_module()
+        freeze_cli = importlib.import_module("scripts.freeze_regression_baseline")
+        fixed3_artifact = {
+            **self.artifact(
+                [
+                    {
+                        **self.clean_result(f"case-{index}"),
+                        "sample_id": f"case-{index}-attempt-{attempt}",
+                        "attempt": attempt,
+                    }
+                    for attempt in range(1, 4)
+                    for index in range(1, 4)
+                ]
+            ),
+            "subset": "fixed3",
+            "repeat": 3,
+        }
+        evaluation = module.evaluate_artifact(fixed3_artifact)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            evaluation_path = root / "fixed3-evaluation.json"
+            manifest_path = root / "manifest.json"
+            baseline_path = root / "baseline.json"
+            evaluation_path.write_text(json.dumps(evaluation), encoding="utf-8")
+            manifest_path.write_text(
+                json.dumps(fixed3_artifact["manifest_contract"]), encoding="utf-8"
+            )
+
+            with redirect_stdout(io.StringIO()):
+                result = freeze_cli.main(
+                    [
+                        "--baseline-id",
+                        "B",
+                        "--manifest",
+                        str(manifest_path),
+                        "--evaluation",
+                        str(evaluation_path),
+                        "--coverage-mode",
+                        "fixed3_only",
+                        "--output",
+                        str(baseline_path),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+            self.assertEqual(baseline["coverage_mode"], "fixed3_only")
+            self.assertEqual(baseline["waived_subsets"], ["fixed10"])
 
 
 if __name__ == "__main__":

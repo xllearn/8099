@@ -22,9 +22,10 @@ from app.regression_manifest import (
 ARTIFACT_SCHEMA_VERSION = "8099.fixed-regression/v2"
 EVALUATION_SCHEMA_VERSION = "8099.regression-evaluation/v1"
 BASELINE_SCHEMA_VERSION = "8099.regression-baseline/v2"
-EVALUATOR_VERSION = "1.4.0"
+EVALUATOR_VERSION = "1.4.1"
 UNSUPPORTED_EVAL_VERSION = "1"
 BASELINE_ENVIRONMENT = "server_test"
+BASELINE_COVERAGE_MODES = ("full", "fixed3_only")
 DIAGNOSTICS_SOURCE_SHA256 = hashlib.sha256(
     Path(__file__).with_name("diagnostics.py").read_bytes()
 ).hexdigest()
@@ -80,6 +81,7 @@ EVALUATOR_RULES = {
     "word_endpoints": list(WORD_ENDPOINTS),
     "required_word_snapshots": sorted(REQUIRED_WORD_SNAPSHOTS),
     "baseline_environments": [BASELINE_ENVIRONMENT],
+    "baseline_coverage_modes": list(BASELINE_COVERAGE_MODES),
     "percentile": "nearest-rank",
     "non_deliverable_primary_failure_code_required": True,
     "unsupported_eval_version": UNSUPPORTED_EVAL_VERSION,
@@ -1268,7 +1270,10 @@ def freeze_baseline(
     baseline_id: str,
     manifest_sha256: str,
     evaluations: Iterable[Mapping[str, Any]],
+    coverage_mode: str = "full",
 ) -> dict[str, Any]:
+    if coverage_mode not in BASELINE_COVERAGE_MODES:
+        raise ValueError(f"unsupported baseline coverage mode: {coverage_mode}")
     selected = sorted(
         (dict(item) for item in evaluations),
         key=lambda item: (str(item.get("environment") or ""), str(item.get("subset") or "")),
@@ -1287,13 +1292,14 @@ def freeze_baseline(
     ]
     if any(not environment for environment, _ in keys) or len(set(keys)) != len(keys):
         raise ValueError("baseline evaluations require unique environment/subset pairs")
-    required_pairs = {
-        (BASELINE_ENVIRONMENT, "fixed3"),
-        (BASELINE_ENVIRONMENT, "fixed10"),
-    }
+    required_pairs = {(BASELINE_ENVIRONMENT, "fixed3")}
+    if coverage_mode == "full":
+        required_pairs.add((BASELINE_ENVIRONMENT, "fixed10"))
     if set(keys) != required_pairs:
-        raise ValueError("baseline requires server_test fixed3/fixed10 evaluations")
-    quality_selected = [item for item in selected if item.get("subset") == "fixed10"]
+        expected = "fixed3/fixed10" if coverage_mode == "full" else "fixed3 only"
+        raise ValueError(f"baseline requires server_test {expected} evaluations")
+    quality_subset = "fixed10" if coverage_mode == "full" else "fixed3"
+    quality_selected = [item for item in selected if item.get("subset") == quality_subset]
     fixed3_selected = [item for item in selected if item.get("subset") == "fixed3"]
     quality_exclusions = [
         _normalize_excluded_cases(item.get("excluded_cases")) for item in quality_selected
@@ -1302,6 +1308,9 @@ def freeze_baseline(
     return {
         "schema_version": BASELINE_SCHEMA_VERSION,
         "baseline_id": str(baseline_id),
+        "coverage_mode": coverage_mode,
+        "required_subsets": ["fixed3", "fixed10"] if coverage_mode == "full" else ["fixed3"],
+        "waived_subsets": [] if coverage_mode == "full" else ["fixed10"],
         "manifest_sha256": manifest_sha256,
         "evaluator_version": EVALUATOR_VERSION,
         "evaluator_rules_sha256": EVALUATOR_RULES_SHA256,
@@ -1311,7 +1320,7 @@ def freeze_baseline(
         "quality": [
             {
                 "environment": str(item.get("environment") or ""),
-                "subset": "fixed10",
+                "subset": str(item.get("subset") or ""),
                 "selected_case_count": _int(item.get("selected_case_count")),
                 "metrics": item.get("metrics"),
             }
