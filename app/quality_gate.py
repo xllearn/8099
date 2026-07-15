@@ -9,6 +9,7 @@ from app.evidence_index import EvidenceIndexError, build_claim_evidence_index
 from app.formal_body import FormalBodyDocument
 from app.formal_body_safety import scan_formal_body
 from app.generation.base import ReportGenerationResult
+from app.vbp_quality_gate import evaluate_vbp_quality
 
 
 class QualityGateComponent(Protocol):
@@ -133,6 +134,76 @@ class ForbiddenPhraseGate:
 
 
 @dataclass
+class VbpQualityGateComponent:
+    def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
+        if not _env_bool("ENABLE_VBP_QUALITY_GATE", False):
+            return result
+        metadata = dict(result.metadata)
+        claim_index = metadata.get("claim_evidence_index")
+        if not isinstance(claim_index, dict):
+            try:
+                claim_index = build_claim_evidence_index(
+                    FormalBodyDocument(markdown=result.report_markdown, report_ir=result.report_ir),
+                    pack,
+                )
+            except EvidenceIndexError:
+                claim_index = {}
+        evaluation = evaluate_vbp_quality(
+            FormalBodyDocument(markdown=result.report_markdown, report_ir=result.report_ir),
+            pack,
+            claim_index,
+        )
+        metadata["vbp_quality_gate"] = evaluation
+        quality_gate = dict(metadata.get("quality_gate") or {})
+        quality_gate["vbp_quality_gate"] = evaluation
+        if evaluation["passed"]:
+            metadata["quality_gate"] = quality_gate
+            return dataclass_replace(result, metadata=metadata)
+
+        existing_codes = [str(item or "") for item in list(quality_gate.get("blocking_issue_codes") or [])]
+        quality_gate["blocking_issue_codes"] = list(
+            dict.fromkeys([*existing_codes, *evaluation["blocking_issue_codes"]])
+        )
+        quality_gate["deliverable_status"] = "needs_manual_review"
+        metadata["quality_gate"] = quality_gate
+        metadata["status"] = "needs_manual_review"
+        metadata["quality_failure_codes"] = list(
+            dict.fromkeys(
+                [
+                    *[str(item or "") for item in list(metadata.get("quality_failure_codes") or [])],
+                    *evaluation["blocking_issue_codes"],
+                ]
+            )
+        )
+
+        quality_check = dict(result.quality_check or {"passed": None, "issues": []})
+        issues = list(quality_check.get("issues") or [])
+        remaining = list(result.remaining_issues or [])
+        for code in evaluation["blocking_issue_codes"]:
+            issue = {
+                "issue_id": f"Q_{code}",
+                "code": code,
+                "severity": "blocker",
+                "problem_type": "vbp_unsupported_claim" if code == "VBP_UNSUPPORTED_CLAIM" else "vbp_quality_gate",
+                "report_text": "",
+                "source_basis": "validated_a_b_evidence",
+                "fix_instruction": "Remove unsupported content or narrow it to validated A/B evidence.",
+            }
+            if not any(isinstance(item, dict) and item.get("issue_id") == issue["issue_id"] for item in issues):
+                issues.append(issue)
+            if not any(isinstance(item, dict) and item.get("issue_id") == issue["issue_id"] for item in remaining):
+                remaining.append(issue)
+        quality_check["passed"] = False
+        quality_check["issues"] = issues
+        return dataclass_replace(
+            result,
+            quality_check=quality_check,
+            remaining_issues=remaining,
+            metadata=metadata,
+        )
+
+
+@dataclass
 class StructureGate:
     def run(self, result: ReportGenerationResult, pack: dict[str, Any]) -> ReportGenerationResult:
         return result
@@ -150,6 +221,7 @@ class QualityGate:
         default_factory=lambda: [
             ClaimEvidenceIndexComponent(),
             LocalEvidenceGate(),
+            VbpQualityGateComponent(),
             ForbiddenPhraseGate(),
             StructureGate(),
             ExportGate(),

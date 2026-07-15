@@ -29,6 +29,7 @@ class VbpTopicRulesTests(unittest.TestCase):
             "ENABLE_VBP_COMPACT_PRESERVATION",
             "ENABLE_VBP_REPORT_RULES",
             "ENABLE_EVIDENCE_INDEX",
+            "ENABLE_VBP_QUALITY_GATE",
         ):
             self.assertIn(f"{name}=false", env_example)
             self.assertIn(f"{name}: ${{{name}:-false}}", compose)

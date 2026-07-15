@@ -2912,6 +2912,13 @@ RUN_STATE_MACHINE_STATUSES = {
 RUN_TERMINAL_STATUSES = {"finished", "needs_manual_review", "failed", "interrupted"}
 
 RUN_P0_FAILURE_CODES = {
+    "VBP_RULE_CONFLICT",
+    "VBP_EVIDENCE_INDEX_INVALID",
+    "VBP_C_LEVEL_FACT_USED",
+    "VBP_FACT_SOURCE_REF_INVALID",
+    "VBP_UNSUPPORTED_CLAIM",
+    "VBP_REQUIRED_SECTION_MISSING",
+    "VBP_REQUIRED_TOPIC_MISSING",
     "UNSUPPORTED_FACT",
     "SUMMARY_ONLY_REPORT",
     "REPORT_TOO_SHORT",
@@ -2942,6 +2949,13 @@ RUN_FAILURE_PRIORITY = [
     "OUTPUT_EMPTY",
     "OUTPUT_TRUNCATED",
     "OUTPUT_SCHEMA_INVALID",
+    "VBP_RULE_CONFLICT",
+    "VBP_EVIDENCE_INDEX_INVALID",
+    "VBP_C_LEVEL_FACT_USED",
+    "VBP_FACT_SOURCE_REF_INVALID",
+    "VBP_UNSUPPORTED_CLAIM",
+    "VBP_REQUIRED_SECTION_MISSING",
+    "VBP_REQUIRED_TOPIC_MISSING",
     "UNSUPPORTED_FACT",
     "SUMMARY_ONLY_REPORT",
     "REPORT_TOO_SHORT",
@@ -2965,6 +2979,13 @@ RUN_DEFAULT_TIMINGS = {
 }
 
 RUN_QUALITY_BLOCKING_CODE_MAP = {
+    "VBP_RULE_CONFLICT": "VBP_RULE_CONFLICT",
+    "VBP_EVIDENCE_INDEX_INVALID": "VBP_EVIDENCE_INDEX_INVALID",
+    "VBP_C_LEVEL_FACT_USED": "VBP_C_LEVEL_FACT_USED",
+    "VBP_FACT_SOURCE_REF_INVALID": "VBP_FACT_SOURCE_REF_INVALID",
+    "VBP_UNSUPPORTED_CLAIM": "VBP_UNSUPPORTED_CLAIM",
+    "VBP_REQUIRED_SECTION_MISSING": "VBP_REQUIRED_SECTION_MISSING",
+    "VBP_REQUIRED_TOPIC_MISSING": "VBP_REQUIRED_TOPIC_MISSING",
     "UNSUPPORTED_FACT": "UNSUPPORTED_FACT",
     "SUMMARY_ONLY_REPORT": "SUMMARY_ONLY_REPORT",
     "REPORT_TOO_SHORT": "REPORT_TOO_SHORT",
@@ -3011,6 +3032,13 @@ RUN_DIFY_ERROR_CODE_MAP = {
 }
 
 RUN_FAILURE_REASON_LABELS = {
+    "VBP_RULE_CONFLICT": "VBP 事实规则存在冲突，专项门禁未通过。",
+    "VBP_EVIDENCE_INDEX_INVALID": "claim 与证据索引无效，专项门禁未通过。",
+    "VBP_C_LEVEL_FACT_USED": "正式 claim 使用了不可独立支持事实的辅助信息。",
+    "VBP_FACT_SOURCE_REF_INVALID": "正式 claim 的来源定位无效。",
+    "VBP_UNSUPPORTED_CLAIM": "正式 claim 未获得有效 A/B 证据支持。",
+    "VBP_REQUIRED_SECTION_MISSING": "VBP 报告缺少必需结构。",
+    "VBP_REQUIRED_TOPIC_MISSING": "VBP 报告缺少已有证据对应的必需主题。",
     "UNSUPPORTED_FACT": "报告存在未被 evidence_pack 支撑的事实表述。",
     "SUMMARY_ONLY_REPORT": "报告偏摘要化，分析深度未达到自动交付条件。",
     "REPORT_TOO_SHORT": "报告正文过短，未达到自动交付条件。",
@@ -3182,6 +3210,13 @@ def _collect_failure_stages(
 
     if "quality_gate" not in blocked_layers and quality_failure_codes:
         allowed = {
+            "VBP_RULE_CONFLICT",
+            "VBP_EVIDENCE_INDEX_INVALID",
+            "VBP_C_LEVEL_FACT_USED",
+            "VBP_FACT_SOURCE_REF_INVALID",
+            "VBP_UNSUPPORTED_CLAIM",
+            "VBP_REQUIRED_SECTION_MISSING",
+            "VBP_REQUIRED_TOPIC_MISSING",
             "UNSUPPORTED_FACT",
             "SUMMARY_ONLY_REPORT",
             "REPORT_TOO_SHORT",
@@ -3194,6 +3229,13 @@ def _collect_failure_stages(
             "EXPORT_GATE_BLOCKED",
         }
         quality_priority = (
+            "VBP_RULE_CONFLICT",
+            "VBP_EVIDENCE_INDEX_INVALID",
+            "VBP_C_LEVEL_FACT_USED",
+            "VBP_FACT_SOURCE_REF_INVALID",
+            "VBP_UNSUPPORTED_CLAIM",
+            "VBP_REQUIRED_SECTION_MISSING",
+            "VBP_REQUIRED_TOPIC_MISSING",
             "UNSUPPORTED_FACT",
             "SUMMARY_ONLY_REPORT",
             "REPORT_TOO_SHORT",
@@ -4011,6 +4053,13 @@ def _quality_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> di
         or quality_check.get("passed") is False
     )
     priority = (
+        "VBP_RULE_CONFLICT",
+        "VBP_EVIDENCE_INDEX_INVALID",
+        "VBP_C_LEVEL_FACT_USED",
+        "VBP_FACT_SOURCE_REF_INVALID",
+        "VBP_UNSUPPORTED_CLAIM",
+        "VBP_REQUIRED_SECTION_MISSING",
+        "VBP_REQUIRED_TOPIC_MISSING",
         "UNSUPPORTED_FACT",
         "SUMMARY_ONLY_REPORT",
         "REPORT_TOO_SHORT",
