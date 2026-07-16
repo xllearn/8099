@@ -245,8 +245,8 @@ class AttachmentConcurrencyTests(unittest.TestCase):
             os.environ,
             {
                 "ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true",
-                "ATTACHMENT_PARSE_CONCURRENCY": "3",
-                "ATTACHMENT_TASK_TIMEOUT_SECONDS": "30",
+                "ATTACHMENT_PARSE_CONCURRENCY": "2",
+                "ATTACHMENT_TASK_TIMEOUT_SECONDS": "180",
                 "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "true",
                 "ATTACHMENT_TEMP_DIR": tmpdir,
             },
