@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import time
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Mapping
 
 
 CANONICAL_STAGE_FIELDS = (
     "prepare_ms",
+    "attachment_queue_ms",
     "attachment_download_ms",
     "attachment_parse_ms",
     "evidence_build_ms",
@@ -71,6 +73,7 @@ class PipelineTiming:
         self._started_ns = self._clock_ns()
         self._values = normalize_pipeline_timings(initial)
         self._base_total_ms = self._values["total_ms"]
+        self._lock = threading.Lock()
 
     @contextmanager
     def measure(self, field: str) -> Iterator[None]:
@@ -88,18 +91,21 @@ class PipelineTiming:
         name = str(field or "").strip()
         if not name:
             return
-        self._values[name] = _safe_ms(self._values.get(name)) + _safe_ms(elapsed_ms)
+        with self._lock:
+            self._values[name] = _safe_ms(self._values.get(name)) + _safe_ms(elapsed_ms)
 
     def merge(self, value: Any) -> None:
         incoming = normalize_pipeline_timings(value)
-        for field, elapsed_ms in incoming.items():
-            self._values[field] = max(_safe_ms(self._values.get(field)), elapsed_ms)
+        with self._lock:
+            for field, elapsed_ms in incoming.items():
+                self._values[field] = max(_safe_ms(self._values.get(field)), elapsed_ms)
 
     def observe(self, field: str, elapsed_ms: int) -> None:
         self.add_ms(field, elapsed_ms)
 
     def snapshot(self, *, finish: bool = False) -> dict[str, int]:
-        normalized = normalize_pipeline_timings(self._values)
+        with self._lock:
+            normalized = normalize_pipeline_timings(dict(self._values))
         if finish:
             wall_ms = max(0, self._clock_ns() - self._started_ns) // 1_000_000
             normalized["total_ms"] = max(normalized["total_ms"], self._base_total_ms + wall_ms)

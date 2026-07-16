@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -4802,11 +4803,7 @@ def _select_pdf_table_evidence_cells(cells: list[dict[str, Any]], *, limit: int)
     return [copy.deepcopy(materialized[index]) for index in sorted(selected)]
 
 
-def _database_attachment_metadata(
-    row: dict[str, Any],
-    attachment_options: dict[str, Any] | None = None,
-    timing: PipelineTiming | None = None,
-) -> dict[str, Any]:
+def _database_attachment_base_metadata(row: dict[str, Any]) -> dict[str, Any]:
     articleattid = str(row.get("articleattid") or "")
     filename = str(row.get("filename") or "")
     core_attachment, business_type = _attachment_core_metadata(filename)
@@ -4815,7 +4812,7 @@ def _database_attachment_metadata(
         warnings.append(f"附件存在异常标记: {row.get('fileerrortype')}")
     if not articleattid:
         warnings.append("附件缺少 articleattid，后续无法通过内网下载接口定位")
-    metadata = {
+    return {
         "articleattid": articleattid,
         "filename": filename,
         "filepath": row.get("filepath") or "",
@@ -4843,6 +4840,18 @@ def _database_attachment_metadata(
         "table_summaries": [],
         "warnings": warnings,
     }
+
+
+def _database_attachment_metadata(
+    row: dict[str, Any],
+    attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+) -> dict[str, Any]:
+    metadata = _database_attachment_base_metadata(row)
+    articleattid = str(metadata["articleattid"])
+    filename = str(metadata["filename"])
+    core_attachment = bool(metadata["core_attachment"])
+    business_type = str(metadata["business_type"])
     options = attachment_options or {}
     enable_download = bool(options.get("enable_download", _env_bool("ENABLE_ATTACHMENT_DOWNLOAD", True)))
     force_refresh = bool(options.get("force_refresh"))
@@ -4952,6 +4961,63 @@ def _database_attachment_metadata(
     metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
     store_cached_result(metadata, metadata)
     return metadata
+
+
+def _failed_database_attachment_metadata(row: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    metadata = _database_attachment_base_metadata(row)
+    metadata["parse_status"] = "parse_failed"
+    metadata["download_status"] = "download_failed"
+    metadata["core_attachment_unavailable"] = bool(metadata.get("core_attachment"))
+    metadata["warnings"].append(f"ATTACHMENT_PROCESSING_FAILED:{exc.__class__.__name__}")
+    return metadata
+
+
+def _parse_database_attachments_bounded(
+    attachments: list[dict[str, Any]],
+    attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+) -> list[dict[str, Any]]:
+    rows = list(attachments or [])
+    if not rows:
+        return []
+    stage_timing = timing or PipelineTiming()
+    options = attachment_options or {}
+
+    def process(row: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return _database_attachment_metadata(row, options, stage_timing)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "database_attachment_processing_failed attachment_id=%s error_type=%s",
+                str(row.get("articleattid") or "")[:80],
+                exc.__class__.__name__,
+            )
+            return _failed_database_attachment_metadata(row, exc)
+
+    enabled = _env_bool("ENABLE_CONCURRENT_ATTACHMENT_PARSE", False)
+    worker_count = min(max(1, _env_int("ATTACHMENT_PARSE_CONCURRENCY", 3)), len(rows))
+    if not enabled or worker_count == 1:
+        return [process(row) for row in rows]
+
+    submitted: list[tuple[dict[str, Any], int]] = [
+        (row, time.monotonic_ns()) for row in rows
+    ]
+
+    def queued_process(row: dict[str, Any], submitted_ns: int) -> dict[str, Any]:
+        stage_timing.add_elapsed("attachment_queue_ms", submitted_ns)
+        return process(row)
+
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="attachment-parse") as executor:
+        futures = [executor.submit(queued_process, row, submitted_ns) for row, submitted_ns in submitted]
+        results = [future.result() for future in futures]
+    logger.info(
+        "database_attachment_batch_completed count=%s concurrency=%s queue_ms=%s parse_ms=%s",
+        len(rows),
+        worker_count,
+        stage_timing.snapshot().get("attachment_queue_ms", 0),
+        stage_timing.snapshot().get("attachment_parse_ms", 0),
+    )
+    return results
 
 
 def _material_key_facts(row: dict[str, Any]) -> list[dict[str, str]]:
@@ -5159,7 +5225,7 @@ def _build_database_material(
         "summary": row.get("summary") or "",
         "content_text": content_text,
         "content_summary": _content_summary(str(row.get("summary") or ""), content_text),
-        "attachments": [_database_attachment_metadata(item, attachment_options, timing) for item in attachments],
+        "attachments": _parse_database_attachments_bounded(attachments, attachment_options, timing),
     }
     if role == "primary":
         base.update(
