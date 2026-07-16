@@ -11,7 +11,7 @@ from docx import Document
 from app import main as main_module
 from app.formal_body_safety import FormalBodySafetyError, publish_docx_atomically
 from app.generation.base import ReportGenerationResult
-from app.pipeline_timing import PipelineTiming, TIMING_FIELDS
+from app.pipeline_timing import PipelineTiming, TIMING_FIELDS, normalize_pipeline_timings
 
 
 EXPECTED_TIMING_FIELDS = {
@@ -99,6 +99,23 @@ class S3PipelineTimingTests(unittest.TestCase):
         self.assertEqual("observed", snapshot["observation_status"]["compact_ms"])
         self.assertIsNone(snapshot["word_render_ms"])
         self.assertEqual("not_observed", snapshot["observation_status"]["word_render_ms"])
+
+    def test_alias_collection_failure_is_not_masked_by_observed_peer(self) -> None:
+        normalized = normalize_pipeline_timings(
+            {
+                "dify_ms": 12,
+                "generation_ms": None,
+                "observation_status": {
+                    "dify_ms": "observed",
+                    "generation_ms": "collection_failed",
+                },
+            }
+        )
+
+        self.assertIsNone(normalized["dify_ms"])
+        self.assertIsNone(normalized["generation_ms"])
+        self.assertEqual("collection_failed", normalized["observation_status"]["dify_ms"])
+        self.assertEqual("collection_failed", normalized["observation_status"]["generation_ms"])
 
     def test_clock_failure_is_nonblocking_and_marks_collection_failed(self) -> None:
         executed: list[str] = []

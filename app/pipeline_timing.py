@@ -57,6 +57,12 @@ def _sync_alias(
     left: str,
     right: str,
 ) -> None:
+    if COLLECTION_FAILED in {statuses[left], statuses[right]}:
+        values[left] = None
+        values[right] = None
+        statuses[left] = COLLECTION_FAILED
+        statuses[right] = COLLECTION_FAILED
+        return
     observed = [
         value
         for field in (left, right)
@@ -69,11 +75,6 @@ def _sync_alias(
         values[right] = value
         statuses[left] = OBSERVED
         statuses[right] = OBSERVED
-    elif COLLECTION_FAILED in {statuses[left], statuses[right]}:
-        values[left] = None
-        values[right] = None
-        statuses[left] = COLLECTION_FAILED
-        statuses[right] = COLLECTION_FAILED
 
 
 def normalize_pipeline_timings(value: Any) -> dict[str, Any]:
