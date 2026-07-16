@@ -5403,6 +5403,14 @@ def records_ui():
     return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
+@app.get("/analysis-history-ui")
+def analysis_history_ui():
+    path = Path(__file__).resolve().parent / "static" / "analysis_history.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="analysis history UI not found")
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
 @app.get("/analysis-runs/{run_id}")
 def analysis_run_ui(run_id: str):
     _safe_run_id(run_id)

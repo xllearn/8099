@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>分析历史</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --line: #e3e8f0;
+      --line-strong: #cfd7e4;
+      --text: #172033;
+      --muted: #667085;
+      --brand: #246bdf;
+      --brand-soft: #edf4ff;
+      --green: #067647;
+      --green-soft: #ecfdf3;
+      --orange: #b54708;
+      --orange-soft: #fff4e5;
+      --danger: #b42318;
+      --danger-soft: #fff1f3;
+      --gray-soft: #f2f4f7;
+      --shadow: 0 4px 16px rgba(31, 50, 81, .06);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    a { color: var(--brand); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button, input, select { font: inherit; }
+    button {
+      height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 0 12px;
+      background: #fff;
+      color: #344054;
+      cursor: pointer;
+    }
+    button:hover { border-color: #9fb0c8; color: #101828; }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    input, select {
+      width: 100%;
+      height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      padding: 0 10px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(36, 107, 223, .11); }
+    label { display: grid; gap: 5px; color: #475467; font-size: 12px; }
+
+    .app-header {
+      height: 58px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 24px;
+      border-bottom: 1px solid #e8edf5;
+      background: #fff;
+    }
+    .brand, .header-actions { display: flex; align-items: center; gap: 12px; }
+    .brand-mark {
+      width: 30px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 7px;
+      background: var(--brand);
+      color: #fff;
+      font-weight: 800;
+    }
+    .brand strong { display: block; font-size: 15px; }
+    .brand span { display: block; color: var(--muted); font-size: 11px; }
+    .header-actions { color: var(--muted); }
+
+    .page { max-width: 1720px; margin: 0 auto; padding: 18px 22px 30px; }
+    .page-head {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 14px;
+    }
+    h1 { margin: 0 0 3px; font-size: 22px; letter-spacing: 0; }
+    .subhead { color: var(--muted); }
+    .count { color: var(--muted); white-space: nowrap; }
+    .count strong { color: var(--text); }
+
+    .filter-band {
+      padding: 13px 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px 8px 0 0;
+      background: var(--panel);
+    }
+    .filters {
+      display: grid;
+      grid-template-columns: minmax(180px, 1.3fr) repeat(2, minmax(140px, .8fr)) minmax(140px, .7fr) minmax(120px, .65fr) auto auto;
+      gap: 10px;
+      align-items: end;
+    }
+
+    .table-panel {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-top: 0;
+      border-radius: 0 0 8px 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .table-wrap { overflow: auto; min-height: 420px; }
+    table { width: 100%; min-width: 1280px; border-collapse: collapse; table-layout: fixed; }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 10px 11px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: left;
+      white-space: nowrap;
+    }
+    td { padding: 11px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    tbody tr:hover td { background: #fbfdff; }
+    .material-title { font-weight: 750; line-height: 1.4; }
+    .meta { margin-top: 5px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .mono { font-family: Consolas, "SFMono-Regular", monospace; font-size: 11px; overflow-wrap: anywhere; }
+    .stack { display: grid; gap: 5px; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      min-height: 23px;
+      border-radius: 5px;
+      padding: 2px 7px;
+      background: var(--gray-soft);
+      color: #475467;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .badge.good { background: var(--green-soft); color: var(--green); }
+    .badge.review { background: var(--orange-soft); color: var(--orange); }
+    .badge.bad { background: var(--danger-soft); color: var(--danger); }
+    .badge.running { background: var(--brand-soft); color: var(--brand); }
+    .failure { color: var(--danger); font-weight: 650; overflow-wrap: anywhere; }
+    .word-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
+    .word-state {
+      min-height: 25px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 5px;
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 3px 6px;
+      color: var(--muted);
+      font-size: 10px;
+    }
+    .word-state b { color: #344054; }
+    .open-link {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      border: 1px solid #b9d6ff;
+      border-radius: 5px;
+      padding: 4px 9px;
+      background: #fff;
+      white-space: nowrap;
+    }
+    .empty { padding: 80px 20px; color: var(--muted); text-align: center; }
+    .pager {
+      min-height: 48px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      padding: 7px 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    @media (max-width: 980px) {
+      .app-header { padding: 0 14px; }
+      .page { padding: 14px 10px 24px; }
+      .page-head { align-items: flex-start; flex-direction: column; gap: 6px; }
+      .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .filters button { width: 100%; }
+    }
+
+    @media (max-width: 640px) {
+      .app-header {
+        min-height: 58px;
+        height: auto;
+        flex-wrap: wrap;
+        gap: 8px 14px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+      }
+      .brand { min-width: 0; }
+      .brand-mark { flex: 0 0 30px; }
+      .brand strong, .brand span, .header-actions, h1, .count, label, button {
+        word-break: keep-all;
+      }
+      .filters { grid-template-columns: minmax(0, 1fr); }
+      .filter-band { padding: 12px; }
+      .table-wrap { min-height: 360px; }
+      .pager { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark">医</div>
+      <div><strong>医保公告分析</strong><span>运行追溯</span></div>
+    </div>
+    <div class="header-actions"><a href="/records-ui">返回选材</a></div>
+  </header>
+
+  <main class="page">
+    <div class="page-head">
+      <div><h1>分析历史</h1><div class="subhead">按材料定位每次分析运行及交付状态</div></div>
+      <div class="count">共 <strong id="totalCount">0</strong> 条</div>
+    </div>
+
+    <section class="filter-band">
+      <form class="filters" id="filters">
+        <label>搜索<input id="query" name="q" placeholder="标题、材料或运行编号"></label>
+        <label>articleid<input id="articleid" name="articleid" placeholder="材料 articleid"></label>
+        <label>record_id<input id="recordId" name="record_id" placeholder="menu_code:articleid"></label>
+        <label>运行状态
+          <select id="status" name="status">
+            <option value="">全部</option>
+            <option value="running">运行中</option>
+            <option value="finished">已完成</option>
+            <option value="needs_manual_review">待复检</option>
+            <option value="failed">失败</option>
+            <option value="interrupted">已中断</option>
+          </select>
+        </label>
+        <label>provider<input id="provider" name="provider" placeholder="dify"></label>
+        <button class="primary" type="submit">查询</button>
+        <button type="button" id="resetButton">重置</button>
+      </form>
+    </section>
+
+    <section class="table-panel">
+      <div class="table-wrap">
+        <table>
+          <colgroup>
+            <col style="width:21%"><col style="width:16%"><col style="width:12%"><col style="width:8%">
+            <col style="width:15%"><col style="width:20%"><col style="width:8%">
+          </colgroup>
+          <thead><tr><th>材料</th><th>运行与时间</th><th>Provider</th><th>Compact</th><th>质量与失败码</th><th>Word 状态</th><th>操作</th></tr></thead>
+          <tbody id="historyBody"><tr><td colspan="7" class="empty">正在读取</td></tr></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" id="previousPage">上一页</button>
+        <span id="pageText">第 1 / 1 页</span>
+        <button type="button" id="nextPage">下一页</button>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const state = { page: 1, page_size: 25, total_pages: 0 };
+    const byId = (id) => document.getElementById(id);
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function statusLabel(status) {
+      return ({
+        running: "运行中", finished: "已完成", needs_manual_review: "待复检",
+        failed: "失败", interrupted: "已中断"
+      })[status] || status || "未知";
+    }
+
+    function statusClass(status) {
+      if (status === "finished") return "good";
+      if (status === "needs_manual_review") return "review";
+      if (status === "running") return "running";
+      if (status === "failed" || status === "interrupted") return "bad";
+      return "";
+    }
+
+    function formatTime(value) {
+      if (!value) return "-";
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function formatDuration(duration_ms) {
+      const value = Number(duration_ms || 0);
+      if (value < 1000) return `${Math.max(0, value)} ms`;
+      return `${(value / 1000).toFixed(value < 10000 ? 1 : 0)} s`;
+    }
+
+    function yesNo(value) { return value ? "是" : "否"; }
+
+    function wordState(label, value) {
+      return `<div class="word-state"><span>${label}</span><b>${yesNo(value)}</b></div>`;
+    }
+
+    function renderRows(items) {
+      if (!items.length) {
+        byId("historyBody").innerHTML = '<tr><td colspan="7" class="empty">没有匹配的分析记录</td></tr>';
+        return;
+      }
+      byId("historyBody").innerHTML = items.map((item) => {
+        const runId = String(item.run_id || "");
+        const detailUrl = `/analysis-runs/${encodeURIComponent(runId)}`;
+        const failureCode = item.primary_failure_code || "无";
+        return `<tr>
+          <td><div class="material-title">${escapeHtml(item.title || "未命名材料")}</div>
+            <div class="meta">${escapeHtml(item.menu_code || "-")} / ${escapeHtml(item.articleid || "-")}</div>
+            <div class="meta mono">${escapeHtml(item.record_id || item.notice_id || "-")}</div></td>
+          <td><div class="stack"><span class="mono">${escapeHtml(runId)}</span>
+            <span>${escapeHtml(formatTime(item.started_at))}</span>
+            <span class="meta">结束：${escapeHtml(formatTime(item.ended_at))} · ${escapeHtml(formatDuration(item.duration_ms))}</span></div></td>
+          <td><div class="stack"><b>${escapeHtml(item.provider || "-")}</b>
+            <span class="meta mono" title="${escapeHtml(item.workflow_run_id || "")}">${escapeHtml(item.workflow_run_id || "无 workflow_run_id")}</span></div></td>
+          <td><b>${Number(item.compact_pack_chars || 0).toLocaleString("zh-CN")}</b><div class="meta">字符</div></td>
+          <td><div class="stack"><span class="badge ${statusClass(item.status)}">${escapeHtml(statusLabel(item.status))}</span>
+            <span class="badge ${item.quality_passed ? "good" : item.needs_manual_review ? "review" : ""}">${escapeHtml(item.quality_status || "质量状态未记录")}</span>
+            <span class="failure">${escapeHtml(failureCode)}</span></div></td>
+          <td><div class="word-grid">
+            ${wordState("Draft", item.draft_word_export_available)}
+            ${wordState("Final", item.final_word_export_available)}
+            ${wordState("Deliverable", item.deliverable)}
+            ${wordState("Manual", item.needs_manual_review)}
+          </div></td>
+          <td><a class="open-link" href="${detailUrl}">查看运行</a></td>
+        </tr>`;
+      }).join("");
+    }
+
+    function buildParams() {
+      const params = new URLSearchParams();
+      const fields = ["q", "articleid", "record_id", "status", "provider"];
+      const controls = { q: "query", articleid: "articleid", record_id: "recordId", status: "status", provider: "provider" };
+      fields.forEach((name) => {
+        const value = byId(controls[name]).value.trim();
+        if (value) params.set(name, value);
+      });
+      params.set("page", String(state.page));
+      params.set("page_size", String(state.page_size));
+      return params;
+    }
+
+    async function loadHistory() {
+      byId("historyBody").innerHTML = '<tr><td colspan="7" class="empty">正在读取</td></tr>';
+      try {
+        const response = await fetch(`/analysis/history?${buildParams().toString()}`, { headers: { Accept: "application/json" } });
+        const data = await response.json();
+        if (!response.ok || data.success === false) throw new Error(data.error?.message || `HTTP ${response.status}`);
+        byId("totalCount").textContent = String(data.total || 0);
+        state.total_pages = Number(data.total_pages || 0);
+        renderRows(Array.isArray(data.items) ? data.items : []);
+        byId("pageText").textContent = `第 ${state.page} / ${Math.max(1, state.total_pages)} 页`;
+        byId("previousPage").disabled = state.page <= 1;
+        byId("nextPage").disabled = !state.total_pages || state.page >= state.total_pages;
+        if (data.enabled === false) {
+          byId("historyBody").innerHTML = '<tr><td colspan="7" class="empty">分析历史功能当前未启用</td></tr>';
+        }
+      } catch (error) {
+        byId("historyBody").innerHTML = `<tr><td colspan="7" class="empty">${escapeHtml(error.message || "读取失败")}</td></tr>`;
+      }
+    }
+
+    function loadInitialFilters() {
+      const params = new URLSearchParams(window.location.search);
+      const mapping = { q: "query", articleid: "articleid", record_id: "recordId", status: "status", provider: "provider" };
+      Object.entries(mapping).forEach(([name, id]) => { if (params.get(name)) byId(id).value = params.get(name); });
+    }
+
+    byId("filters").addEventListener("submit", (event) => { event.preventDefault(); state.page = 1; loadHistory(); });
+    byId("resetButton").addEventListener("click", () => { byId("filters").reset(); state.page = 1; loadHistory(); });
+    byId("previousPage").addEventListener("click", () => { if (state.page > 1) { state.page -= 1; loadHistory(); } });
+    byId("nextPage").addEventListener("click", () => { if (state.page < state.total_pages) { state.page += 1; loadHistory(); } });
+
+    loadInitialFilters();
+    loadHistory();
+  </script>
+</body>
+</html>
