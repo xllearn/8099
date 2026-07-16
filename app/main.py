@@ -52,6 +52,7 @@ from app.compact_pack import (
     reduce_optional_evidence,
     secondary_compression_plan,
 )
+from app.compact_cache import CompactCache, CompactCacheError, compact_cache_enabled
 from app.analysis_history import (
     AnalysisHistoryStore,
     HistoryTopologyError,
@@ -704,6 +705,8 @@ def health() -> dict[str, Any]:
         "report_dir_configured": bool((os.getenv("REPORT_DIR") or "").strip()),
         "report_dir": str(REPORT_DIR),
         "word_export_enabled": _word_export_enabled(),
+        "compact_cache_enabled": compact_cache_enabled(),
+        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
         "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
     }
@@ -2339,7 +2342,7 @@ def _compact_primary_content_limit(primary_source: list[dict[str, Any]], auxilia
     return 7600
 
 
-def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
+def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
     original_pack_chars = len(json.dumps(pack, ensure_ascii=False, sort_keys=True))
     primary_source = [item for item in list(pack.get("primary_materials") or [])[:3] if isinstance(item, dict)]
     auxiliary_source = [item for item in list(pack.get("auxiliary_materials") or [])[:10] if isinstance(item, dict)]
@@ -2816,6 +2819,44 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
     compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
     # The ratio's serialized width can change the final JSON size.
     _refresh_dify_char_fields(compact)
+    return compact
+
+
+def _compact_cache_version_context(pack: dict[str, Any], target_max_chars: int) -> dict[str, Any]:
+    return {
+        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
+        "pack_version": str(pack.get("pack_version") or ""),
+        "evidence_schema_version": pack.get("evidence_schema_version"),
+        "source_evidence_schema_version": pack.get("source_evidence_schema_version"),
+        "pdf_table_rule_version": (os.getenv("PDF_TABLE_RULE_VERSION") or "20260715-text-pdf-v1").strip(),
+        "vbp_fact_extractor_version": str(pack.get("vbp_fact_extractor_version") or ""),
+        "vbp_fact_rules_version": str(pack.get("vbp_fact_rules_version") or ""),
+        "vbp_compact_preservation": _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False),
+        "thresholds": _dify_input_thresholds(),
+        "target_max_chars": target_max_chars,
+    }
+
+
+def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
+    if not compact_cache_enabled():
+        return _compact_evidence_pack_for_dify_uncached(pack, max_chars)
+    target_max_chars = max_chars or _dify_input_thresholds()["hard_limit"]
+    try:
+        compact, status, key = CompactCache.from_environment().get_or_compute(
+            pack,
+            max_chars=target_max_chars,
+            version_context=_compact_cache_version_context(pack, target_max_chars),
+            compute=lambda: _compact_evidence_pack_for_dify_uncached(pack, max_chars),
+        )
+    except CompactCacheError as exc:
+        logger.warning("compact_cache_bypassed error_type=%s", exc.__class__.__name__)
+        return _compact_evidence_pack_for_dify_uncached(pack, max_chars)
+    logger.info(
+        "compact_cache_result pack_id=%s status=%s key_prefix=%s",
+        str(pack.get("pack_id") or "")[:80],
+        status,
+        key[:12],
+    )
     return compact
 
 
