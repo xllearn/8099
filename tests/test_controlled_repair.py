@@ -617,7 +617,11 @@ class ControlledRepairPipelineTests(unittest.TestCase):
         with patch.dict(os.environ, strict_only_env, clear=False), patch.object(
             main_module,
             "_read_analysis_run",
-            side_effect=[{"run_id": "run-s2", "status": "running"}, {"status": "running"}],
+            side_effect=[
+                {"run_id": "run-s2", "status": "running"},
+                {"run_id": "run-s2", "status": "running"},
+                {"status": "running"},
+            ],
         ), patch.object(
             main_module, "_read_database_evidence_pack", return_value=self.pack()
         ), patch.object(
@@ -638,6 +642,7 @@ class ControlledRepairPipelineTests(unittest.TestCase):
             main_module._execute_analysis_run_background("pack-s2", "run-s2")
 
         saved = writes[-1]
+        self.assertTrue(any(isinstance(item.get("timings"), dict) for item in writes))
         self.assertEqual("CONTROLLED_REPAIR_POSTPROCESS_FAILED", saved.get("repair_failure_code"))
         self.assertEqual("needs_manual_review", saved.get("status"))
         self.assertFalse(saved.get("deliverable"))
