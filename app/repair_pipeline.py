@@ -15,13 +15,14 @@ from app.generation.base import ReportGenerationResult
 from app.vbp_quality_gate import evaluate_vbp_quality
 
 
-CONTROLLED_REPAIR_VERSION = "20260715-delete-only-v1"
+CONTROLLED_REPAIR_VERSION = "20260716-delete-or-narrow-v2"
 CONTROLLED_REPAIR_FAILURE_CODE = "CONTROLLED_REPAIR_FAILED"
 _STRUCTURAL_QUALITY_CODES = frozenset(
     {"VBP_REQUIRED_SECTION_MISSING", "VBP_REQUIRED_TOPIC_MISSING"}
 )
 _INPUT_CLAIM_TEXTS_KEY = "_repair_input_claim_texts"
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[。！？!?；;])")
+_CLAUSE_SPLIT_RE = re.compile(r"(?<!\d)[，,](?!\d)")
 _MARKDOWN_SENTENCE_LOCATION_RE = re.compile(r"^markdown\.line\[(\d+)]\.sentence\[(\d+)]$")
 _MARKDOWN_TABLE_LOCATION_RE = re.compile(r"^markdown\.table\[(\d+)]\.row\[(\d+)]$")
 _REPORT_IR_LIST_LOCATION_RE = re.compile(
@@ -255,6 +256,139 @@ def _delete_unsupported_claims(
     )
 
 
+def _replace_sentence_text(value: Any, source: str, replacement: str) -> str:
+    text = str(value or "")
+    candidates = (source, source.replace(",", "，"), source.replace("，", ","))
+    for candidate in dict.fromkeys(candidates):
+        if candidate and candidate in text:
+            return text.replace(candidate, replacement, 1)
+    return text
+
+
+def _replace_markdown_sentences(
+    markdown: str,
+    replacements: dict[str, tuple[str, str]],
+) -> str:
+    lines = str(markdown or "").splitlines()
+    for location, (source, replacement) in replacements.items():
+        match = _MARKDOWN_SENTENCE_LOCATION_RE.fullmatch(location)
+        if not match:
+            continue
+        line_index = int(match.group(1))
+        sentence_index = int(match.group(2))
+        if line_index >= len(lines):
+            continue
+        parts = _SENTENCE_SPLIT_RE.split(lines[line_index])
+        if sentence_index >= len(parts):
+            continue
+        parts[sentence_index] = _replace_sentence_text(
+            parts[sentence_index], source, replacement
+        )
+        lines[line_index] = "".join(parts)
+    return "\n".join(lines)
+
+
+def _replace_report_ir_sentences(
+    report_ir: dict[str, Any] | None,
+    replacements: dict[str, tuple[str, str]],
+) -> dict[str, Any] | None:
+    if not isinstance(report_ir, dict):
+        return None
+    cleaned = copy.deepcopy(report_ir)
+    for location, (source, replacement) in replacements.items():
+        root_match = _REPORT_IR_LIST_LOCATION_RE.fullmatch(location)
+        if root_match:
+            values = cleaned.get(root_match.group(1))
+            value_index = int(root_match.group(2))
+            sentence_index = int(root_match.group(3))
+        else:
+            section_match = _REPORT_IR_SECTION_LIST_LOCATION_RE.fullmatch(location)
+            if not section_match:
+                continue
+            sections = cleaned.get("sections")
+            section_index = int(section_match.group(1))
+            if not isinstance(sections, list) or section_index >= len(sections):
+                continue
+            section = sections[section_index]
+            if not isinstance(section, dict):
+                continue
+            values = section.get(section_match.group(2))
+            value_index = int(section_match.group(3))
+            sentence_index = int(section_match.group(4))
+        if not isinstance(values, list) or value_index >= len(values):
+            continue
+        parts = _SENTENCE_SPLIT_RE.split(str(values[value_index] or ""))
+        if sentence_index >= len(parts):
+            continue
+        parts[sentence_index] = _replace_sentence_text(
+            parts[sentence_index], source, replacement
+        )
+        values[value_index] = "".join(parts)
+    return cleaned
+
+
+def _supported_narrowing(
+    claim: dict[str, Any],
+    pack: dict[str, Any],
+) -> str:
+    source = str(claim.get("text") or "")
+    fragments = [item.strip() for item in _CLAUSE_SPLIT_RE.split(source) if item.strip()]
+    if len(fragments) < 2:
+        return ""
+    supported: list[str] = []
+    for fragment in fragments:
+        index = build_claim_evidence_index(
+            FormalBodyDocument(markdown=fragment),
+            pack,
+        )
+        fragment_claims = [
+            item for item in list(index.get("claims") or []) if isinstance(item, dict)
+        ]
+        if fragment_claims and all(bool(item.get("supported")) for item in fragment_claims):
+            supported.append(fragment)
+    if not supported or len(supported) == len(fragments):
+        return ""
+    return "；".join(supported)
+
+
+def _repair_unsupported_claims(
+    document: FormalBodyDocument,
+    claims: list[dict[str, Any]],
+    pack: dict[str, Any],
+) -> tuple[FormalBodyDocument, set[str]]:
+    replacements: dict[str, tuple[str, str]] = {}
+    narrowed_claim_ids: set[str] = set()
+    for claim in claims:
+        replacement = _supported_narrowing(claim, pack)
+        if not replacement:
+            continue
+        claim_id = str(claim.get("claim_id") or "")
+        source = str(claim.get("text") or "")
+        sentence_locations = [
+            str(location)
+            for location in list(claim.get("locations") or [])
+            if _MARKDOWN_SENTENCE_LOCATION_RE.fullmatch(str(location))
+            or _REPORT_IR_LIST_LOCATION_RE.fullmatch(str(location))
+            or _REPORT_IR_SECTION_LIST_LOCATION_RE.fullmatch(str(location))
+        ]
+        if not sentence_locations:
+            continue
+        narrowed_claim_ids.add(claim_id)
+        for location in sentence_locations:
+            replacements[location] = (source, replacement)
+
+    narrowed = FormalBodyDocument(
+        markdown=_replace_markdown_sentences(document.markdown, replacements),
+        report_ir=_replace_report_ir_sentences(document.report_ir, replacements),
+    )
+    remaining = [
+        claim
+        for claim in claims
+        if str(claim.get("claim_id") or "") not in narrowed_claim_ids
+    ]
+    return _delete_unsupported_claims(narrowed, remaining), narrowed_claim_ids
+
+
 def _clear_word_publication(metadata: dict[str, Any]) -> None:
     for field in _WORD_LOCATOR_FIELDS:
         metadata[field] = ""
@@ -365,7 +499,9 @@ class UnsupportedFactRepairer:
 
         before_hash = _body_hash(document)
         try:
-            repaired_document = _delete_unsupported_claims(document, unsupported)
+            repaired_document, narrowed_claim_ids = _repair_unsupported_claims(
+                document, unsupported, pack
+            )
             after_hash = _body_hash(repaired_document)
         except Exception as exc:  # noqa: BLE001
             return _mark_repair_failure(
@@ -375,7 +511,11 @@ class UnsupportedFactRepairer:
             )
         actions = [
             {
-                "action": "delete_unsupported_claim",
+                "action": (
+                    "narrow_unsupported_claim"
+                    if str(claim.get("claim_id") or "") in narrowed_claim_ids
+                    else "delete_unsupported_claim"
+                ),
                 "claim_id": str(claim.get("claim_id") or ""),
                 "locations": sorted(str(item) for item in list(claim.get("locations") or [])),
                 "before_sha256": before_hash,

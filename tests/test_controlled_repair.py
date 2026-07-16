@@ -158,6 +158,48 @@ class ControlledRepairPipelineTests(unittest.TestCase):
         self.assertEqual(0, repaired.metadata["claim_evidence_index"]["metrics"]["unsupported_claim_count"])
         self.assertTrue(repaired.metadata["vbp_quality_gate"]["passed"])
 
+    def test_markdown_repair_narrows_mixed_sentence_without_deleting_supported_clause(self):
+        original = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_markdown=self.markdown("采购周期为2年，最高有效申报价999元。"),
+            quality_check={"passed": True, "issues": []},
+            metadata={"status": "finished"},
+        )
+
+        repaired = self.run_repair(original)
+
+        self.assertIn("采购周期为2年", repaired.report_markdown)
+        self.assertNotIn("999元", repaired.report_markdown)
+        self.assertTrue(repaired.metadata["repair_success"])
+        self.assertEqual(1, repaired.metadata["repair_count"])
+        self.assertEqual(
+            "narrow_unsupported_claim",
+            repaired.metadata["repair_actions"][0]["action"],
+        )
+        self.assertEqual(0, repaired.metadata["repair_new_fact_count"])
+        self.assertEqual(
+            0,
+            repaired.metadata["claim_evidence_index"]["metrics"]["unsupported_claim_count"],
+        )
+
+    def test_markdown_repair_with_only_unsupported_content_remains_fail_closed(self):
+        original = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_markdown="## 导语\n\n最高有效申报价999元。",
+            quality_check={"passed": False, "issues": []},
+            metadata={"status": "needs_manual_review"},
+        )
+
+        repaired = self.run_repair(original)
+
+        self.assertFalse(repaired.metadata["repair_success"])
+        self.assertEqual("CONTROLLED_REPAIR_OUTPUT_EMPTY", repaired.metadata["repair_failure_code"])
+        self.assertFalse(repaired.metadata["formal_body_present"])
+        self.assertFalse(repaired.metadata["deliverable"])
+        self.assertEqual("", repaired.metadata["word_download_url"])
+
     def test_markdown_table_repair_removes_only_unsupported_row(self):
         markdown = self.markdown(
             "| 规则 | 数值 |\n"
@@ -182,7 +224,7 @@ class ControlledRepairPipelineTests(unittest.TestCase):
     def test_report_ir_repair_handles_sentences_and_table_rows(self):
         report_ir = {
             "title": "项目公告分析",
-            "lead_paragraphs": ["采购周期为2年。最高有效申报价999元。"],
+            "lead_paragraphs": ["采购周期为2年，最高有效申报价999元。"],
             "sections": [
                 {"heading": "公告要点", "paragraphs": [], "highlights": [], "tables": []},
                 {
