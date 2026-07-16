@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -149,7 +150,23 @@ def store_cached_result(attachment: dict[str, Any], result: dict[str, Any]) -> N
         "retry_after_seconds": ttl if status in FAILURE_STATUSES else 0,
         "result": result,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
 
 
 def cleanup_cache() -> dict[str, int]:

@@ -3,13 +3,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 import app.main as main_module
+from app import attachment_cache
 from app.pipeline_timing import PipelineTiming
 
 
@@ -81,6 +84,11 @@ class AttachmentConcurrencyTests(unittest.TestCase):
         self.assertLessEqual(parallel_maximum, 2)
         self.assertEqual(parallel, serial)
 
+    def test_configured_concurrency_above_three_is_hard_capped(self) -> None:
+        _, parallel_maximum, _ = self._run_with_probe(enabled=True, concurrency=99)
+
+        self.assertEqual(3, parallel_maximum)
+
     def test_parallel_completion_keeps_attachment_identity_order_and_hash(self) -> None:
         serial, _, _ = self._run_with_probe(enabled=False, concurrency=3)
         parallel, _, _ = self._run_with_probe(enabled=True, concurrency=3)
@@ -126,6 +134,89 @@ class AttachmentConcurrencyTests(unittest.TestCase):
                 break
             time.sleep(0.01)
         self.assertFalse(any(thread.name.startswith("attachment-parse") for thread in threading.enumerate()))
+
+    def test_attachment_timeout_cancels_task_without_cache_or_background_residue(self) -> None:
+        lock = threading.Lock()
+        active = 0
+        cached_ids: list[str] = []
+
+        def process(row, options=None, _timing=None):
+            nonlocal active
+            options = options or {}
+            with lock:
+                active += 1
+            try:
+                if row["articleattid"] == "att-0":
+                    deadline = time.monotonic() + 0.2
+                    while time.monotonic() < deadline:
+                        cancel_event = options.get("_cancel_event")
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise TimeoutError("cooperative attachment cancellation")
+                        time.sleep(0.002)
+                else:
+                    time.sleep(0.005)
+                return {**self._result(row), "_cache_write_pending": True}
+            finally:
+                with lock:
+                    active -= 1
+
+        def store(attachment, result):
+            cached_ids.append(str(result["articleattid"]))
+
+        with patch.dict(
+            os.environ,
+            {
+                "ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true",
+                "ATTACHMENT_PARSE_CONCURRENCY": "99",
+                "ATTACHMENT_TASK_TIMEOUT_SECONDS": "0.03",
+            },
+            clear=False,
+        ), patch.object(
+            main_module, "_database_attachment_metadata", side_effect=process
+        ), patch.object(main_module, "store_cached_result", side_effect=store):
+            results = main_module._parse_database_attachments_bounded(
+                self.rows, {}, PipelineTiming()
+            )
+
+        self.assertEqual(0, active)
+        self.assertEqual("parse_failed", results[0]["parse_status"])
+        self.assertEqual("timed_out", results[0]["task_status"])
+        self.assertIn("ATTACHMENT_PROCESSING_TIMEOUT", results[0]["warnings"])
+        self.assertEqual(
+            [f"att-{index}" for index in range(1, 6)],
+            sorted(cached_ids, key=lambda value: int(value.split("-")[1])),
+        )
+        self.assertFalse(
+            any(thread.name.startswith("attachment-parse") for thread in threading.enumerate())
+        )
+
+    def test_attachment_cache_write_is_atomic_and_cleans_temporary_file(self) -> None:
+        attachment = {
+            "articleattid": "att-cache",
+            "filename": "cache.pdf",
+            "parse_status": "parsed_summary",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {
+                "ENABLE_ATTACHMENT_PARSE_CACHE": "true",
+                "ATTACHMENT_PARSE_CACHE_DIR": tmpdir,
+            },
+            clear=False,
+        ):
+            attachment_cache.store_cached_result(attachment, attachment)
+            self.assertEqual(1, len(list(Path(tmpdir).glob("*.json"))))
+            self.assertEqual([], list(Path(tmpdir).glob("*.tmp")))
+
+            with patch("app.attachment_cache.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaises(OSError):
+                    attachment_cache.store_cached_result(
+                        {**attachment, "articleattid": "att-cache-failed"},
+                        {**attachment, "articleattid": "att-cache-failed"},
+                    )
+
+            self.assertEqual([], list(Path(tmpdir).glob("*.tmp")))
+            self.assertEqual(1, len(list(Path(tmpdir).glob("*.json"))))
 
     def test_shared_pipeline_timing_does_not_lose_concurrent_updates(self) -> None:
         timing = PipelineTiming()

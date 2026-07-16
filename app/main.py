@@ -15,7 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -4883,6 +4883,36 @@ def _database_attachment_base_metadata(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+class AttachmentTaskTimeout(TimeoutError):
+    pass
+
+
+def _attachment_task_checkpoint(options: dict[str, Any]) -> float | None:
+    cancel_event = options.get("_cancel_event")
+    if isinstance(cancel_event, threading.Event) and cancel_event.is_set():
+        raise AttachmentTaskTimeout("attachment task cancelled")
+    deadline = options.get("_deadline_monotonic")
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        if isinstance(cancel_event, threading.Event):
+            cancel_event.set()
+        raise AttachmentTaskTimeout("attachment task deadline exceeded")
+    return remaining
+
+
+def _store_database_attachment_result(
+    metadata: dict[str, Any],
+    options: dict[str, Any],
+) -> None:
+    _attachment_task_checkpoint(options)
+    if bool(options.get("_defer_cache_write")):
+        metadata["_cache_write_pending"] = True
+        return
+    store_cached_result(metadata, metadata)
+
+
 def _database_attachment_metadata(
     row: dict[str, Any],
     attachment_options: dict[str, Any] | None = None,
@@ -4894,6 +4924,7 @@ def _database_attachment_metadata(
     core_attachment = bool(metadata["core_attachment"])
     business_type = str(metadata["business_type"])
     options = attachment_options or {}
+    _attachment_task_checkpoint(options)
     enable_download = bool(options.get("enable_download", _env_bool("ENABLE_ATTACHMENT_DOWNLOAD", True)))
     force_refresh = bool(options.get("force_refresh"))
     if not enable_download:
@@ -4918,23 +4949,27 @@ def _database_attachment_metadata(
         metadata["stored_original_file"] = False
         metadata["temporary_file_used"] = bool(metadata.get("temporary_file_used", False))
         metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata.get("parse_status") or "")))
+        _attachment_task_checkpoint(options)
         return metadata
 
     attachment_timing = timing or PipelineTiming()
+    remaining_seconds = _attachment_task_checkpoint(options)
     with attachment_timing.measure("attachment_download_ms"):
         download = fetch_attachment_bytes(
             metadata,
             enable_download=enable_download,
             user_cookie=str(options.get("user_cookie") or ""),
             user_headers=options.get("user_headers") if isinstance(options.get("user_headers"), dict) else None,
+            timeout_seconds=remaining_seconds,
         )
+    _attachment_task_checkpoint(options)
     metadata["download_status"] = download.download_status
     metadata["download_auth_mode"] = download.auth_mode
     metadata["warnings"].extend(download.warnings or [])
     if download.download_status != "downloaded" or not download.content:
         metadata["parse_status"] = download.download_status
         metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
-        store_cached_result(metadata, metadata)
+        _store_database_attachment_result(metadata, options)
         return metadata
     if structured_pdf_enabled:
         metadata["content_sha256"] = hashlib.sha256(download.content).hexdigest()
@@ -4948,16 +4983,19 @@ def _database_attachment_metadata(
             metadata["core_attachment_unavailable"] = bool(
                 core_attachment and _attachment_unavailable_for_report(str(metadata.get("parse_status") or ""))
             )
+            _attachment_task_checkpoint(options)
             return metadata
     if not _env_bool("ENABLE_ATTACHMENT_PARSE", True):
         metadata["parse_status"] = "stream_parsed"
         metadata["warnings"].append("附件解析未启用，未提取摘要")
         metadata["core_attachment_unavailable"] = bool(core_attachment)
-        store_cached_result(metadata, metadata)
+        _store_database_attachment_result(metadata, options)
         return metadata
 
+    _attachment_task_checkpoint(options)
     with attachment_timing.measure("attachment_parse_ms"):
         parsed = parse_attachment_bytes(download.content, str(metadata["filename"]), str(metadata["fileext"]), metadata["filesize"])
+    _attachment_task_checkpoint(options)
     statuses = list(parsed.get("parse_statuses") or [])
     metadata["parse_statuses"] = statuses
     metadata["parse_status"] = statuses[-1] if statuses else "parse_failed"
@@ -5000,7 +5038,7 @@ def _database_attachment_metadata(
     if metadata["parse_status"] not in {"unsupported", "parse_failed"}:
         metadata["download_status"] = "stream_parsed"
     metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
-    store_cached_result(metadata, metadata)
+    _store_database_attachment_result(metadata, options)
     return metadata
 
 
@@ -5013,6 +5051,27 @@ def _failed_database_attachment_metadata(row: dict[str, Any], exc: Exception) ->
     return metadata
 
 
+def _timed_out_database_attachment_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = _database_attachment_base_metadata(row)
+    metadata["parse_status"] = "parse_failed"
+    metadata["download_status"] = "download_failed"
+    metadata["task_status"] = "timed_out"
+    metadata["core_attachment_unavailable"] = bool(metadata.get("core_attachment"))
+    metadata["warnings"].append("ATTACHMENT_PROCESSING_TIMEOUT")
+    return metadata
+
+
+@dataclass
+class _AttachmentTaskState:
+    index: int
+    row: dict[str, Any]
+    submitted_ns: int
+    cancel_event: threading.Event
+    started_at: float | None = None
+    deadline: float | None = None
+    timed_out: bool = False
+
+
 def _parse_database_attachments_bounded(
     attachments: list[dict[str, Any]],
     attachment_options: dict[str, Any] | None = None,
@@ -5022,11 +5081,37 @@ def _parse_database_attachments_bounded(
     if not rows:
         return []
     stage_timing = timing or PipelineTiming()
-    options = attachment_options or {}
+    options = dict(attachment_options or {})
+    timeout_seconds = max(0.01, _env_float("ATTACHMENT_TASK_TIMEOUT_SECONDS", 180.0))
 
-    def process(row: dict[str, Any]) -> dict[str, Any]:
+    def process(state: _AttachmentTaskState) -> dict[str, Any]:
+        row = state.row
+        state.started_at = time.monotonic()
+        state.deadline = state.started_at + timeout_seconds
+        task_options = {
+            **options,
+            "_cancel_event": state.cancel_event,
+            "_deadline_monotonic": state.deadline,
+            "_defer_cache_write": True,
+        }
+        stage_timing.add_elapsed("attachment_queue_ms", state.submitted_ns)
         try:
-            return _database_attachment_metadata(row, options, stage_timing)
+            result = _database_attachment_metadata(row, task_options, stage_timing)
+            _attachment_task_checkpoint(task_options)
+            return result
+        except AttachmentTaskTimeout:
+            state.timed_out = True
+            return _timed_out_database_attachment_metadata(row)
+        except TimeoutError as exc:
+            if state.cancel_event.is_set() or time.monotonic() >= float(state.deadline):
+                state.timed_out = True
+                return _timed_out_database_attachment_metadata(row)
+            logger.warning(
+                "database_attachment_processing_failed attachment_id=%s error_type=%s",
+                str(row.get("articleattid") or "")[:80],
+                exc.__class__.__name__,
+            )
+            return _failed_database_attachment_metadata(row, exc)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "database_attachment_processing_failed attachment_id=%s error_type=%s",
@@ -5036,21 +5121,56 @@ def _parse_database_attachments_bounded(
             return _failed_database_attachment_metadata(row, exc)
 
     enabled = _env_bool("ENABLE_CONCURRENT_ATTACHMENT_PARSE", False)
-    worker_count = min(max(1, _env_int("ATTACHMENT_PARSE_CONCURRENCY", 3)), len(rows))
-    if not enabled or worker_count == 1:
-        return [process(row) for row in rows]
-
-    submitted: list[tuple[dict[str, Any], int]] = [
-        (row, time.monotonic_ns()) for row in rows
+    configured_workers = max(1, _env_int("ATTACHMENT_PARSE_CONCURRENCY", 3))
+    worker_count = min(3, configured_workers, len(rows)) if enabled else 1
+    states = [
+        _AttachmentTaskState(
+            index=index,
+            row=row,
+            submitted_ns=time.monotonic_ns(),
+            cancel_event=threading.Event(),
+        )
+        for index, row in enumerate(rows)
     ]
-
-    def queued_process(row: dict[str, Any], submitted_ns: int) -> dict[str, Any]:
-        stage_timing.add_elapsed("attachment_queue_ms", submitted_ns)
-        return process(row)
-
-    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="attachment-parse") as executor:
-        futures = [executor.submit(queued_process, row, submitted_ns) for row, submitted_ns in submitted]
-        results = [future.result() for future in futures]
+    results: list[dict[str, Any] | None] = [None] * len(states)
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="attachment-parse",
+    )
+    future_states = {executor.submit(process, state): state for state in states}
+    pending = set(future_states)
+    try:
+        while pending:
+            done, _ = wait(pending, timeout=0.005, return_when=FIRST_COMPLETED)
+            now = time.monotonic()
+            for future in pending - done:
+                state = future_states[future]
+                if state.deadline is not None and now >= state.deadline:
+                    state.timed_out = True
+                    state.cancel_event.set()
+                    future.cancel()
+            for future in done:
+                state = future_states[future]
+                result = future.result()
+                if state.timed_out and result.get("task_status") != "timed_out":
+                    result = _timed_out_database_attachment_metadata(state.row)
+                cache_pending = bool(result.pop("_cache_write_pending", False))
+                if cache_pending and result.get("task_status") != "timed_out":
+                    try:
+                        store_cached_result(result, result)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "database_attachment_cache_write_failed attachment_id=%s error_type=%s",
+                            str(result.get("articleattid") or "")[:80],
+                            exc.__class__.__name__,
+                        )
+                results[state.index] = result
+                pending.remove(future)
+    finally:
+        for future in pending:
+            future_states[future].cancel_event.set()
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
     logger.info(
         "database_attachment_batch_completed count=%s concurrency=%s queue_ms=%s parse_ms=%s",
         len(rows),
@@ -5058,7 +5178,10 @@ def _parse_database_attachments_bounded(
         stage_timing.snapshot().get("attachment_queue_ms", 0),
         stage_timing.snapshot().get("attachment_parse_ms", 0),
     )
-    return results
+    return [
+        result if isinstance(result, dict) else _failed_database_attachment_metadata(states[index].row, RuntimeError())
+        for index, result in enumerate(results)
+    ]
 
 
 def _material_key_facts(row: dict[str, Any]) -> list[dict[str, str]]:
