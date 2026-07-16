@@ -154,11 +154,7 @@ def publish_docx_atomically(
     staging_path = staging_dir / "candidate.docx"
     published = False
     try:
-        render_started_ns = time.monotonic_ns()
-        try:
-            render(staging_path)
-        finally:
-            _observe_timing(timing_observer, "word_render_ms", render_started_ns)
+        render(staging_path)
         if not staging_path.is_file():
             raise FormalBodySafetyError("DOCX 临时文件未生成")
         scan_started_ns = time.monotonic_ns()

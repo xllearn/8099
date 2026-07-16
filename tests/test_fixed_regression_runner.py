@@ -10,6 +10,36 @@ FIXTURE_PATH = Path(__file__).parent / "fixtures" / "8099_regression_cases.json"
 
 
 class FixedRegressionRunnerTests(unittest.TestCase):
+    def test_regression_timings_preserve_unobserved_stages_as_null(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        timings = runner.build_regression_timings(
+            {
+                "generation_ms": 0,
+                "local_quality_gate_ms": None,
+                "repair_ms": None,
+                "export_check_ms": None,
+                "observation_status": {
+                    "generation_ms": "observed",
+                    "local_quality_gate_ms": "not_observed",
+                    "repair_ms": "not_observed",
+                    "export_check_ms": "not_observed",
+                },
+            },
+            prepare_ms=0,
+            analysis_elapsed_ms=7,
+            word_export_ms=0,
+            total_ms=9,
+        )
+
+        self.assertEqual(0, timings["generation_ms"])
+        self.assertEqual("observed", timings["observation_status"]["generation_ms"])
+        for field in ("local_quality_gate_ms", "repair_ms", "export_check_ms"):
+            self.assertIsNone(timings[field])
+            self.assertEqual("not_observed", timings["observation_status"][field])
+        for field in ("prepare_ms", "word_export_ms", "total_ms"):
+            self.assertEqual("observed", timings["observation_status"][field])
+
     def test_safe_request_retries_stale_keepalive_disconnect(self) -> None:
         from scripts import run_fixed_regression as runner
 

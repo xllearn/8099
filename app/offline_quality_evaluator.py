@@ -24,7 +24,7 @@ from app.regression_manifest import (
 ARTIFACT_SCHEMA_VERSION = "8099.fixed-regression/v2"
 EVALUATION_SCHEMA_VERSION = "8099.regression-evaluation/v1"
 BASELINE_SCHEMA_VERSION = "8099.regression-baseline/v2"
-EVALUATOR_VERSION = "1.5.0"
+EVALUATOR_VERSION = "1.6.0"
 UNSUPPORTED_EVAL_VERSION = "1"
 BASELINE_ENVIRONMENT = "server_test"
 BASELINE_COVERAGE_MODES = ("full", "fixed3_only")
@@ -50,6 +50,11 @@ TIMING_FIELDS = (
     "export_check_ms",
     "word_export_ms",
     "total_ms",
+)
+TIMING_OBSERVATION_STATUSES = (
+    "observed",
+    "not_observed",
+    "collection_failed",
 )
 WORD_ENDPOINTS = (
     "run_download",
@@ -82,6 +87,7 @@ EVALUATOR_RULES = {
     "consistency_fields": list(CONSISTENCY_FIELDS),
     "required_json_snapshots": list(REQUIRED_JSON_SNAPSHOTS),
     "timing_fields": list(TIMING_FIELDS),
+    "timing_observation_statuses": list(TIMING_OBSERVATION_STATUSES),
     "word_endpoints": list(WORD_ENDPOINTS),
     "required_word_snapshots": sorted(REQUIRED_WORD_SNAPSHOTS),
     "baseline_environments": [BASELINE_ENVIRONMENT],
@@ -142,6 +148,43 @@ def _int(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _nullable_timing(value: Any) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        elapsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return elapsed if elapsed >= 0 else None
+
+
+def _normalize_timing_contract(value: Any) -> dict[str, Any]:
+    source = value if isinstance(value, Mapping) else {}
+    raw_statuses = source.get("observation_status")
+    declared_statuses = raw_statuses if isinstance(raw_statuses, Mapping) else {}
+    timings: dict[str, Any] = {}
+    statuses: dict[str, str] = {}
+    for field in TIMING_FIELDS:
+        raw_value = source.get(field) if field in source else None
+        elapsed = _nullable_timing(raw_value) if field in source else None
+        declared = str(declared_statuses.get(field) or "").strip()
+        if declared == "observed":
+            status = "observed" if elapsed is not None else "collection_failed"
+        elif declared in {"not_observed", "collection_failed"}:
+            elapsed = None
+            status = declared
+        elif field in source and elapsed is not None:
+            status = "observed"
+        elif field in source and raw_value is not None and raw_value != "":
+            status = "collection_failed"
+        else:
+            status = "not_observed"
+        timings[field] = elapsed if status == "observed" else None
+        statuses[field] = status
+    timings["observation_status"] = statuses
+    return timings
 
 
 def _float(value: Any) -> float:
@@ -506,6 +549,7 @@ def validate_sample_contract(sample: Mapping[str, Any]) -> None:
     timings = sample.get("timings")
     if not isinstance(timings, Mapping) or any(field not in timings for field in TIMING_FIELDS):
         raise ValueError("sample timings are incomplete")
+    _normalize_timing_contract(timings)
     _normalize_material_bindings(sample.get("material_bindings"), "sample material bindings")
 
 
@@ -673,10 +717,7 @@ def evaluate_artifact(artifact: Mapping[str, Any]) -> dict[str, Any]:
                 "compact_pack_chars": _int(sample.get("compact_pack_chars")),
                 "input_strategy": str(sample.get("input_strategy") or ""),
                 "evidence_pack_sha256": str(sample.get("evidence_pack_sha256") or ""),
-                "timings": {
-                    field: _int((sample.get("timings") or {}).get(field))
-                    for field in TIMING_FIELDS
-                },
+                "timings": _normalize_timing_contract(sample.get("timings")),
                 "quality_status": str(sample.get("quality_status") or ""),
                 "quality_passed": sample.get("quality_passed"),
                 "unsupported_fact_count": _int(sample.get("unsupported_fact_count")),
@@ -1111,7 +1152,7 @@ def _derive_sample_from_snapshots(
     timings_value = word_contract.get("timings")
     if not isinstance(timings_value, Mapping):
         timings_value = {}
-    timings = {field: _int(timings_value.get(field)) for field in TIMING_FIELDS}
+    timings = _normalize_timing_contract(timings_value)
     quality_status = quality_status_from_run(run)
     quality_passed = _quality_passed(run)
     provider = str(run.get("provider") or "").strip()
@@ -1127,7 +1168,7 @@ def _derive_sample_from_snapshots(
         and input_strategy
         and evidence_pack_sha256
         and (provider != "dify" or workflow_run_id)
-        and timings["total_ms"] > 0
+        and int(timings["total_ms"] or 0) > 0
     )
     derived = {
         **dict(sample),
@@ -1168,7 +1209,7 @@ def _derive_sample_from_snapshots(
         "material_bindings": material_bindings,
         "report_chars": len(report_markdown),
         "report_section_count": _report_section_count(report_ir, report_markdown),
-        "elapsed_seconds": round(timings["total_ms"] / 1000, 3),
+        "elapsed_seconds": round(int(timings["total_ms"] or 0) / 1000, 3),
     }
     return derived
 

@@ -260,6 +260,24 @@ class OfflineQualityEvaluatorTests(unittest.TestCase):
         self.assertRegex(first["evaluator_rules_sha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(first["evaluator_version"])
 
+    def test_evaluator_preserves_null_for_unobserved_timing_stage(self) -> None:
+        module = self.evaluator_module()
+        sample = self.clean_result()
+        sample["timings"] = {
+            **sample["timings"],
+            "repair_ms": None,
+            "observation_status": {
+                field: ("not_observed" if field == "repair_ms" else "observed")
+                for field in module.TIMING_FIELDS
+            },
+        }
+
+        evaluation = module.evaluate_artifact(self.artifact([sample]))
+        timings = evaluation["samples"][0]["timings"]
+
+        self.assertIsNone(timings["repair_ms"])
+        self.assertEqual("not_observed", timings["observation_status"]["repair_ms"])
+
     def test_evaluator_aggregates_s2_claim_and_repair_metrics(self) -> None:
         module = self.evaluator_module()
         sample = self.clean_result()

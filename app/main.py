@@ -282,7 +282,7 @@ class ExportReportResponse(BaseModel):
     success: bool = True
     filename: str
     download_url: str
-    timings: dict[str, int] = Field(default_factory=dict)
+    timings: dict[str, Any] = Field(default_factory=dict)
 
 
 class RenderReportRequest(ExportReportRequest):
@@ -314,7 +314,7 @@ class CheckedExportReportResponse(BaseModel):
     blocked: bool = False
     qa_summary: str = ""
     report_markdown: str = ""
-    timings: dict[str, int] = Field(default_factory=dict)
+    timings: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReportQAIssue(BaseModel):
@@ -3145,7 +3145,7 @@ def _safe_int_value(value: Any, default: int = 0) -> int:
         return default
 
 
-def _normalize_run_timings(value: Any) -> dict[str, int]:
+def _normalize_run_timings(value: Any) -> dict[str, Any]:
     return normalize_pipeline_timings(value)
 
 
@@ -4485,9 +4485,9 @@ def _call_dify_workflow(
     result = _normalize_dify_result(response_json, pack_id)
     result["provider"] = "dify"
     result["input_strategy"] = str(policy.get("input_strategy") or "")
-    timings = _normalize_run_timings(result.get("timings"))
-    timings["generation_ms"] = elapsed_ms
-    result["timings"] = timings
+    generation_timing = PipelineTiming(result.get("timings"))
+    generation_timing.observe("generation_ms", elapsed_ms)
+    result["timings"] = generation_timing.snapshot()
     if pack is not None:
         try:
             compact = _compact_evidence_pack_for_dify(pack)
@@ -6424,9 +6424,9 @@ def download_analysis_run_report(run_id: str):
     try:
         if not path.exists():
             if report_ir is not None:
-                _publish_report_ir_docx(report_ir, path, title, word_timing.observe)
+                _publish_report_ir_docx(report_ir, path, title, word_timing)
             else:
-                _publish_markdown_docx(report_markdown, path, title, word_timing.observe)
+                _publish_markdown_docx(report_markdown, path, title, word_timing)
             logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
         else:
             with word_timing.measure("word_scan_ms"):
@@ -6818,7 +6818,7 @@ async def export_report(req: ExportReportRequest) -> ExportReportResponse | JSON
             raise ValueError("报告质量检查未通过：" + "；".join(quality_issues))
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _publish_report_ir_docx(report, path, req.title, word_timing.observe)
+        _publish_report_ir_docx(report, path, req.title, word_timing)
         logger.info("report_export_completed filename=%s timings=%s", filename, word_timing.snapshot(finish=True))
     except (ValueError, FormalBodySafetyError) as exc:
         logger.warning(
@@ -6913,7 +6913,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
             )
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _publish_report_ir_docx(report, path, req.title, word_timing.observe)
+        _publish_report_ir_docx(report, path, req.title, word_timing)
         logger.info(
             "report_export_checked_completed filename=%s qa_status=%s timings=%s",
             filename,
@@ -6960,7 +6960,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         qa_summary = _format_qa_summary(qa)
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _publish_report_ir_docx(report, path, req.title, word_timing.observe)
+        _publish_report_ir_docx(report, path, req.title, word_timing)
     except (ValueError, FormalBodySafetyError) as exc:
         logger.warning(
             "report_export_checked_failed error_type=%s timings=%s",
@@ -8149,12 +8149,19 @@ def _publish_report_ir_docx(
     report: ReportIR,
     path: Path,
     fallback_title: str,
-    timing_observer: Any = None,
+    timing: PipelineTiming | None = None,
 ) -> None:
+    def render(staging_path: Path) -> None:
+        if timing is None:
+            _report_ir_to_docx(report, staging_path, fallback_title)
+            return
+        with timing.measure("word_render_ms"):
+            _report_ir_to_docx(report, staging_path, fallback_title)
+
     publish_docx_atomically(
         path,
-        lambda staging_path: _report_ir_to_docx(report, staging_path, fallback_title),
-        timing_observer=timing_observer,
+        render,
+        timing_observer=timing.observe if timing is not None else None,
     )
 
 
@@ -8162,12 +8169,19 @@ def _publish_markdown_docx(
     markdown: str,
     path: Path,
     title: str,
-    timing_observer: Any = None,
+    timing: PipelineTiming | None = None,
 ) -> None:
+    def render(staging_path: Path) -> None:
+        if timing is None:
+            _markdown_to_docx(markdown, staging_path, title)
+            return
+        with timing.measure("word_render_ms"):
+            _markdown_to_docx(markdown, staging_path, title)
+
     publish_docx_atomically(
         path,
-        lambda staging_path: _markdown_to_docx(markdown, staging_path, title),
-        timing_observer=timing_observer,
+        render,
+        timing_observer=timing.observe if timing is not None else None,
     )
 
 

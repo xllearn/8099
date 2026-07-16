@@ -137,7 +137,11 @@ class AttachmentConcurrencyTests(unittest.TestCase):
         snapshot = timing.snapshot()
         self.assertEqual(snapshot["attachment_parse_ms"], 2000)
         self.assertIn("attachment_queue_ms", snapshot)
-        self.assertGreaterEqual(snapshot["attachment_queue_ms"], 0)
+        self.assertIsNone(snapshot["attachment_queue_ms"])
+        self.assertEqual(
+            "not_observed",
+            snapshot["observation_status"]["attachment_queue_ms"],
+        )
 
 
 if __name__ == "__main__":

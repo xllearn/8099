@@ -85,6 +85,57 @@ FORBIDDEN_PHRASES = (
     "待核实",
 )
 
+
+def _observed_timing(value: Any) -> int | None:
+    if value is None or value == "" or isinstance(value, bool):
+        return None
+    try:
+        elapsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return elapsed if elapsed >= 0 else None
+
+
+def build_regression_timings(
+    state_timings: Mapping[str, Any],
+    *,
+    prepare_ms: int,
+    analysis_elapsed_ms: int,
+    word_export_ms: int,
+    total_ms: int,
+) -> dict[str, Any]:
+    raw_statuses = state_timings.get("observation_status")
+    state_statuses = raw_statuses if isinstance(raw_statuses, Mapping) else {}
+    timings: dict[str, Any] = {
+        "prepare_ms": max(0, int(prepare_ms)),
+        "generation_ms": None,
+        "local_quality_gate_ms": None,
+        "repair_ms": None,
+        "export_check_ms": None,
+        "word_export_ms": max(0, int(word_export_ms)),
+        "total_ms": max(0, int(total_ms)),
+    }
+    statuses = {
+        field: "observed" if field in {"prepare_ms", "word_export_ms", "total_ms"} else "not_observed"
+        for field in TIMING_FIELDS
+    }
+    for field in ("generation_ms", "local_quality_gate_ms", "repair_ms", "export_check_ms"):
+        value = _observed_timing(state_timings.get(field))
+        declared = str(state_statuses.get(field) or "").strip()
+        if declared == "observed" and value is not None:
+            timings[field] = value
+            statuses[field] = "observed"
+        elif declared == "collection_failed":
+            statuses[field] = "collection_failed"
+        elif not declared and value is not None:
+            timings[field] = value
+            statuses[field] = "observed"
+    if statuses["generation_ms"] != "observed":
+        timings["generation_ms"] = max(0, int(analysis_elapsed_ms))
+        statuses["generation_ms"] = "observed"
+    timings["observation_status"] = statuses
+    return timings
+
 def _text_only_attachment_hash(attachment: Mapping[str, Any]) -> dict[str, Any]:
     parsed_text = normalize_source_text(attachment.get("parsed_text"))
     if not parsed_text.strip():
@@ -857,16 +908,13 @@ def run_case(
     input_strategy = str(state.get("input_strategy") or "").strip()
     state_timings = state.get("timings") if isinstance(state.get("timings"), Mapping) else {}
     total_ms = int((time.monotonic() - started) * 1000)
-    timings = {
-        "prepare_ms": prepare_ms,
-        "generation_ms": int(state_timings.get("generation_ms") or analysis_elapsed_ms),
-        "local_quality_gate_ms": int(state_timings.get("local_quality_gate_ms") or 0),
-        "repair_ms": int(state_timings.get("repair_ms") or 0),
-        "export_check_ms": int(state_timings.get("export_check_ms") or 0),
-        "word_export_ms": word_export_ms,
-        "total_ms": total_ms,
-    }
-    timings = {field: max(0, int(timings.get(field) or 0)) for field in TIMING_FIELDS}
+    timings = build_regression_timings(
+        state_timings,
+        prepare_ms=prepare_ms,
+        analysis_elapsed_ms=analysis_elapsed_ms,
+        word_export_ms=word_export_ms,
+        total_ms=total_ms,
+    )
     metrics_complete = bool(
         provider
         and str(state.get("status") or state.get("run_status") or "").strip()
@@ -875,7 +923,7 @@ def run_case(
         and input_strategy
         and evidence_pack
         and (provider != "dify" or workflow_run_id)
-        and timings["total_ms"] > 0
+        and int(timings["total_ms"] or 0) > 0
     )
     if not metrics_complete:
         raise ValueError("run result metrics are incomplete")
