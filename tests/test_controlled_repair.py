@@ -200,6 +200,54 @@ class ControlledRepairPipelineTests(unittest.TestCase):
         self.assertFalse(repaired.metadata["deliverable"])
         self.assertEqual("", repaired.metadata["word_download_url"])
 
+    def test_finalize_narrows_residual_mixed_claim_without_second_repair(self):
+        from app.evidence_index import build_claim_evidence_index
+        from app.repair_pipeline import _finalize_controlled_repair
+
+        markdown = self.markdown("采购周期为2年，最高有效申报价999元。")
+        initial_index = build_claim_evidence_index(
+            FormalBodyDocument(markdown=markdown), self.pack()
+        )
+        result = ReportGenerationResult(
+            success=True,
+            provider="dify",
+            report_markdown=markdown,
+            quality_check={"passed": False, "issues": []},
+            metadata={
+                "status": "needs_manual_review",
+                "repair_attempted": True,
+                "repair_success": False,
+                "repair_count": 1,
+                "repair_finalized": False,
+                "repair_input_claim_ids": [
+                    str(claim.get("claim_id") or "")
+                    for claim in initial_index["claims"]
+                ],
+                "_repair_input_claim_texts": [
+                    str(claim.get("normalized_text") or "")
+                    for claim in initial_index["claims"]
+                ],
+                "repair_actions": [],
+            },
+        )
+
+        repaired = _finalize_controlled_repair(result, self.pack())
+
+        self.assertTrue(repaired.metadata["repair_success"])
+        self.assertEqual(1, repaired.metadata["repair_count"])
+        self.assertNotIn("999元", repaired.report_markdown)
+        self.assertIn("采购周期为2年", repaired.report_markdown)
+        self.assertEqual(
+            0,
+            repaired.metadata["claim_evidence_index"]["metrics"]["unsupported_claim_count"],
+        )
+        self.assertTrue(
+            any(
+                action.get("action") == "narrow_residual_unsupported_claim"
+                for action in repaired.metadata["repair_actions"]
+            )
+        )
+
     def test_markdown_table_repair_removes_only_unsupported_row(self):
         markdown = self.markdown(
             "| 规则 | 数值 |\n"

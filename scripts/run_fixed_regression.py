@@ -50,6 +50,7 @@ DEFAULT_MANIFEST = ROOT / "tests" / "fixtures" / "8099_regression_cases.json"
 TERMINAL_STATUSES = {"finished", "failed", "needs_manual_review"}
 ATTACHMENT_DOWNLOAD_ATTEMPTS = 3
 SAFE_REQUEST_ATTEMPTS = 3
+HISTORY_PAGE_SIZE_MAX = 100
 WORD_FLAGS = (
     "word_export_available",
     "draft_word_export_available",
@@ -286,27 +287,56 @@ def validate_enabled_word_contract(
 ) -> None:
     if formal_body_hits:
         raise ValueError(f"Forbidden phrases found in formal body: {formal_body_hits}")
-    if run_payload.get("word_export_available") is not True:
-        raise ValueError("Word export is not available for a safe formal body")
-    if run_payload.get("draft_word_export_available") is not True:
-        raise ValueError("Draft Word must be available for every safe formal body")
+    run_available = run_payload.get("word_export_available") is True
+    if run_available:
+        if run_payload.get("draft_word_export_available") is not True:
+            raise ValueError("Draft Word must be available for every safe formal body")
 
-    deliverable = run_payload.get("deliverable") is True
-    needs_manual_review = run_payload.get("needs_manual_review") is True
-    final_available = run_payload.get("final_word_export_available") is True
-    if deliverable:
-        if needs_manual_review or not final_available:
-            raise ValueError("Deliverable Word state is contradictory")
-    elif needs_manual_review:
-        if final_available:
-            raise ValueError("Manual-review draft exposed final Word")
+        deliverable = run_payload.get("deliverable") is True
+        needs_manual_review = run_payload.get("needs_manual_review") is True
+        final_available = run_payload.get("final_word_export_available") is True
+        if deliverable:
+            if needs_manual_review or not final_available:
+                raise ValueError("Deliverable Word state is contradictory")
+        elif needs_manual_review:
+            if final_available:
+                raise ValueError("Manual-review draft exposed final Word")
+        else:
+            raise ValueError("Safe Word state is neither deliverable nor manual-review draft")
     else:
-        raise ValueError("Safe Word state is neither deliverable nor manual-review draft")
+        enabled_flags = [
+            field for field in WORD_FLAGS if run_payload.get(field) is not False
+        ]
+        if run_payload.get("word_download_available") not in {None, False}:
+            enabled_flags.append("word_download_available")
+        if enabled_flags:
+            raise ValueError(
+                f"Fail-closed run has enabled Word flags: {', '.join(enabled_flags)}"
+            )
+        exposed_locators = [
+            field
+            for field in (*WORD_LOCATORS, *WORD_METADATA)
+            if str(run_payload.get(field) or "").strip()
+        ]
+        if exposed_locators or run_payload.get("word_generated") not in {None, False}:
+            raise ValueError("Fail-closed run exposed Word download metadata")
+        if run_payload.get("deliverable") is True:
+            raise ValueError("Fail-closed run cannot be deliverable")
+        run_id = str(run_payload.get("run_id") or "").strip()
+        run_artifacts = [
+            name for name in created_docx if run_id and run_id in str(name)
+        ]
+        if run_artifacts:
+            raise ValueError(
+                f"Fail-closed run created run-specific Word files: {run_artifacts}"
+            )
 
+    expected_statuses = {name: 200 for name in WORD_ENDPOINTS}
+    expected_statuses["run_download"] = 200 if run_available else 409
     bad_statuses = {
         name: endpoint_statuses.get(name)
-        for name in WORD_ENDPOINTS
-        if endpoint_statuses.get(name) != 200
+        for name, expected in expected_statuses.items()
+        if endpoint_statuses.get(name) != expected
     }
     if bad_statuses:
         raise ValueError(f"Enabled Word endpoint status mismatch: {bad_statuses}")
@@ -320,6 +350,47 @@ def validate_enabled_word_contract(
         raise ValueError(f"Forbidden phrases found in Word outputs: {unsafe}")
     if staging_artifacts:
         raise ValueError(f"Word staging artifacts remain: {staging_artifacts}")
+
+
+def validate_word_download_response(
+    response: httpx.Response,
+    name: str,
+    *,
+    available: bool,
+) -> bool:
+    expected_status = 200 if available else 409
+    if response.status_code != expected_status:
+        raise ValueError(
+            f"{name} download returned HTTP {response.status_code}, expected {expected_status}: "
+            f"{response.text[:300]}"
+        )
+    if available:
+        return True
+
+    body = _json_body(response)
+    error = body.get("error") if isinstance(body.get("error"), dict) else {}
+    if body.get("success") is not False or error.get("code") != "WORD_BODY_SAFETY_FAILED":
+        raise ValueError(f"{name} did not return the fail-closed Word error")
+    exposed_headers = {
+        header: response.headers.get(header)
+        for header in ("location", "content-disposition")
+        if str(response.headers.get(header) or "").strip()
+    }
+    if exposed_headers:
+        raise ValueError(f"{name} exposed Word download metadata in response headers")
+    serialized = json.dumps(body, ensure_ascii=False, sort_keys=True)
+    exposed_markers = (
+        "/download/",
+        ".docx",
+        "word_download_url",
+        "download_url",
+        "word_filename",
+        "word_file_path",
+        "word_path",
+    )
+    if any(marker in serialized for marker in exposed_markers):
+        raise ValueError(f"{name} exposed a Word download locator while unavailable")
+    return False
 
 
 def forbidden_phrase_hits(text: str) -> list[str]:
@@ -656,7 +727,7 @@ def _history_for_run(
                 "menu_code": case["menu_code"],
                 "articleid": case["articleid"],
                 "page": 1,
-                "page_size": 200,
+                "page_size": HISTORY_PAGE_SIZE_MAX,
             },
             timeout=60,
         ),
@@ -813,9 +884,18 @@ def run_case(
             "export.docx": export_download,
             "checked.docx": checked_download,
         }
+        availability = {
+            "run.docx": state.get("word_export_available") is True,
+            "export.docx": True,
+            "checked.docx": True,
+        }
         for name, response in downloads.items():
-            if response.status_code != 200:
-                raise ValueError(f"{name} download failed with HTTP {response.status_code}: {response.text[:300]}")
+            if not validate_word_download_response(
+                response,
+                name,
+                available=availability[name],
+            ):
+                continue
             downloaded_path = artifact_dir / name
             word_scan_hits[name] = _save_and_scan_docx(response.content, downloaded_path)
             snapshots[f"word_{Path(name).stem}"] = {

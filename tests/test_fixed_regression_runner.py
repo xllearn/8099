@@ -275,6 +275,133 @@ class FixedRegressionRunnerTests(unittest.TestCase):
             [],
         )
 
+    def test_runner_accepts_fail_closed_run_when_global_word_export_is_enabled(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        payload = {
+            "run_id": "run-1",
+            "deliverable": False,
+            "needs_manual_review": True,
+            "word_download_available": False,
+            "word_export_available": False,
+            "draft_word_export_available": False,
+            "final_word_export_available": False,
+            "word_download_url": "",
+            "download_url": "",
+            "word_filename": "",
+            "word_file_path": "",
+            "word_path": "",
+            "word_generated": False,
+            "word_exported_at": "",
+        }
+        statuses = {
+            "run_download": 409,
+            "report_export": 200,
+            "report_export_checked": 200,
+            "file_download": 200,
+        }
+
+        runner.validate_enabled_word_contract(
+            payload,
+            statuses,
+            ["export.docx", "checked.docx"],
+            {"export.docx": [], "checked.docx": []},
+            [],
+        )
+
+        response = httpx.Response(
+            409,
+            json={
+                "success": False,
+                "error": {
+                    "code": "WORD_BODY_SAFETY_FAILED",
+                    "message": "formal body unavailable",
+                },
+            },
+            request=httpx.Request("GET", "http://test/analysis/runs/run-1/download"),
+        )
+        self.assertFalse(
+            runner.validate_word_download_response(
+                response,
+                "run.docx",
+                available=False,
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            runner.validate_enabled_word_contract(
+                {**payload, "word_download_available": True},
+                statuses,
+                ["export.docx", "checked.docx"],
+                {"export.docx": [], "checked.docx": []},
+                [],
+            )
+        with self.assertRaises(ValueError):
+            runner.validate_enabled_word_contract(
+                payload,
+                statuses,
+                ["report_run-1.docx", "export.docx", "checked.docx"],
+                {
+                    "report_run-1.docx": [],
+                    "export.docx": [],
+                    "checked.docx": [],
+                },
+                [],
+            )
+
+        for headers in (
+            {"Location": "/download/report.docx"},
+            {"Content-Disposition": 'attachment; filename="report.docx"'},
+        ):
+            with self.subTest(headers=headers), self.assertRaises(ValueError):
+                leaked_response = httpx.Response(
+                    409,
+                    headers=headers,
+                    json={
+                        "success": False,
+                        "error": {
+                            "code": "WORD_BODY_SAFETY_FAILED",
+                            "message": "formal body unavailable",
+                        },
+                    },
+                    request=httpx.Request(
+                        "GET", "http://test/analysis/runs/run-1/download"
+                    ),
+                )
+                runner.validate_word_download_response(
+                    leaked_response,
+                    "run.docx",
+                    available=False,
+                )
+
+    def test_history_lookup_respects_api_max_page_size(self) -> None:
+        from scripts import run_fixed_regression as runner
+
+        class HistoryClient:
+            def __init__(self) -> None:
+                self.list_params = None
+
+            def get(self, path: str, params=None, timeout: int = 60):
+                if path == "/analysis/history/run-1":
+                    body = {"success": True, "item": {"run_id": "run-1"}}
+                else:
+                    self.list_params = dict(params or {})
+                    body = {"success": True, "items": [{"run_id": "run-1"}]}
+                return httpx.Response(
+                    200,
+                    json=body,
+                    request=httpx.Request("GET", f"http://test{path}"),
+                )
+
+        client = HistoryClient()
+        runner._history_for_run(
+            client,
+            "run-1",
+            {"menu_code": "project_notice", "articleid": "notice-1"},
+        )
+
+        self.assertEqual(100, client.list_params["page_size"])
+
     def test_runner_rejects_enabled_word_contradiction_hits_or_staging_residue(self) -> None:
         from scripts import run_fixed_regression as runner
 

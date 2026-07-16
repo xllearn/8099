@@ -15,7 +15,7 @@ from app.generation.base import ReportGenerationResult
 from app.vbp_quality_gate import evaluate_vbp_quality
 
 
-CONTROLLED_REPAIR_VERSION = "20260716-delete-or-narrow-v2"
+CONTROLLED_REPAIR_VERSION = "20260716-delete-narrow-residual-v3"
 CONTROLLED_REPAIR_FAILURE_CODE = "CONTROLLED_REPAIR_FAILED"
 _STRUCTURAL_QUALITY_CODES = frozenset(
     {"VBP_REQUIRED_SECTION_MISSING", "VBP_REQUIRED_TOPIC_MISSING"}
@@ -258,7 +258,9 @@ def _delete_unsupported_claims(
 
 def _replace_sentence_text(value: Any, source: str, replacement: str) -> str:
     text = str(value or "")
-    candidates = (source, source.replace(",", "，"), source.replace("，", ","))
+    to_full_width = str.maketrans({",": "，", ":": "：", "(": "（", ")": "）"})
+    to_ascii = str.maketrans({"，": ",", "：": ":", "（": "(", "）": ")"})
+    candidates = (source, source.translate(to_full_width), source.translate(to_ascii))
     for candidate in dict.fromkeys(candidates):
         if candidate and candidate in text:
             return text.replace(candidate, replacement, 1)
@@ -268,8 +270,9 @@ def _replace_sentence_text(value: Any, source: str, replacement: str) -> str:
 def _replace_markdown_sentences(
     markdown: str,
     replacements: dict[str, tuple[str, str]],
-) -> str:
+) -> tuple[str, set[str]]:
     lines = str(markdown or "").splitlines()
+    changed_locations: set[str] = set()
     for location, (source, replacement) in replacements.items():
         match = _MARKDOWN_SENTENCE_LOCATION_RE.fullmatch(location)
         if not match:
@@ -281,20 +284,22 @@ def _replace_markdown_sentences(
         parts = _SENTENCE_SPLIT_RE.split(lines[line_index])
         if sentence_index >= len(parts):
             continue
-        parts[sentence_index] = _replace_sentence_text(
-            parts[sentence_index], source, replacement
-        )
+        original = parts[sentence_index]
+        parts[sentence_index] = _replace_sentence_text(original, source, replacement)
+        if parts[sentence_index] != original:
+            changed_locations.add(location)
         lines[line_index] = "".join(parts)
-    return "\n".join(lines)
+    return "\n".join(lines), changed_locations
 
 
 def _replace_report_ir_sentences(
     report_ir: dict[str, Any] | None,
     replacements: dict[str, tuple[str, str]],
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, set[str]]:
     if not isinstance(report_ir, dict):
-        return None
+        return None, set()
     cleaned = copy.deepcopy(report_ir)
+    changed_locations: set[str] = set()
     for location, (source, replacement) in replacements.items():
         root_match = _REPORT_IR_LIST_LOCATION_RE.fullmatch(location)
         if root_match:
@@ -320,11 +325,12 @@ def _replace_report_ir_sentences(
         parts = _SENTENCE_SPLIT_RE.split(str(values[value_index] or ""))
         if sentence_index >= len(parts):
             continue
-        parts[sentence_index] = _replace_sentence_text(
-            parts[sentence_index], source, replacement
-        )
+        original = parts[sentence_index]
+        parts[sentence_index] = _replace_sentence_text(original, source, replacement)
+        if parts[sentence_index] != original:
+            changed_locations.add(location)
         values[value_index] = "".join(parts)
-    return cleaned
+    return cleaned, changed_locations
 
 
 def _supported_narrowing(
@@ -346,9 +352,28 @@ def _supported_narrowing(
         ]
         if fragment_claims and all(bool(item.get("supported")) for item in fragment_claims):
             supported.append(fragment)
-    if not supported or len(supported) == len(fragments):
+    if not supported:
         return ""
-    return "；".join(supported)
+    joined = "；".join(supported)
+    candidates = [
+        joined,
+        *sorted(supported, key=lambda item: (-len(item), fragments.index(item))),
+    ]
+    for candidate in dict.fromkeys(candidates):
+        if not candidate or candidate == source:
+            continue
+        index = build_claim_evidence_index(
+            FormalBodyDocument(markdown=candidate),
+            pack,
+        )
+        candidate_claims = [
+            item for item in list(index.get("claims") or []) if isinstance(item, dict)
+        ]
+        if candidate_claims and all(
+            bool(item.get("supported")) for item in candidate_claims
+        ):
+            return candidate
+    return ""
 
 
 def _repair_unsupported_claims(
@@ -357,7 +382,7 @@ def _repair_unsupported_claims(
     pack: dict[str, Any],
 ) -> tuple[FormalBodyDocument, set[str]]:
     replacements: dict[str, tuple[str, str]] = {}
-    narrowed_claim_ids: set[str] = set()
+    claim_locations: dict[str, set[str]] = {}
     for claim in claims:
         replacement = _supported_narrowing(claim, pack)
         if not replacement:
@@ -373,13 +398,27 @@ def _repair_unsupported_claims(
         ]
         if not sentence_locations:
             continue
-        narrowed_claim_ids.add(claim_id)
+        claim_locations[claim_id] = set(sentence_locations)
         for location in sentence_locations:
             replacements[location] = (source, replacement)
 
+    narrowed_markdown, markdown_changes = _replace_markdown_sentences(
+        document.markdown,
+        replacements,
+    )
+    narrowed_report_ir, report_ir_changes = _replace_report_ir_sentences(
+        document.report_ir,
+        replacements,
+    )
+    changed_locations = markdown_changes | report_ir_changes
+    narrowed_claim_ids = {
+        claim_id
+        for claim_id, locations in claim_locations.items()
+        if locations & changed_locations
+    }
     narrowed = FormalBodyDocument(
-        markdown=_replace_markdown_sentences(document.markdown, replacements),
-        report_ir=_replace_report_ir_sentences(document.report_ir, replacements),
+        markdown=narrowed_markdown,
+        report_ir=narrowed_report_ir,
     )
     remaining = [
         claim
@@ -632,8 +671,46 @@ def _finalize_controlled_repair(
     pack: dict[str, Any],
 ) -> ReportGenerationResult:
     document = FormalBodyDocument(markdown=result.report_markdown, report_ir=result.report_ir)
+    residual_actions: list[dict[str, Any]] = []
     try:
         claim_index = build_claim_evidence_index(document, pack)
+        residual_claims = [
+            claim
+            for claim in list(claim_index.get("claims") or [])
+            if isinstance(claim, dict) and not bool(claim.get("supported"))
+        ]
+        residual_narrowed_claim_ids: set[str] = set()
+        if residual_claims:
+            before_hash = _body_hash(document)
+            cleaned_document, residual_narrowed_claim_ids = _repair_unsupported_claims(
+                document,
+                residual_claims,
+                pack,
+            )
+            after_hash = _body_hash(cleaned_document)
+            if before_hash != after_hash:
+                residual_actions = [
+                    {
+                        "action": (
+                            "narrow_residual_unsupported_claim"
+                            if str(claim.get("claim_id") or "")
+                            in residual_narrowed_claim_ids
+                            else "delete_residual_unsupported_claim"
+                        ),
+                        "claim_id": str(claim.get("claim_id") or ""),
+                        "locations": sorted(
+                            str(item) for item in list(claim.get("locations") or [])
+                        ),
+                        "before_sha256": before_hash,
+                        "after_sha256": after_hash,
+                    }
+                    for claim in sorted(
+                        residual_claims,
+                        key=lambda item: str(item.get("claim_id") or ""),
+                    )
+                ]
+                document = cleaned_document
+                claim_index = build_claim_evidence_index(document, pack)
         vbp_gate = evaluate_vbp_quality(document, pack, claim_index)
         safety = scan_formal_body(document)
     except Exception as exc:  # noqa: BLE001
@@ -643,6 +720,12 @@ def _finalize_controlled_repair(
             error_type=exc.__class__.__name__,
         )
 
+    validated_result = replace(
+        result,
+        report_markdown=document.markdown,
+        report_ir=document.report_ir,
+    )
+
     metadata_updates = {
         "claim_evidence_index": claim_index,
         "vbp_quality_gate": vbp_gate,
@@ -650,6 +733,10 @@ def _finalize_controlled_repair(
         "body_safety_passed": safety.safe,
         "forbidden_phrase_hits": [
             {"phrase": hit.phrase, "location": hit.location} for hit in safety.hits
+        ],
+        "repair_actions": [
+            *list(result.metadata.get("repair_actions") or []),
+            *residual_actions,
         ],
     }
     input_claim_ids = {
@@ -691,25 +778,25 @@ def _finalize_controlled_repair(
     )
     if not safety.has_body:
         return _mark_repair_failure(
-            result,
+            validated_result,
             "CONTROLLED_REPAIR_OUTPUT_EMPTY",
             metadata_updates=metadata_updates,
         )
     if not safety.safe:
         return _mark_repair_failure(
-            result,
+            validated_result,
             "CONTROLLED_REPAIR_SAFETY_FAILED",
             metadata_updates=metadata_updates,
         )
     if int(claim_index.get("metrics", {}).get("unsupported_claim_count") or 0) > 0:
         return _mark_repair_failure(
-            result,
+            validated_result,
             "CONTROLLED_REPAIR_UNSUPPORTED_REMAINS",
             metadata_updates=metadata_updates,
         )
     if new_claim_ids:
         return _mark_repair_failure(
-            result,
+            validated_result,
             "CONTROLLED_REPAIR_NEW_FACT_DETECTED",
             metadata_updates=metadata_updates,
         )
@@ -728,7 +815,7 @@ def _finalize_controlled_repair(
         ]
         if not gate_codes or evidence_safety_codes:
             return _mark_repair_failure(
-                result,
+                validated_result,
                 "CONTROLLED_REPAIR_VBP_GATE_FAILED",
                 metadata_updates={
                     **metadata_updates,
@@ -781,4 +868,4 @@ def _finalize_controlled_repair(
             ),
         }
     )
-    return replace(result, metadata=metadata)
+    return replace(validated_result, metadata=metadata)
