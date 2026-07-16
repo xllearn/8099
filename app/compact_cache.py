@@ -16,6 +16,7 @@ DEFAULT_COMPACT_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 DEFAULT_COMPACT_CACHE_MAX_ENTRY_BYTES = 2 * 1024 * 1024
 
 _CACHE_LOCKS = tuple(threading.Lock() for _ in range(64))
+_NON_CONTENT_PACK_FIELDS = frozenset({"timings"})
 
 
 class CompactCacheError(RuntimeError):
@@ -46,6 +47,10 @@ def compact_cache_enabled() -> bool:
     return (os.getenv("ENABLE_COMPACT_CACHE") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def compact_content_view(pack: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in pack.items() if key not in _NON_CONTENT_PACK_FIELDS}
+
+
 def compact_cache_key(
     pack: Mapping[str, Any],
     *,
@@ -56,7 +61,7 @@ def compact_cache_key(
         "cache_schema_version": COMPACT_CACHE_SCHEMA_VERSION,
         "max_chars": int(max_chars),
         "version_context": dict(version_context),
-        "evidence_pack": dict(pack),
+        "evidence_pack": compact_content_view(pack),
     }
     return hashlib.sha256(_canonical_bytes(payload)).hexdigest()
 

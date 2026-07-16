@@ -52,7 +52,7 @@ from app.compact_pack import (
     reduce_optional_evidence,
     secondary_compression_plan,
 )
-from app.compact_cache import CompactCache, CompactCacheError, compact_cache_enabled
+from app.compact_cache import CompactCache, CompactCacheError, compact_cache_enabled, compact_content_view
 from app.analysis_history import (
     AnalysisHistoryStore,
     HistoryTopologyError,
@@ -2343,7 +2343,7 @@ def _compact_primary_content_limit(primary_source: list[dict[str, Any]], auxilia
 
 
 def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
-    original_pack_chars = len(json.dumps(pack, ensure_ascii=False, sort_keys=True))
+    original_pack_chars = len(json.dumps(compact_content_view(pack), ensure_ascii=False, sort_keys=True))
     primary_source = [item for item in list(pack.get("primary_materials") or [])[:3] if isinstance(item, dict)]
     auxiliary_source = [item for item in list(pack.get("auxiliary_materials") or [])[:10] if isinstance(item, dict)]
     thresholds = _dify_input_thresholds()

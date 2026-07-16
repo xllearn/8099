@@ -83,6 +83,15 @@ class CompactCacheTests(unittest.TestCase):
         self.assertNotIn(baseline, keys)
         self.assertEqual(len(keys), len(variants))
 
+    def test_runtime_timings_do_not_change_content_cache_key(self) -> None:
+        with_timings = copy.deepcopy(self.pack)
+        with_timings["timings"] = {"prepare_ms": 17, "total_ms": 29}
+
+        baseline = compact_cache_key(self.pack, max_chars=80000, version_context=self.versions)
+        timed = compact_cache_key(with_timings, max_chars=80000, version_context=self.versions)
+
+        self.assertEqual(timed, baseline)
+
     def test_miss_then_hit_returns_byte_identical_value_and_computes_once(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cache = CompactCache(Path(directory), ttl_seconds=60, clock=lambda: 1000.0)
@@ -222,6 +231,22 @@ class CompactCacheTests(unittest.TestCase):
             cache_text = "\n".join(path.read_text(encoding="utf-8") for path in Path(directory).glob("*.json"))
             self.assertNotIn("SECRET_DATABASE_PASSWORD", cache_text)
             self.assertNotIn("SECRET_REPORT_BODY", cache_text)
+
+    def test_runtime_timings_do_not_change_compact_output_fingerprint(self) -> None:
+        baseline = main_module._compact_evidence_pack_for_dify_uncached(copy.deepcopy(self.pack))
+        with_timings = copy.deepcopy(self.pack)
+        with_timings["timings"] = {
+            "prepare_ms": 17,
+            "attachment_parse_ms": 23,
+            "total_ms": 41,
+        }
+
+        timed = main_module._compact_evidence_pack_for_dify_uncached(with_timings)
+
+        self.assertEqual(
+            json.dumps(timed, ensure_ascii=False, sort_keys=True),
+            json.dumps(baseline, ensure_ascii=False, sort_keys=True),
+        )
 
 
 if __name__ == "__main__":
