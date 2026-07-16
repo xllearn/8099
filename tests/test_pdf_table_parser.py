@@ -451,6 +451,7 @@ class PdfTableParserTests(unittest.TestCase):
             {
                 "ENABLE_STRUCTURED_PDF_TABLES": "true",
                 "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
             },
             clear=False,
         ), patch.object(

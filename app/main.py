@@ -43,6 +43,11 @@ from pypdf import PdfReader
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
+from app.attachment_task_process import (
+    AttachmentTaskProcessError,
+    AttachmentTaskProcessTimeout,
+    run_attachment_task_isolated,
+)
 from app.pdf_table_parser import rule_version as pdf_table_rule_version
 from app.compact_pack import (
     CompactPolicyError,
@@ -5130,6 +5135,15 @@ def _failed_database_attachment_metadata(row: dict[str, Any], exc: Exception) ->
     return metadata
 
 
+def _database_attachment_metadata_process_worker(
+    row: dict[str, Any],
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    timing = PipelineTiming()
+    result = _database_attachment_metadata(row, options, timing)
+    return {"result": result, "timings": timing.snapshot()}
+
+
 def _timed_out_database_attachment_metadata(row: dict[str, Any]) -> dict[str, Any]:
     metadata = _database_attachment_base_metadata(row)
     metadata["parse_status"] = "parse_failed"
@@ -5175,9 +5189,37 @@ def _parse_database_attachments_bounded(
         }
         stage_timing.add_elapsed("attachment_queue_ms", state.submitted_ns)
         try:
-            result = _database_attachment_metadata(row, task_options, stage_timing)
+            if _env_bool("ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION", True):
+                child_options = {
+                    key: value
+                    for key, value in task_options.items()
+                    if key not in {"_cancel_event", "_deadline_monotonic"}
+                }
+                child_options["_deadline_monotonic"] = state.deadline
+                payload = run_attachment_task_isolated(
+                    row,
+                    child_options,
+                    worker_path="app.main:_database_attachment_metadata_process_worker",
+                    timeout_seconds=max(0.01, float(state.deadline) - time.monotonic()),
+                    cancel_event=state.cancel_event,
+                )
+                if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+                    raise AttachmentTaskProcessError("attachment worker result is invalid")
+                result = dict(payload["result"])
+                child_timings = payload.get("timings")
+                if isinstance(child_timings, dict):
+                    statuses = child_timings.get("observation_status")
+                    statuses = statuses if isinstance(statuses, dict) else {}
+                    for field in ("attachment_download_ms", "attachment_parse_ms"):
+                        if statuses.get(field) == "observed":
+                            stage_timing.add_ms(field, child_timings.get(field))
+            else:
+                result = _database_attachment_metadata(row, task_options, stage_timing)
             _attachment_task_checkpoint(task_options)
             return result
+        except AttachmentTaskProcessTimeout:
+            state.timed_out = True
+            return _timed_out_database_attachment_metadata(row)
         except AttachmentTaskTimeout:
             state.timed_out = True
             return _timed_out_database_attachment_metadata(row)

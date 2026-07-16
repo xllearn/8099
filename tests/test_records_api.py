@@ -753,6 +753,7 @@ class RecordsApiTests(unittest.TestCase):
             {
                 "ENABLE_ATTACHMENT_PARSE": "true",
                 "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
                 "ATTACHMENT_COOKIE": "",
                 "ATTACHMENT_HEADERS_JSON": "",
                 "ELIAN_QX_COOKIE": "",
@@ -841,6 +842,7 @@ class RecordsApiTests(unittest.TestCase):
                 "ENABLE_ATTACHMENT_DOWNLOAD": "false",
                 "ENABLE_ATTACHMENT_PARSE": "true",
                 "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
                 "ATTACHMENT_COOKIE": "",
                 "ATTACHMENT_HEADERS_JSON": "",
                 "ELIAN_QX_COOKIE": "",

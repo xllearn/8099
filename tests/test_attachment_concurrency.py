@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
+import multiprocessing
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -65,6 +68,7 @@ class AttachmentConcurrencyTests(unittest.TestCase):
         env = {
             "ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true" if enabled else "false",
             "ATTACHMENT_PARSE_CONCURRENCY": str(concurrency),
+            "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
         }
         timing = PipelineTiming()
         with patch.dict(os.environ, env, clear=False), patch.object(
@@ -113,7 +117,11 @@ class AttachmentConcurrencyTests(unittest.TestCase):
 
         with patch.dict(
             os.environ,
-            {"ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true", "ATTACHMENT_PARSE_CONCURRENCY": "3"},
+            {
+                "ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true",
+                "ATTACHMENT_PARSE_CONCURRENCY": "3",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
+            },
             clear=False,
         ), patch.object(main_module, "_database_attachment_metadata", side_effect=process):
             results = main_module._parse_database_attachments_bounded(self.rows, {}, PipelineTiming())
@@ -169,6 +177,7 @@ class AttachmentConcurrencyTests(unittest.TestCase):
                 "ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true",
                 "ATTACHMENT_PARSE_CONCURRENCY": "99",
                 "ATTACHMENT_TASK_TIMEOUT_SECONDS": "0.03",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
             },
             clear=False,
         ), patch.object(
@@ -188,6 +197,74 @@ class AttachmentConcurrencyTests(unittest.TestCase):
         )
         self.assertFalse(
             any(thread.name.startswith("attachment-parse") for thread in threading.enumerate())
+        )
+
+    def test_uncooperative_attachment_process_is_killed_at_deadline_without_temp_residue(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            module_name = "blocking_attachment_worker_fixture"
+            (root / f"{module_name}.py").write_text(
+                "import time\n"
+                "def run(row, options):\n"
+                "    time.sleep(60)\n"
+                "    return {'result': row, 'timings': {}}\n",
+                encoding="utf-8",
+            )
+            sys.path.insert(0, str(root))
+            try:
+                process_module = importlib.import_module("app.attachment_task_process")
+                active_before = {child.pid for child in multiprocessing.active_children()}
+                started = time.monotonic()
+                with patch.dict(
+                    os.environ,
+                    {"ATTACHMENT_TEMP_DIR": str(root / "task-temp")},
+                    clear=False,
+                ), self.assertRaises(process_module.AttachmentTaskProcessTimeout):
+                    process_module.run_attachment_task_isolated(
+                        {"articleattid": "att-blocked"},
+                        {},
+                        worker_path=f"{module_name}:run",
+                        timeout_seconds=0.1,
+                    )
+                elapsed = time.monotonic() - started
+            finally:
+                sys.path.remove(str(root))
+                sys.modules.pop(module_name, None)
+
+            self.assertLess(elapsed, 2.0)
+            self.assertEqual(
+                active_before,
+                {child.pid for child in multiprocessing.active_children()},
+            )
+            task_temp = root / "task-temp"
+            self.assertTrue(task_temp.is_dir())
+            self.assertEqual([], list(task_temp.iterdir()))
+
+    def test_process_isolation_preserves_attachment_identity_and_releases_children(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {
+                "ENABLE_CONCURRENT_ATTACHMENT_PARSE": "true",
+                "ATTACHMENT_PARSE_CONCURRENCY": "3",
+                "ATTACHMENT_TASK_TIMEOUT_SECONDS": "30",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "true",
+                "ATTACHMENT_TEMP_DIR": tmpdir,
+            },
+            clear=False,
+        ):
+            results = main_module._parse_database_attachments_bounded(
+                self.rows[:3],
+                {"enable_download": False},
+                PipelineTiming(),
+            )
+
+        self.assertEqual(
+            ["att-0", "att-1", "att-2"],
+            [result["articleattid"] for result in results],
+        )
+        self.assertTrue(all(result["download_status"] == "metadata_only" for result in results))
+        self.assertFalse(
+            any(child.name == "attachment-task-process" for child in multiprocessing.active_children())
         )
 
     def test_attachment_cache_write_is_atomic_and_cleans_temporary_file(self) -> None:
