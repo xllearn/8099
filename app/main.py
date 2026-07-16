@@ -705,6 +705,7 @@ def health() -> dict[str, Any]:
         "report_dir_configured": bool((os.getenv("REPORT_DIR") or "").strip()),
         "report_dir": str(REPORT_DIR),
         "word_export_enabled": _word_export_enabled(),
+        "analysis_history_ui_enabled": _analysis_history_ui_enabled(),
         "compact_cache_enabled": compact_cache_enabled(),
         "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
@@ -2871,6 +2872,10 @@ def _analysis_history_enabled() -> bool:
     return _env_bool("ENABLE_ANALYSIS_HISTORY", True)
 
 
+def _analysis_history_ui_enabled() -> bool:
+    return _env_bool("ENABLE_ANALYSIS_HISTORY_UI", False)
+
+
 def _analysis_history_dir() -> Path:
     configured = (os.getenv("ANALYSIS_HISTORY_DIR") or "").strip()
     if configured:
@@ -2930,6 +2935,80 @@ def _history_item_for_response(item: dict[str, Any]) -> dict[str, Any]:
         }
     )
     return response_item
+
+
+HISTORY_LIST_RESPONSE_FIELDS = (
+    "run_id",
+    "pack_id",
+    "record_id",
+    "notice_id",
+    "menu_code",
+    "menu_name",
+    "articleid",
+    "title",
+    "status",
+    "run_status",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "provider",
+    "workflow_run_id",
+    "compact_pack_chars",
+    "quality_status",
+    "quality_passed",
+    "quality_gate_status",
+    "primary_failure_code",
+    "word_generated",
+    "word_download_available",
+    "word_export_available",
+    "draft_word_export_available",
+    "final_word_export_available",
+    "deliverable",
+    "needs_manual_review",
+    "revision",
+    "latest_event_id",
+)
+
+HISTORY_COMPARE_FIELDS = (
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "provider",
+    "workflow_run_id",
+    "compact_pack_chars",
+    "quality_status",
+    "primary_failure_code",
+    "draft_word_export_available",
+    "final_word_export_available",
+    "deliverable",
+    "needs_manual_review",
+)
+
+
+def _history_list_item_for_response(item: dict[str, Any]) -> dict[str, Any]:
+    safe_item = _history_item_for_response(item)
+    return {field: safe_item.get(field) for field in HISTORY_LIST_RESPONSE_FIELDS}
+
+
+def _history_compare_item(item: dict[str, Any]) -> dict[str, Any]:
+    safe_item = _history_item_for_response(item)
+    return {field: safe_item.get(field) for field in HISTORY_COMPARE_FIELDS}
+
+
+def _history_material_key(item: dict[str, Any]) -> str:
+    record_id = str(item.get("record_id") or "").strip()
+    if record_id:
+        return f"record:{record_id}"
+    notice_id = str(item.get("notice_id") or "").strip()
+    if notice_id:
+        return f"notice:{notice_id}"
+    menu_code = str(item.get("menu_code") or "").strip()
+    articleid = str(item.get("articleid") or "").strip()
+    if menu_code and articleid:
+        return f"article:{menu_code}:{articleid}"
+    return ""
 
 
 def _safe_run_id(run_id: str) -> str:
@@ -5528,6 +5607,8 @@ def records_ui():
 
 @app.get("/analysis-history-ui")
 def analysis_history_ui():
+    if not _analysis_history_ui_enabled():
+        raise HTTPException(status_code=404, detail="analysis history UI not found")
     path = Path(__file__).resolve().parent / "static" / "analysis_history.html"
     if not path.exists():
         raise HTTPException(status_code=404, detail="analysis history UI not found")
@@ -6224,7 +6305,7 @@ def list_analysis_history(
     provider: str = "",
     q: str = "",
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=200),
+    page_size: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any] | JSONResponse:
     if not _analysis_history_enabled():
         return {
@@ -6262,10 +6343,61 @@ def list_analysis_history(
         "success": True,
         "enabled": True,
         "total": total,
-        "items": [_history_item_for_response(item) for item in items],
+        "items": [_history_list_item_for_response(item) for item in items],
         "page": page,
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
+
+
+@app.get("/analysis/history/compare", response_model=None)
+def compare_analysis_history(
+    left_run_id: str,
+    right_run_id: str,
+) -> dict[str, Any] | JSONResponse:
+    if not _analysis_history_enabled():
+        return _analysis_error(404, "ANALYSIS_HISTORY_DISABLED", "分析历史功能未启用")
+    try:
+        left_id = _safe_run_id(left_run_id)
+        right_id = _safe_run_id(right_run_id)
+        store = _analysis_history_store()
+        left_item = store.get_run(left_id)
+        right_item = store.get_run(right_id)
+    except HistoryTopologyError:
+        return _analysis_error(
+            503,
+            "ANALYSIS_HISTORY_SINGLE_WORKER_REQUIRED",
+            "分析历史仅支持单 worker 写入拓扑",
+        )
+    except HTTPException:
+        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis_history_compare_failed error_type=%s", exc.__class__.__name__)
+        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
+    if left_item is None or right_item is None:
+        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    left_material = _history_material_key(left_item)
+    right_material = _history_material_key(right_item)
+    if not left_material or left_material != right_material:
+        return _analysis_error(
+            409,
+            "ANALYSIS_HISTORY_MATERIAL_MISMATCH",
+            "只能对比同一材料的分析记录",
+        )
+    left = _history_compare_item(left_item)
+    right = _history_compare_item(right_item)
+    changes = {
+        field: {"left": left[field], "right": right[field]}
+        for field in HISTORY_COMPARE_FIELDS
+        if left[field] != right[field]
+    }
+    return {
+        "success": True,
+        "left_run_id": left_id,
+        "right_run_id": right_id,
+        "left": left,
+        "right": right,
+        "changes": changes,
     }
 
 

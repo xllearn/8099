@@ -562,14 +562,17 @@ class AnalysisHistoryTests(unittest.TestCase):
                 listing = self.client.get("/analysis/history")
                 detail = self.client.get("/analysis/history/run_fusedhistory1")
 
-        for item in (listing.json()["items"][0], detail.json()["item"]):
+        listing_item = listing.json()["items"][0]
+        self.assertNotIn("word_download_url", listing_item)
+        self.assertNotIn("word_filename", listing_item)
+        for item in (listing_item, detail.json()["item"]):
             self.assertFalse(item["word_generated"])
             self.assertFalse(item["word_download_available"])
             self.assertFalse(item["word_export_available"])
             self.assertFalse(item["draft_word_export_available"])
             self.assertFalse(item["final_word_export_available"])
-            self.assertEqual(item["word_download_url"], "")
-            self.assertEqual(item["word_filename"], "")
+        self.assertEqual(detail.json()["item"]["word_download_url"], "")
+        self.assertEqual(detail.json()["item"]["word_filename"], "")
 
 
 if __name__ == "__main__":

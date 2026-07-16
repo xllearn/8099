@@ -192,6 +192,33 @@
       border-top: 1px solid var(--line);
       color: var(--muted);
     }
+    .compare-toolbar {
+      min-height: 46px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 6px 11px;
+      border-bottom: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--muted);
+    }
+    .compare-toolbar strong { color: var(--text); }
+    .compare-check { width: 16px; height: 16px; }
+    dialog {
+      width: min(860px, calc(100vw - 28px));
+      max-height: calc(100vh - 40px);
+      border: 1px solid var(--line-strong);
+      border-radius: 8px;
+      padding: 0;
+      color: var(--text);
+    }
+    dialog::backdrop { background: rgba(15, 23, 42, .42); }
+    .compare-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid var(--line); }
+    .compare-head h2 { margin: 0; font-size: 16px; }
+    .compare-body { max-height: 70vh; overflow: auto; padding: 14px 16px; }
+    .compare-table { min-width: 680px; table-layout: auto; }
+    .compare-table th, .compare-table td { position: static; overflow-wrap: anywhere; }
 
     @media (max-width: 980px) {
       .app-header { padding: 0 14px; }
@@ -259,14 +286,18 @@
     </section>
 
     <section class="table-panel">
+      <div class="compare-toolbar">
+        <span>已选择 <strong id="compareCount">0</strong> / 2 条同材料记录</span>
+        <button type="button" id="compareRuns" disabled>对比运行</button>
+      </div>
       <div class="table-wrap">
         <table>
           <colgroup>
-            <col style="width:21%"><col style="width:16%"><col style="width:12%"><col style="width:8%">
-            <col style="width:15%"><col style="width:20%"><col style="width:8%">
+            <col style="width:4%"><col style="width:19%"><col style="width:16%"><col style="width:12%"><col style="width:8%">
+            <col style="width:14%"><col style="width:20%"><col style="width:7%">
           </colgroup>
-          <thead><tr><th>材料</th><th>运行与时间</th><th>Provider</th><th>Compact</th><th>质量与失败码</th><th>Word 状态</th><th>操作</th></tr></thead>
-          <tbody id="historyBody"><tr><td colspan="7" class="empty">正在读取</td></tr></tbody>
+          <thead><tr><th>对比</th><th>材料</th><th>运行与时间</th><th>Provider</th><th>Compact</th><th>质量与失败码</th><th>Word 状态</th><th>操作</th></tr></thead>
+          <tbody id="historyBody"><tr><td colspan="8" class="empty">正在读取</td></tr></tbody>
         </table>
       </div>
       <div class="pager">
@@ -277,8 +308,13 @@
     </section>
   </main>
 
+  <dialog id="compareDialog">
+    <div class="compare-head"><h2>运行字段对比</h2><button type="button" id="closeCompare">关闭</button></div>
+    <div class="compare-body" id="compareBody"></div>
+  </dialog>
+
   <script>
-    const state = { page: 1, page_size: 25, total_pages: 0 };
+    const state = { page: 1, page_size: 20, total_pages: 0, items: [], selected_runs: new Map() };
     const byId = (id) => document.getElementById(id);
 
     function escapeHtml(value) {
@@ -325,7 +361,7 @@
 
     function renderRows(items) {
       if (!items.length) {
-        byId("historyBody").innerHTML = '<tr><td colspan="7" class="empty">没有匹配的分析记录</td></tr>';
+        byId("historyBody").innerHTML = '<tr><td colspan="8" class="empty">没有匹配的分析记录</td></tr>';
         return;
       }
       byId("historyBody").innerHTML = items.map((item) => {
@@ -333,6 +369,7 @@
         const detailUrl = `/analysis-runs/${encodeURIComponent(runId)}`;
         const failureCode = item.primary_failure_code || "无";
         return `<tr>
+          <td><input class="compare-check" type="checkbox" data-compare-run="${escapeHtml(runId)}" aria-label="选择 ${escapeHtml(runId)} 进行对比" ${state.selected_runs.has(runId) ? "checked" : ""}></td>
           <td><div class="material-title">${escapeHtml(item.title || "未命名材料")}</div>
             <div class="meta">${escapeHtml(item.menu_code || "-")} / ${escapeHtml(item.articleid || "-")}</div>
             <div class="meta mono">${escapeHtml(item.record_id || item.notice_id || "-")}</div></td>
@@ -354,6 +391,58 @@
           <td><a class="open-link" href="${detailUrl}">查看运行</a></td>
         </tr>`;
       }).join("");
+      updateCompareControls();
+    }
+
+    function updateCompareControls() {
+      const count = state.selected_runs.size;
+      byId("compareCount").textContent = String(count);
+      byId("compareRuns").disabled = count !== 2;
+    }
+
+    function toggleCompareRun(runId, checked) {
+      if (!checked) {
+        state.selected_runs.delete(runId);
+        updateCompareControls();
+        return;
+      }
+      if (state.selected_runs.size >= 2) {
+        const checkbox = document.querySelector(`[data-compare-run="${CSS.escape(runId)}"]`);
+        if (checkbox) checkbox.checked = false;
+        return;
+      }
+      const item = state.items.find((candidate) => String(candidate.run_id || "") === runId);
+      if (item) state.selected_runs.set(runId, item);
+      updateCompareControls();
+    }
+
+    function comparisonValue(field, value) {
+      if (field === "started_at" || field === "ended_at") return formatTime(value);
+      if (field === "duration_ms") return formatDuration(value);
+      if (typeof value === "boolean") return yesNo(value);
+      return value === null || value === undefined || value === "" ? "-" : String(value);
+    }
+
+    async function compareSelectedRuns() {
+      const runIds = Array.from(state.selected_runs.keys());
+      if (runIds.length !== 2) return;
+      const params = new URLSearchParams({ left_run_id: runIds[0], right_run_id: runIds[1] });
+      try {
+        const response = await fetch(`/analysis/history/compare?${params.toString()}`, { headers: { Accept: "application/json" } });
+        const data = await response.json();
+        if (!response.ok || data.success === false) throw new Error(data.error?.message || `HTTP ${response.status}`);
+        const labels = {
+          started_at: "开始时间", ended_at: "结束时间", duration_ms: "耗时", provider: "Provider",
+          workflow_run_id: "Workflow Run ID", compact_pack_chars: "Compact 字符数", quality_status: "质量状态",
+          primary_failure_code: "主失败码", draft_word_export_available: "Draft Word", final_word_export_available: "Final Word",
+          deliverable: "可交付", needs_manual_review: "需人工复检"
+        };
+        byId("compareBody").innerHTML = `<table class="compare-table"><thead><tr><th>字段</th><th>${escapeHtml(data.left_run_id)}</th><th>${escapeHtml(data.right_run_id)}</th></tr></thead><tbody>${Object.keys(labels).map((field) => `<tr><td>${labels[field]}</td><td>${escapeHtml(comparisonValue(field, data.left[field]))}</td><td>${escapeHtml(comparisonValue(field, data.right[field]))}</td></tr>`).join("")}</tbody></table>`;
+        byId("compareDialog").showModal();
+      } catch (error) {
+        byId("compareBody").textContent = error.message || "对比失败";
+        byId("compareDialog").showModal();
+      }
     }
 
     function buildParams() {
@@ -370,22 +459,23 @@
     }
 
     async function loadHistory() {
-      byId("historyBody").innerHTML = '<tr><td colspan="7" class="empty">正在读取</td></tr>';
+      byId("historyBody").innerHTML = '<tr><td colspan="8" class="empty">正在读取</td></tr>';
       try {
         const response = await fetch(`/analysis/history?${buildParams().toString()}`, { headers: { Accept: "application/json" } });
         const data = await response.json();
         if (!response.ok || data.success === false) throw new Error(data.error?.message || `HTTP ${response.status}`);
         byId("totalCount").textContent = String(data.total || 0);
         state.total_pages = Number(data.total_pages || 0);
-        renderRows(Array.isArray(data.items) ? data.items : []);
+        state.items = Array.isArray(data.items) ? data.items : [];
+        renderRows(state.items);
         byId("pageText").textContent = `第 ${state.page} / ${Math.max(1, state.total_pages)} 页`;
         byId("previousPage").disabled = state.page <= 1;
         byId("nextPage").disabled = !state.total_pages || state.page >= state.total_pages;
         if (data.enabled === false) {
-          byId("historyBody").innerHTML = '<tr><td colspan="7" class="empty">分析历史功能当前未启用</td></tr>';
+          byId("historyBody").innerHTML = '<tr><td colspan="8" class="empty">分析历史功能当前未启用</td></tr>';
         }
       } catch (error) {
-        byId("historyBody").innerHTML = `<tr><td colspan="7" class="empty">${escapeHtml(error.message || "读取失败")}</td></tr>`;
+        byId("historyBody").innerHTML = `<tr><td colspan="8" class="empty">${escapeHtml(error.message || "读取失败")}</td></tr>`;
       }
     }
 
@@ -399,6 +489,12 @@
     byId("resetButton").addEventListener("click", () => { byId("filters").reset(); state.page = 1; loadHistory(); });
     byId("previousPage").addEventListener("click", () => { if (state.page > 1) { state.page -= 1; loadHistory(); } });
     byId("nextPage").addEventListener("click", () => { if (state.page < state.total_pages) { state.page += 1; loadHistory(); } });
+    byId("historyBody").addEventListener("change", (event) => {
+      const checkbox = event.target.closest("input[data-compare-run]");
+      if (checkbox) toggleCompareRun(checkbox.dataset.compareRun, checkbox.checked);
+    });
+    byId("compareRuns").addEventListener("click", compareSelectedRuns);
+    byId("closeCompare").addEventListener("click", () => byId("compareDialog").close());
 
     loadInitialFilters();
     loadHistory();

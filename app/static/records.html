@@ -1086,7 +1086,7 @@
           </div>
         </div>
         <div class="header-tools">
-          <a href="/analysis-history-ui">分析历史</a>
+          <a id="analysisHistoryLink" href="/analysis-history-ui" hidden>分析历史</a>
           <span>ⓘ 帮助中心</span>
           <span class="user-chip"><span class="user-avatar">医</span> 医保分析员⌄</span>
         </div>
@@ -1422,6 +1422,19 @@
         showToast(`列表读取失败：${error.message}`, 'error');
       } finally {
         setLoading(false);
+      }
+    }
+
+    async function initializeHistoryNavigation() {
+      const link = $('analysisHistoryLink');
+      if (!link) return;
+      try {
+        const response = await fetch('/health', { headers: { Accept: 'application/json' } });
+        if (!response.ok) return;
+        const health = await response.json();
+        link.hidden = health.analysis_history_ui_enabled !== true;
+      } catch (_error) {
+        link.hidden = true;
       }
     }
 
@@ -1979,6 +1992,7 @@
 
     renderSelected();
     renderDetail();
+    initializeHistoryNavigation();
     loadRecords();
   </script>
 </body>
