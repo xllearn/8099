@@ -85,6 +85,7 @@ from app.layered_diagnostics import (
     build_failure_attribution,
     make_layer_result,
 )
+from app.pipeline_timing import DEFAULT_TIMINGS, PipelineTiming, normalize_pipeline_timings
 from app.quality_gate import QualityGate
 from app.repair_pipeline import (
     fail_closed_controlled_repair,
@@ -279,6 +280,7 @@ class ExportReportResponse(BaseModel):
     success: bool = True
     filename: str
     download_url: str
+    timings: dict[str, int] = Field(default_factory=dict)
 
 
 class RenderReportRequest(ExportReportRequest):
@@ -310,6 +312,7 @@ class CheckedExportReportResponse(BaseModel):
     blocked: bool = False
     qa_summary: str = ""
     report_markdown: str = ""
+    timings: dict[str, int] = Field(default_factory=dict)
 
 
 class ReportQAIssue(BaseModel):
@@ -2982,12 +2985,7 @@ RUN_FAILURE_PRIORITY = [
     "AUTO_REPAIR_PARTIAL",
 ]
 
-RUN_DEFAULT_TIMINGS = {
-    "generation_ms": 0,
-    "local_quality_gate_ms": 0,
-    "repair_ms": 0,
-    "export_check_ms": 0,
-}
+RUN_DEFAULT_TIMINGS = dict(DEFAULT_TIMINGS)
 
 RUN_QUALITY_BLOCKING_CODE_MAP = {
     "CONTROLLED_REPAIR_FAILED": "CONTROLLED_REPAIR_FAILED",
@@ -3106,14 +3104,23 @@ def _safe_int_value(value: Any, default: int = 0) -> int:
 
 
 def _normalize_run_timings(value: Any) -> dict[str, int]:
-    timings = dict(RUN_DEFAULT_TIMINGS)
-    if isinstance(value, dict):
-        for key, raw in value.items():
-            text_key = str(key or "").strip()
-            if not text_key:
-                continue
-            timings[text_key] = max(0, _safe_int_value(raw, 0))
-    return timings
+    return normalize_pipeline_timings(value)
+
+
+def _persist_run_timings_nonblocking(run_id: str, timings: Any) -> None:
+    try:
+        record = _read_analysis_run(run_id)
+        merged = PipelineTiming(record.get("timings"))
+        merged.merge(timings)
+        record["timings"] = merged.snapshot()
+        _write_analysis_run(record)
+        logger.info("analysis_run_timings_saved run_id=%s timings=%s", run_id, record["timings"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_run_timings_save_failed run_id=%s error_type=%s",
+            run_id,
+            exc.__class__.__name__,
+        )
 
 
 def _extract_issue_codes(items: Any) -> list[str]:
@@ -3968,7 +3975,10 @@ def _set_failure_stage(result: dict[str, Any], stage: dict[str, Any]) -> dict[st
     return updated
 
 
-def _input_pipeline_stages(pack: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+def _input_pipeline_stages(
+    pack: dict[str, Any],
+    timing: PipelineTiming | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     materials = [
         item
         for key in ("primary_materials", "auxiliary_materials")
@@ -4009,7 +4019,9 @@ def _input_pipeline_stages(pack: dict[str, Any]) -> tuple[list[dict[str, Any]], 
 
     compact: dict[str, Any] | None = None
     try:
-        compact = _compact_evidence_pack_for_dify(pack)
+        stage_timing = timing or PipelineTiming()
+        with stage_timing.measure("compact_ms"):
+            compact = _compact_evidence_pack_for_dify(pack)
         compact_chars = _safe_int_value(
             compact.get("compact_pack_chars") or compact.get("final_dify_input_chars") or 0
         )
@@ -4136,9 +4148,10 @@ def _postprocess_generation_with_stages(
     pack: dict[str, Any],
     input_stages: list[dict[str, Any]] | None = None,
     compact: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
 ) -> dict[str, Any]:
     if input_stages is None:
-        input_stages, compact = _input_pipeline_stages(pack)
+        input_stages, compact = _input_pipeline_stages(pack, timing)
     staged = dict(result)
     for stage in input_stages:
         staged = _set_failure_stage(staged, stage)
@@ -4164,21 +4177,24 @@ def _postprocess_generation_with_stages(
     staged = _set_failure_stage(staged, provider_stage)
 
     before_cleanup = dict(staged)
-    repaired_result = RepairPipeline(
-        repairers=[
-            StructureRepairer(_repair_unusable_dify_result),
-            UnsupportedFactRepairer(),
-            ForbiddenPhraseRepairer(),
-        ]
-    ).run(
-        ReportGenerationResult.from_legacy_result(staged, provider=str(staged.get("provider") or "dify")),
-        pack,
-    )
+    stage_timing = timing or PipelineTiming()
+    with stage_timing.measure("repair_ms"):
+        repaired_result = RepairPipeline(
+            repairers=[
+                StructureRepairer(_repair_unusable_dify_result),
+                UnsupportedFactRepairer(),
+                ForbiddenPhraseRepairer(),
+            ]
+        ).run(
+            ReportGenerationResult.from_legacy_result(staged, provider=str(staged.get("provider") or "dify")),
+            pack,
+        )
     staged = repaired_result.to_legacy_result()
     staged = _set_failure_stage(staged, _cleanup_pipeline_stage(before_cleanup, staged))
 
     before_quality = dict(staged)
-    staged = _apply_local_quality_gate_to_dify_result(staged, pack)
+    with stage_timing.measure("quality_gate_ms"):
+        staged = _apply_local_quality_gate_to_dify_result(staged, pack)
     return _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
 
 
@@ -4188,6 +4204,7 @@ def _fallback_result_from_dify_error(
     pack_id: str,
     *,
     apply_quality_gate: bool = True,
+    timing: PipelineTiming | None = None,
 ) -> dict[str, Any]:
     provider_code = canonical_provider_failure_code(exc.code)
     provider_stage = exc.provider_stage or make_layer_result(
@@ -4232,8 +4249,8 @@ def _fallback_result_from_dify_error(
         "failure_stages": [provider_stage],
     }
     if apply_quality_gate:
-        return _postprocess_generation_with_stages(result, pack)
-    input_stages, _ = _input_pipeline_stages(pack)
+        return _postprocess_generation_with_stages(result, pack, timing=timing)
+    input_stages, _ = _input_pipeline_stages(pack, timing)
     for stage in input_stages:
         result = _set_failure_stage(result, stage)
     result = _set_failure_stage(
@@ -4785,7 +4802,11 @@ def _select_pdf_table_evidence_cells(cells: list[dict[str, Any]], *, limit: int)
     return [copy.deepcopy(materialized[index]) for index in sorted(selected)]
 
 
-def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[str, Any] | None = None) -> dict[str, Any]:
+def _database_attachment_metadata(
+    row: dict[str, Any],
+    attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+) -> dict[str, Any]:
     articleattid = str(row.get("articleattid") or "")
     filename = str(row.get("filename") or "")
     core_attachment, business_type = _attachment_core_metadata(filename)
@@ -4849,12 +4870,14 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata.get("parse_status") or "")))
         return metadata
 
-    download = fetch_attachment_bytes(
-        metadata,
-        enable_download=enable_download,
-        user_cookie=str(options.get("user_cookie") or ""),
-        user_headers=options.get("user_headers") if isinstance(options.get("user_headers"), dict) else None,
-    )
+    attachment_timing = timing or PipelineTiming()
+    with attachment_timing.measure("attachment_download_ms"):
+        download = fetch_attachment_bytes(
+            metadata,
+            enable_download=enable_download,
+            user_cookie=str(options.get("user_cookie") or ""),
+            user_headers=options.get("user_headers") if isinstance(options.get("user_headers"), dict) else None,
+        )
     metadata["download_status"] = download.download_status
     metadata["download_auth_mode"] = download.auth_mode
     metadata["warnings"].extend(download.warnings or [])
@@ -4883,7 +4906,8 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         store_cached_result(metadata, metadata)
         return metadata
 
-    parsed = parse_attachment_bytes(download.content, str(metadata["filename"]), str(metadata["fileext"]), metadata["filesize"])
+    with attachment_timing.measure("attachment_parse_ms"):
+        parsed = parse_attachment_bytes(download.content, str(metadata["filename"]), str(metadata["fileext"]), metadata["filesize"])
     statuses = list(parsed.get("parse_statuses") or [])
     metadata["parse_statuses"] = statuses
     metadata["parse_status"] = statuses[-1] if statuses else "parse_failed"
@@ -5106,6 +5130,7 @@ def _build_database_material(
     attachments: list[dict[str, Any]],
     warnings: list[str],
     attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
 ) -> dict[str, Any]:
     content_html = str(row.get("content") or "")
     content_text = _article_text_from_html(content_html)
@@ -5134,7 +5159,7 @@ def _build_database_material(
         "summary": row.get("summary") or "",
         "content_text": content_text,
         "content_summary": _content_summary(str(row.get("summary") or ""), content_text),
-        "attachments": [_database_attachment_metadata(item, attachment_options) for item in attachments],
+        "attachments": [_database_attachment_metadata(item, attachment_options, timing) for item in attachments],
     }
     if role == "primary":
         base.update(
@@ -5155,7 +5180,10 @@ def _build_database_material(
     return base
 
 
-def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
+def _build_database_evidence_pack_impl(
+    req: SelectionPreviewRequest,
+    timing: PipelineTiming,
+) -> dict[str, Any] | JSONResponse:
     primary_keys, auxiliary_keys, error = _validate_material_selection(req)
     if error is not None:
         return error
@@ -5185,6 +5213,7 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
             attachments=attachments_by_key.get(key, []),
             warnings=warnings,
             attachment_options=attachment_options,
+            timing=timing,
         )
         for key in primary_keys
     ]
@@ -5195,9 +5224,11 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
             attachments=attachments_by_key.get(key, []),
             warnings=warnings,
             attachment_options=attachment_options,
+            timing=timing,
         )
         for key in auxiliary_keys
     ]
+    evidence_started_ns = time.monotonic_ns()
     primary_keywords = _primary_topic_keywords([rows_by_key[key] for key in primary_keys])
     for material in primary_materials:
         _enhance_material_for_stage4(material, primary_keywords)
@@ -5240,9 +5271,21 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
     if vbp_fact_extraction_enabled():
         pack = enrich_vbp_facts(pack)
     pack.pop("source_evidence_schema_version", None)
+    timing.add_elapsed("evidence_build_ms", evidence_started_ns)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
-    _write_database_evidence_pack(pack)
     return pack
+
+
+def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
+    timing = PipelineTiming()
+    with timing.measure("prepare_ms"):
+        result = _build_database_evidence_pack_impl(req, timing)
+    if isinstance(result, dict):
+        result["timings"] = timing.snapshot(finish=True)
+        _write_database_evidence_pack(result)
+    else:
+        logger.info("analysis_prepare_failed timings=%s", timing.snapshot(finish=True))
+    return result
 
 
 @app.get("/records-ui")
@@ -5686,6 +5729,7 @@ def _execute_analysis_run_background(
         pack_for_policy = _read_database_evidence_pack(pack_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis_run_pack_preread_failed run_id=%s pack_id=%s error_type=%s", run_id, pack_id, exc.__class__.__name__)
+    run_timing = PipelineTiming((pack_for_policy or {}).get("timings"))
     watchdog: threading.Timer | None = None
     watchdog_timeout = _analysis_watchdog_timeout_seconds(pack_for_policy)
     if watchdog_timeout > 0:
@@ -5694,14 +5738,16 @@ def _execute_analysis_run_background(
         watchdog.start()
     try:
         generator = _configured_report_generator()
-        generation_result = generator.generate(
-            pack_id,
-            run_id,
-            pack_for_policy,
-            report_memory_snapshot,
-            use_report_memory=use_report_memory,
-        )
+        with run_timing.measure("dify_ms"):
+            generation_result = generator.generate(
+                pack_id,
+                run_id,
+                pack_for_policy,
+                report_memory_snapshot,
+                use_report_memory=use_report_memory,
+            )
         result = generation_result.to_legacy_result()
+        run_timing.merge(result.get("timings"))
         inherited_warnings = [str(item) for item in list(record.get("warnings") or []) if str(item).strip()]
         generated_warnings = [
             str(item)
@@ -5713,8 +5759,8 @@ def _execute_analysis_run_background(
         result["warnings"] = merged_warnings
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            input_stages, compact = _input_pipeline_stages(pack)
-            result = _postprocess_generation_with_stages(result, pack, input_stages, compact)
+            input_stages, compact = _input_pipeline_stages(pack, run_timing)
+            result = _postprocess_generation_with_stages(result, pack, input_stages, compact, run_timing)
         except Exception as repair_exc:  # noqa: BLE001
             if strict_delivery_gate_enabled():
                 failed = fail_closed_controlled_repair(
@@ -5747,7 +5793,7 @@ def _execute_analysis_run_background(
             warnings.append("证据包较大时可能导致 Dify 超时，可减少辅助材料、缩短辅助附件摘要或稍后重试。")
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            fallback = _fallback_result_from_dify_error(exc, pack, pack_id)
+            fallback = _fallback_result_from_dify_error(exc, pack, pack_id, timing=run_timing)
             merged_warnings = [*warnings, *list(fallback.get("warnings") or fallback.get("generation_warnings") or [])]
             record.update(fallback)
             record.update(
@@ -5807,7 +5853,9 @@ def _execute_analysis_run_background(
     finally:
         if watchdog:
             watchdog.cancel()
+        _persist_run_timings_nonblocking(run_id, run_timing.snapshot(finish=True))
 
+    result["timings"] = run_timing.snapshot(finish=True)
     try:
         current_record = _read_analysis_run(run_id)
         if current_record.get("status") != "running":
@@ -5859,6 +5907,7 @@ def run_analysis(req: AnalysisRunRequest):
         "generation_warnings": [],
         "warnings": memory_warnings,
         "remaining_issues": [],
+        "timings": _normalize_run_timings(pack_for_memory.get("timings")),
         "version": 1,
         "created_at": now,
         "updated_at": now,
@@ -6256,22 +6305,26 @@ def download_analysis_run_report(run_id: str):
     report_hash = hashlib.sha256(report_source.encode("utf-8", errors="ignore")).hexdigest()[:12]
     filename = f"{_safe_filename(title)}_{_safe_filename(run_id)}_v{_safe_filename(version)}_{report_hash}.docx"
     path = REPORT_DIR / filename
+    word_timing = PipelineTiming(record.get("timings"))
     try:
         if not path.exists():
             if report_ir is not None:
-                _publish_report_ir_docx(report_ir, path, title)
+                _publish_report_ir_docx(report_ir, path, title, word_timing.observe)
             else:
-                _publish_markdown_docx(report_markdown, path, title)
+                _publish_markdown_docx(report_markdown, path, title, word_timing.observe)
             logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
         else:
-            hits = scan_docx(path)
+            with word_timing.measure("word_scan_ms"):
+                hits = scan_docx(path)
             if hits:
                 raise FormalBodySafetyError("缓存 DOCX 正文安全扫描未通过")
             logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
     except FormalBodySafetyError as exc:
+        _persist_run_timings_nonblocking(run_id, word_timing.snapshot(finish=True))
         return _word_body_safety_failed_response(
             "/analysis/runs/{run_id}/download", str(exc)
         )
+    _persist_run_timings_nonblocking(run_id, word_timing.snapshot(finish=True))
     _record_analysis_word_download(
         record,
         f"/analysis/runs/{run_id}/download",
@@ -6641,6 +6694,7 @@ async def export_report(req: ExportReportRequest) -> ExportReportResponse | JSON
         return _word_export_disabled_response("/report/export")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
+    word_timing = PipelineTiming()
     try:
         report = _prepare_report_for_export(req)
         _require_export_evidence(report, req.evidence_text)
@@ -6649,12 +6703,20 @@ async def export_report(req: ExportReportRequest) -> ExportReportResponse | JSON
             raise ValueError("报告质量检查未通过：" + "；".join(quality_issues))
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _publish_report_ir_docx(report, path, req.title)
-        logger.info("report_export_completed filename=%s", filename)
+        _publish_report_ir_docx(report, path, req.title, word_timing.observe)
+        logger.info("report_export_completed filename=%s timings=%s", filename, word_timing.snapshot(finish=True))
     except (ValueError, FormalBodySafetyError) as exc:
-        logger.warning("report_export_failed error=%s", str(exc)[:500])
+        logger.warning(
+            "report_export_failed error_type=%s timings=%s",
+            type(exc).__name__,
+            word_timing.snapshot(finish=True),
+        )
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return ExportReportResponse(filename=filename, download_url=_download_url(filename))
+    return ExportReportResponse(
+        filename=filename,
+        download_url=_download_url(filename),
+        timings=word_timing.snapshot(finish=True),
+    )
 
 
 @app.post("/report/render", response_model=RenderReportResponse)
@@ -6700,6 +6762,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         return _word_export_disabled_response("/report/export_checked")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
+    word_timing = PipelineTiming()
     try:
         if not str(req.evidence_text or "").strip():
             raise ValueError("Word 发布缺少 evidence context")
@@ -6731,11 +6794,17 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
                 blocked=True,
                 qa_summary=qa_summary,
                 report_markdown=report_markdown,
+                timings=word_timing.snapshot(finish=True),
             )
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _publish_report_ir_docx(report, path, req.title)
-        logger.info("report_export_checked_completed filename=%s qa_status=%s", filename, _workflow_qa_status(qa))
+        _publish_report_ir_docx(report, path, req.title, word_timing.observe)
+        logger.info(
+            "report_export_checked_completed filename=%s qa_status=%s timings=%s",
+            filename,
+            _workflow_qa_status(qa),
+            word_timing.snapshot(finish=True),
+        )
         return CheckedExportReportResponse(
             success=True,
             filename=filename,
@@ -6743,6 +6812,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
             blocked=False,
             qa_summary=qa_summary,
             report_markdown=report_markdown,
+            timings=word_timing.snapshot(finish=True),
         )
         if req.qa_output:
             try:
@@ -6775,9 +6845,13 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         qa_summary = _format_qa_summary(qa)
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _publish_report_ir_docx(report, path, req.title)
+        _publish_report_ir_docx(report, path, req.title, word_timing.observe)
     except (ValueError, FormalBodySafetyError) as exc:
-        logger.warning("report_export_checked_failed error=%s", str(exc)[:500])
+        logger.warning(
+            "report_export_checked_failed error_type=%s timings=%s",
+            type(exc).__name__,
+            word_timing.snapshot(finish=True),
+        )
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return CheckedExportReportResponse(
         success=True,
@@ -6786,6 +6860,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         blocked=False,
         qa_summary=qa_summary,
         report_markdown=report_markdown,
+        timings=word_timing.snapshot(finish=True),
     )
 
 
@@ -7955,17 +8030,29 @@ def _safe_markdown_formal_body(markdown: str) -> str:
     return safety.document.markdown
 
 
-def _publish_report_ir_docx(report: ReportIR, path: Path, fallback_title: str) -> None:
+def _publish_report_ir_docx(
+    report: ReportIR,
+    path: Path,
+    fallback_title: str,
+    timing_observer: Any = None,
+) -> None:
     publish_docx_atomically(
         path,
         lambda staging_path: _report_ir_to_docx(report, staging_path, fallback_title),
+        timing_observer=timing_observer,
     )
 
 
-def _publish_markdown_docx(markdown: str, path: Path, title: str) -> None:
+def _publish_markdown_docx(
+    markdown: str,
+    path: Path,
+    title: str,
+    timing_observer: Any = None,
+) -> None:
     publish_docx_atomically(
         path,
         lambda staging_path: _markdown_to_docx(markdown, staging_path, title),
+        timing_observer=timing_observer,
     )
 
 

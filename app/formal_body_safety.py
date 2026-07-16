@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import logging
 import os
 import re
 import shutil
 import tempfile
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,9 @@ from typing import Any, Callable, Iterable
 from docx import Document
 
 from app.formal_body import FormalBodyDocument, REPORT_IR_METADATA_FIELDS
+
+
+logger = logging.getLogger("medical_notice_analyzer.formal_body_safety")
 
 
 FORBIDDEN_PHRASES = (
@@ -127,21 +132,48 @@ def scan_docx(path: Path) -> tuple[ForbiddenPhraseHit, ...]:
     return _dedupe_hits(hits)
 
 
-def publish_docx_atomically(destination: Path, render: Callable[[Path], None]) -> None:
+def _observe_timing(observer: Callable[[str, int], None] | None, stage: str, started_ns: int) -> None:
+    if observer is None:
+        return
+    elapsed_ms = max(0, time.monotonic_ns() - started_ns) // 1_000_000
+    try:
+        observer(stage, elapsed_ms)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("word_timing_observer_failed stage=%s error_type=%s", stage, exc.__class__.__name__)
+
+
+def publish_docx_atomically(
+    destination: Path,
+    render: Callable[[Path], None],
+    *,
+    timing_observer: Callable[[str, int], None] | None = None,
+) -> None:
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging_dir = Path(tempfile.mkdtemp(prefix=".word-staging-", dir=destination.parent))
     staging_path = staging_dir / "candidate.docx"
     published = False
     try:
-        render(staging_path)
+        render_started_ns = time.monotonic_ns()
+        try:
+            render(staging_path)
+        finally:
+            _observe_timing(timing_observer, "word_render_ms", render_started_ns)
         if not staging_path.is_file():
             raise FormalBodySafetyError("DOCX 临时文件未生成")
-        hits = scan_docx(staging_path)
+        scan_started_ns = time.monotonic_ns()
+        try:
+            hits = scan_docx(staging_path)
+        finally:
+            _observe_timing(timing_observer, "word_scan_ms", scan_started_ns)
         if hits:
             phrases = ",".join(dict.fromkeys(hit.phrase for hit in hits))
             raise FormalBodySafetyError(f"DOCX 正文安全扫描未通过:{phrases}")
-        os.replace(staging_path, destination)
+        publish_started_ns = time.monotonic_ns()
+        try:
+            os.replace(staging_path, destination)
+        finally:
+            _observe_timing(timing_observer, "word_publish_ms", publish_started_ns)
         published = True
     except FormalBodySafetyError:
         raise
