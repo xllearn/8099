@@ -9,6 +9,7 @@ import os
 import tarfile
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -341,6 +342,60 @@ class ReleaseExecutionTests(unittest.TestCase):
 
         self.assertEqual("failed", state["state"])
         self.assertNotIn("verified", [event["state"] for event in state["events"]])
+
+    def test_health_check_retries_bounded_startup_failures_then_succeeds(self) -> None:
+        module = support_module()
+
+        class Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _size: int) -> bytes:
+                return b'{"status":"ok"}'
+
+        failures = [
+            urllib.error.URLError("not ready"),
+            urllib.error.URLError("not ready"),
+            Response(),
+        ]
+        sleeps: list[float] = []
+        with patch.object(module.urllib.request, "urlopen", side_effect=failures) as opened:
+            result = module.health_check(
+                "http://127.0.0.1:8099/health",
+                timeout_seconds=0.1,
+                max_attempts=3,
+                retry_delay_seconds=0.25,
+                sleeper=sleeps.append,
+            )
+
+        self.assertEqual(200, result["status_code"])
+        self.assertEqual(3, opened.call_count)
+        self.assertEqual([0.25, 0.25], sleeps)
+
+    def test_health_check_stops_after_bounded_failures(self) -> None:
+        module = support_module()
+        sleeps: list[float] = []
+        with patch.object(
+            module.urllib.request,
+            "urlopen",
+            side_effect=urllib.error.URLError("not ready"),
+        ) as opened:
+            with self.assertRaises(module.ReleaseVerificationError):
+                module.health_check(
+                    "http://127.0.0.1:8099/health",
+                    timeout_seconds=0.1,
+                    max_attempts=3,
+                    retry_delay_seconds=0.25,
+                    sleeper=sleeps.append,
+                )
+
+        self.assertEqual(3, opened.call_count)
+        self.assertEqual([0.25, 0.25], sleeps)
 
 
 class ReleaseCliTests(unittest.TestCase):

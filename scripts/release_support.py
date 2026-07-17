@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
 import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -658,15 +659,33 @@ def docker_image_loader(image: Path) -> None:
     run_checked(("docker", "image", "load", "-i", str(image)))
 
 
-def health_check(url: str, timeout_seconds: float = 20.0) -> dict[str, Any]:
+def health_check(
+    url: str,
+    timeout_seconds: float = 2.0,
+    *,
+    max_attempts: int = 20,
+    retry_delay_seconds: float = 1.0,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, Any]:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
     request = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
-            status = int(response.status)
-            response.read(1024 * 1024)
-    except Exception as exc:
-        raise ReleaseVerificationError("health endpoint request failed") from exc
-    return {"status_code": status}
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                status = int(response.status)
+                response.read(1024 * 1024)
+            if 200 <= status < 300:
+                return {"attempts": attempt + 1, "status_code": status}
+            last_error = ReleaseVerificationError(
+                "health endpoint returned a non-success status"
+            )
+        except Exception as exc:
+            last_error = exc
+        if attempt + 1 < max_attempts:
+            sleeper(max(0.0, retry_delay_seconds))
+    raise ReleaseVerificationError("health endpoint request failed") from last_error
 
 
 def build_and_deploy_image(
