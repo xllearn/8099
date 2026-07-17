@@ -16,6 +16,7 @@ COPY app ./app
 COPY tests ./tests
 COPY prompts ./prompts
 COPY scripts ./scripts
+COPY docker-compose.s4-runtime.yml ./docker-compose.s4-runtime.yml
 COPY dify_workflow_pack_id_human_style.yml ./dify_workflow_pack_id_human_style.yml
 COPY README.md ./README.md
 
