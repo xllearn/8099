@@ -101,6 +101,11 @@ from app.run_checkpoints import (
     hash_checkpoint_value,
     publish_file_once,
 )
+from app.schema_migrations import (
+    REPORT_IR_SCHEMA_VERSION,
+    upgrade_report_ir_schema,
+    upgrade_run_schema,
+)
 from app.repair_pipeline import (
     fail_closed_controlled_repair,
     ForbiddenPhraseRepairer,
@@ -270,6 +275,7 @@ class ReportSection(BaseModel):
 
 
 class ReportIR(BaseModel):
+    schema_version: int = Field(default=REPORT_IR_SCHEMA_VERSION, ge=1, le=REPORT_IR_SCHEMA_VERSION)
     title: str = ""
     suggested_filename: str = ""
     notice_type: str = ""
@@ -3679,7 +3685,7 @@ def _is_explicitly_deliverable(record: dict[str, Any], run_status: str, has_form
 
 
 def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(record)
+    normalized = upgrade_run_schema(record)
     raw_status = str(normalized.get("status") or normalized.get("run_status") or "created").strip() or "created"
     if raw_status not in RUN_STATE_MACHINE_STATUSES:
         raw_status = "failed" if normalized.get("success") is False else "running"
@@ -9172,7 +9178,7 @@ def _report_ir_from_json(text: str) -> ReportIR:
         raise ValueError("ReportIR JSON 顶层必须是对象")
     blocked_keys = {"reasoning", "analysis", "scratchpad", "thought", "debug", "raw_response", "chain_of_thought"}
     data = {key: value for key, value in data.items() if key not in blocked_keys}
-    data = _coerce_report_ir_payload(data)
+    data = upgrade_report_ir_schema(_coerce_report_ir_payload(data))
     try:
         return ReportIR.model_validate(data)
     except Exception as exc:  # noqa: BLE001

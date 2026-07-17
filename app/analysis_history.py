@@ -11,6 +11,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from app.schema_migrations import (
+    HISTORY_SCHEMA_VERSION,
+    SchemaMigrationError,
+    UnknownSchemaVersionError,
+    upgrade_history_event_schema,
+    upgrade_history_index_schema,
+)
+
 
 logger = logging.getLogger("medical_notice_analyzer.analysis_history")
 
@@ -227,7 +235,7 @@ class AnalysisHistoryStore:
     @staticmethod
     def _empty_index() -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": HISTORY_SCHEMA_VERSION,
             "updated_at": "",
             "last_event_id": "",
             "active_event_count": 0,
@@ -252,8 +260,8 @@ class AnalysisHistoryStore:
             temporary.unlink(missing_ok=True)
 
     def _write_index_unlocked(self, index: dict[str, Any]) -> None:
-        payload = dict(index)
-        payload["schema_version"] = 1
+        payload = upgrade_history_index_schema(index)
+        payload["schema_version"] = HISTORY_SCHEMA_VERSION
         payload["updated_at"] = _now_text()
         self._atomic_write_bytes(
             self.index_path,
@@ -322,7 +330,14 @@ class AnalysisHistoryStore:
                     raise HistoryCorruptionError(
                         f"non-object event in {path.name}:{line_number}"
                     )
-                events.append(event)
+                try:
+                    events.append(upgrade_history_event_schema(event))
+                except UnknownSchemaVersionError:
+                    raise
+                except SchemaMigrationError as exc:
+                    raise HistoryCorruptionError(
+                        f"invalid event schema in {path.name}:{line_number}"
+                    ) from exc
         return events
 
     def read_events(self, paths: Sequence[Path] | None = None) -> list[dict[str, Any]]:
@@ -375,9 +390,25 @@ class AnalysisHistoryStore:
                     "analysis_history_index_read_failed error_type=%s", exc.__class__.__name__
                 )
             return None
-        if not isinstance(data, dict) or not isinstance(data.get("runs"), dict):
+        try:
+            data = upgrade_history_index_schema(data)
+        except UnknownSchemaVersionError:
+            raise
+        except SchemaMigrationError as exc:
+            try:
+                raw = self.index_path.read_bytes()
+                quarantine = self._quarantine_bytes_unlocked("index", raw)
+                logger.warning(
+                    "analysis_history_index_schema_quarantined error_type=%s quarantine=%s",
+                    exc.__class__.__name__,
+                    quarantine,
+                )
+            except OSError:
+                logger.warning(
+                    "analysis_history_index_schema_read_failed error_type=%s",
+                    exc.__class__.__name__,
+                )
             return None
-        data.setdefault("schema_version", 1)
         data.setdefault("updated_at", "")
         data.setdefault("last_event_id", "")
         data.setdefault("active_event_count", 0)
@@ -571,6 +602,7 @@ class AnalysisHistoryStore:
         menu_code = _text(record.get("menu_code") or old.get("menu_code") or primary.get("menu_code"))
         articleid = _text(record.get("articleid") or old.get("articleid") or primary.get("articleid"))
         item = {
+            "schema_version": HISTORY_SCHEMA_VERSION,
             "run_id": _text(prefer("run_id")),
             "pack_id": _text(prefer("pack_id")),
             "material_identities": identities,
@@ -641,7 +673,7 @@ class AnalysisHistoryStore:
             )
             resolved_event_type = event_type or ("run_created" if old is None else "run_updated")
             event = {
-                "schema_version": 1,
+                "schema_version": HISTORY_SCHEMA_VERSION,
                 "event_id": event_id,
                 "event_type": resolved_event_type,
                 "event_at": _now_text(),
@@ -804,7 +836,7 @@ class AnalysisHistoryStore:
             active_events = len(self._read_events_unlocked([self.events_path]))
         self._write_index_unlocked(
             {
-                "schema_version": 1,
+                "schema_version": HISTORY_SCHEMA_VERSION,
                 "updated_at": "",
                 "last_event_id": last_event_id,
                 "active_event_count": active_events,

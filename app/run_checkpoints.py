@@ -10,8 +10,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from app.schema_migrations import (
+    CHECKPOINT_SCHEMA_VERSION,
+    SchemaMigrationError,
+    upgrade_checkpoint_schema,
+)
 
-RUN_CHECKPOINT_SCHEMA_VERSION = 1
+
+RUN_CHECKPOINT_SCHEMA_VERSION = CHECKPOINT_SCHEMA_VERSION
 RUN_CHECKPOINT_STEPS = (
     "prepare",
     "attachments",
@@ -123,10 +129,10 @@ class RunCheckpointStore:
         }
 
     def _validate(self, value: Any, run_id: str) -> dict[str, Any]:
-        if not isinstance(value, dict):
-            raise CheckpointCorruptionError("checkpoint root must be an object")
-        if value.get("schema_version") != RUN_CHECKPOINT_SCHEMA_VERSION:
-            raise CheckpointCorruptionError("unsupported checkpoint schema")
+        try:
+            value = upgrade_checkpoint_schema(value)
+        except SchemaMigrationError as exc:
+            raise CheckpointCorruptionError("unsupported checkpoint schema") from exc
         if str(value.get("run_id") or "") != run_id:
             raise CheckpointCorruptionError("checkpoint run_id mismatch")
         events = value.get("events")
