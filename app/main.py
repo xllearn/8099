@@ -94,6 +94,13 @@ from app.layered_diagnostics import (
 )
 from app.pipeline_timing import DEFAULT_TIMINGS, PipelineTiming, normalize_pipeline_timings
 from app.quality_gate import QualityGate
+from app.run_checkpoints import (
+    CheckpointCorruptionError,
+    CheckpointError,
+    RunCheckpointStore,
+    hash_checkpoint_value,
+    publish_file_once,
+)
 from app.repair_pipeline import (
     fail_closed_controlled_repair,
     ForbiddenPhraseRepairer,
@@ -461,6 +468,10 @@ class AnalysisRunRequest(BaseModel):
     use_report_memory: bool = False
 
 
+class AnalysisRecoveryRequest(BaseModel):
+    recovery_id: str = Field(min_length=1, max_length=120)
+
+
 class AnalysisRunResponse(BaseModel):
     success: bool
     run_id: str
@@ -602,6 +613,7 @@ SITE_CACHE_DIR = Path(os.getenv("SITE_CACHE_DIR", "/app/site-cache"))
 DEFAULT_PUBLIC_BASE_URL = "http://192.168.34.88:8099"
 URL_ANALYZE_DISABLED_CODE = "URL_ANALYZE_DISABLED"
 URL_ANALYZE_DISABLED_MESSAGE = "URL 输入分析已下线，请从数据库选材页面选择材料生成 pack_id。"
+_ANALYSIS_RECOVERY_LOCK = threading.RLock()
 
 
 @app.on_event("startup")
@@ -711,6 +723,8 @@ def health() -> dict[str, Any]:
         "report_dir": str(REPORT_DIR),
         "word_export_enabled": _word_export_enabled(),
         "analysis_history_ui_enabled": _analysis_history_ui_enabled(),
+        "run_checkpoints_enabled": _analysis_checkpoints_enabled(),
+        "run_recovery_enabled": _analysis_recovery_enabled(),
         "compact_cache_enabled": compact_cache_enabled(),
         "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
@@ -2892,6 +2906,245 @@ def _analysis_history_store() -> AnalysisHistoryStore:
     return AnalysisHistoryStore(_analysis_history_dir())
 
 
+def _analysis_checkpoints_enabled() -> bool:
+    return _env_bool("ENABLE_RUN_CHECKPOINTS", False)
+
+
+def _analysis_recovery_enabled() -> bool:
+    return _env_bool("ENABLE_RUN_RECOVERY", False)
+
+
+def _analysis_checkpoint_dir() -> Path:
+    configured = (os.getenv("ANALYSIS_CHECKPOINT_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    return _analysis_run_dir().parent / "analysis_checkpoints"
+
+
+def _analysis_checkpoint_store() -> RunCheckpointStore:
+    return RunCheckpointStore(_analysis_checkpoint_dir())
+
+
+def _checkpoint_nonblocking(
+    run_id: str,
+    step: str,
+    callback,
+    *,
+    on_failure=None,
+) -> bool:
+    try:
+        callback()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_checkpoint_write_failed run_id=%s step=%s error_type=%s",
+            run_id,
+            step,
+            exc.__class__.__name__,
+        )
+        if on_failure is not None:
+            try:
+                on_failure()
+            except Exception as failure_exc:  # noqa: BLE001
+                logger.warning(
+                    "analysis_checkpoint_failure_hook_failed run_id=%s step=%s error_type=%s",
+                    run_id,
+                    step,
+                    failure_exc.__class__.__name__,
+                )
+        return False
+
+
+def _recover_analysis_result(record: dict[str, Any]) -> dict[str, Any]:
+    run_id = str(record.get("run_id") or "")
+    plan = _analysis_checkpoint_store().resume_plan(run_id)
+    if plan.get("blocked"):
+        return {**plan, "provider_result": None}
+    provider_result = record.get("provider_result")
+    provider_completed = "provider" in list(plan.get("skipped_steps") or [])
+    provider_state = str(record.get("provider_invocation_state") or "")
+    if not provider_completed and (
+        provider_state == "completed" or isinstance(provider_result, dict)
+    ):
+        return {
+            **plan,
+            "blocked": True,
+            "error_code": "RECOVERY_PROVIDER_CHECKPOINT_MISSING",
+            "next_step": "",
+            "provider_result": None,
+        }
+    if not provider_completed and provider_state == "started":
+        return {
+            **plan,
+            "blocked": True,
+            "error_code": "RECOVERY_PROVIDER_OUTCOME_UNKNOWN",
+            "next_step": "",
+            "provider_result": None,
+        }
+    if provider_completed:
+        if not isinstance(provider_result, dict):
+            raise CheckpointCorruptionError(
+                "completed provider checkpoint has no persisted provider result"
+            )
+        return {**plan, "provider_result": dict(provider_result)}
+    return {**plan, "provider_result": None}
+
+
+def _checkpoint_stage_input(pack: dict[str, Any], step: str) -> Any:
+    materials = [
+        item
+        for field in ("primary_materials", "auxiliary_materials")
+        for item in list(pack.get(field) or [])
+        if isinstance(item, dict)
+    ]
+    if step == "prepare":
+        return {
+            "pack_id": str(pack.get("pack_id") or ""),
+            "materials": [
+                {
+                    "menu_code": str(item.get("menu_code") or ""),
+                    "articleid": str(item.get("articleid") or ""),
+                    "material_role": str(item.get("material_role") or ""),
+                }
+                for item in materials
+            ],
+        }
+    if step == "attachments":
+        return [
+            {
+                "menu_code": str(material.get("menu_code") or ""),
+                "articleid": str(material.get("articleid") or ""),
+                "attachments": list(material.get("attachments") or []),
+            }
+            for material in materials
+        ]
+    if step == "evidence":
+        return {
+            "evidence_schema_version": pack.get("evidence_schema_version"),
+            "evidence_items": list(pack.get("evidence_items") or []),
+            "primary_materials": list(pack.get("primary_materials") or []),
+            "auxiliary_materials": list(pack.get("auxiliary_materials") or []),
+        }
+    return {"pack_id": str(pack.get("pack_id") or "")}
+
+
+def _bootstrap_analysis_checkpoints(run_id: str, pack: dict[str, Any]) -> None:
+    if not _analysis_checkpoints_enabled():
+        return
+    store = _analysis_checkpoint_store()
+    for step in ("prepare", "attachments", "evidence"):
+        input_value = _checkpoint_stage_input(pack, step)
+        _checkpoint_nonblocking(
+            run_id,
+            step,
+            lambda step=step, input_value=input_value: store.start(
+                run_id,
+                step,
+                input_value,
+                recovery_condition="imported_pack_hash_must_match",
+            ),
+        )
+        _checkpoint_nonblocking(
+            run_id,
+            step,
+            lambda step=step, input_value=input_value: store.complete(
+                run_id,
+                step,
+                input_value,
+                {"imported_from_pack": True},
+                recovery_condition="imported_pack_hash_must_match",
+                allow_bootstrap=True,
+            ),
+        )
+
+
+def _record_stage_checkpoint(
+    run_id: str,
+    step: str,
+    status: str,
+    input_value: Any,
+    output_value: Any = None,
+    *,
+    error_code: str = "",
+    recovery_id: str = "",
+) -> bool:
+    if not _analysis_checkpoints_enabled():
+        return True
+    store = _analysis_checkpoint_store()
+    if status == "started":
+        callback = lambda: store.start(
+            run_id,
+            step,
+            input_value,
+            recovery_id=recovery_id,
+        )
+    elif status == "completed":
+        callback = lambda: store.complete(
+            run_id,
+            step,
+            input_value,
+            output_value,
+            recovery_id=recovery_id,
+            allow_bootstrap=True,
+        )
+    elif status == "failed":
+        callback = lambda: store.fail(
+            run_id,
+            step,
+            input_value,
+            error_code=error_code or "CHECKPOINTED_STEP_FAILED",
+            recovery_id=recovery_id,
+        )
+    else:
+        raise ValueError("invalid checkpoint status")
+    return _checkpoint_nonblocking(run_id, step, callback)
+
+
+def _persist_resume_stage_nonblocking(
+    run_id: str,
+    step: str,
+    result: dict[str, Any],
+) -> None:
+    try:
+        current = _read_analysis_run(run_id)
+        current["resume_stage"] = step
+        current["resume_stage_result"] = dict(result)
+        current["status"] = "repairing" if step == "repair" else "local_quality_checking"
+        current["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+        _write_analysis_run(current)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_resume_stage_save_failed run_id=%s step=%s error_type=%s",
+            run_id,
+            step,
+            exc.__class__.__name__,
+        )
+
+
+def _analysis_stage_checkpoint_callback(
+    run_id: str,
+    recovery_id: str = "",
+):
+    def callback(
+        step: str,
+        status: str,
+        input_value: Any,
+        output_value: Any = None,
+    ) -> None:
+        _record_stage_checkpoint(
+            run_id,
+            step,
+            status,
+            input_value,
+            output_value,
+            recovery_id=recovery_id,
+        )
+        if status == "completed" and isinstance(output_value, dict):
+            _persist_resume_stage_nonblocking(run_id, step, output_value)
+
+    return callback
+
+
 def _record_analysis_history(record: dict[str, Any]) -> None:
     if not _analysis_history_enabled():
         return
@@ -4275,6 +4528,8 @@ def _postprocess_generation_with_stages(
     input_stages: list[dict[str, Any]] | None = None,
     compact: dict[str, Any] | None = None,
     timing: PipelineTiming | None = None,
+    checkpoint_callback=None,
+    resume_after: str = "",
 ) -> dict[str, Any]:
     if input_stages is None:
         input_stages, compact = _input_pipeline_stages(pack, timing)
@@ -4302,26 +4557,36 @@ def _postprocess_generation_with_stages(
         )["input_artifact"]
     staged = _set_failure_stage(staged, provider_stage)
 
-    before_cleanup = dict(staged)
     stage_timing = timing or PipelineTiming()
-    with stage_timing.measure("repair_ms"):
-        repaired_result = RepairPipeline(
-            repairers=[
-                StructureRepairer(_repair_unusable_dify_result),
-                UnsupportedFactRepairer(),
-                ForbiddenPhraseRepairer(),
-            ]
-        ).run(
-            ReportGenerationResult.from_legacy_result(staged, provider=str(staged.get("provider") or "dify")),
-            pack,
-        )
-    staged = repaired_result.to_legacy_result()
-    staged = _set_failure_stage(staged, _cleanup_pipeline_stage(before_cleanup, staged))
+    if resume_after != "repair":
+        before_cleanup = dict(staged)
+        if checkpoint_callback is not None:
+            checkpoint_callback("repair", "started", before_cleanup, None)
+        with stage_timing.measure("repair_ms"):
+            repaired_result = RepairPipeline(
+                repairers=[
+                    StructureRepairer(_repair_unusable_dify_result),
+                    UnsupportedFactRepairer(),
+                    ForbiddenPhraseRepairer(),
+                ]
+            ).run(
+                ReportGenerationResult.from_legacy_result(staged, provider=str(staged.get("provider") or "dify")),
+                pack,
+            )
+        staged = repaired_result.to_legacy_result()
+        staged = _set_failure_stage(staged, _cleanup_pipeline_stage(before_cleanup, staged))
+        if checkpoint_callback is not None:
+            checkpoint_callback("repair", "completed", before_cleanup, staged)
 
     before_quality = dict(staged)
+    if checkpoint_callback is not None:
+        checkpoint_callback("quality_gate", "started", before_quality, None)
     with stage_timing.measure("quality_gate_ms"):
         staged = _apply_local_quality_gate_to_dify_result(staged, pack)
-    return _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
+    staged = _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
+    if checkpoint_callback is not None:
+        checkpoint_callback("quality_gate", "completed", before_quality, staged)
+    return staged
 
 
 def _fallback_result_from_dify_error(
@@ -5986,13 +6251,16 @@ def cleanup_analysis_cache() -> dict[str, Any]:
     return {"success": True, **result}
 
 
+_ANALYSIS_WATCHDOG_ACTIVE_STATUSES = frozenset({"running", "generating"})
+
+
 def _save_analysis_timeout_fallback_if_running(pack_id: str, run_id: str, pack: dict[str, Any] | None, timeout_seconds: float) -> None:
     try:
         current = _read_analysis_run(run_id)
     except HTTPException as exc:
         logger.warning("analysis_run_watchdog_missing run_id=%s pack_id=%s detail=%s", run_id, pack_id, exc.detail)
         return
-    if current.get("status") != "running":
+    if current.get("status") not in _ANALYSIS_WATCHDOG_ACTIVE_STATUSES:
         return
     try:
         evidence_pack = pack or _read_database_evidence_pack(pack_id)
@@ -6046,7 +6314,7 @@ def _parse_analysis_timestamp(value: Any) -> datetime | None:
 
 
 def _maybe_finalize_timed_out_analysis_run(record: dict[str, Any]) -> dict[str, Any]:
-    if record.get("status") != "running":
+    if record.get("status") not in _ANALYSIS_WATCHDOG_ACTIVE_STATUSES:
         return record
     run_id = str(record.get("run_id") or "")
     pack_id = str(record.get("pack_id") or "")
@@ -6091,6 +6359,9 @@ def _execute_analysis_run_background(
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis_run_pack_preread_failed run_id=%s pack_id=%s error_type=%s", run_id, pack_id, exc.__class__.__name__)
     run_timing = PipelineTiming((pack_for_policy or {}).get("timings"))
+    input_stages: list[dict[str, Any]] | None = None
+    compact: dict[str, Any] | None = None
+    provider_input: Any = {"pack_id": pack_id}
     watchdog: threading.Timer | None = None
     watchdog_timeout = _analysis_watchdog_timeout_seconds(pack_for_policy)
     if watchdog_timeout > 0:
@@ -6098,6 +6369,37 @@ def _execute_analysis_run_background(
         watchdog.daemon = True
         watchdog.start()
     try:
+        if _analysis_checkpoints_enabled():
+            pack = pack_for_policy or _read_database_evidence_pack(pack_id)
+            _record_stage_checkpoint(run_id, "compact", "started", pack)
+            input_stages, compact = _input_pipeline_stages(pack, run_timing)
+            _record_stage_checkpoint(
+                run_id,
+                "compact",
+                "completed",
+                pack,
+                compact or {"compact_unavailable": True},
+            )
+            provider_input = compact or {"pack_id": pack_id}
+            record.update(
+                {
+                    "status": "generating",
+                    "provider_invocation_state": "started",
+                    "provider_started_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            _record_stage_checkpoint(
+                run_id,
+                "provider",
+                "started",
+                provider_input,
+            )
         generator = _configured_report_generator()
         with run_timing.measure("dify_ms"):
             generation_result = generator.generate(
@@ -6118,10 +6420,44 @@ def _execute_analysis_run_background(
         merged_warnings = _dedupe_strings([*inherited_warnings, *generated_warnings])
         result["generation_warnings"] = merged_warnings
         result["warnings"] = merged_warnings
+        if _analysis_checkpoints_enabled():
+            record.update(
+                {
+                    "status": "generated",
+                    "provider_invocation_state": "completed",
+                    "provider_completed_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                    "provider_result": dict(result),
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            _record_stage_checkpoint(
+                run_id,
+                "provider",
+                "completed",
+                provider_input,
+                result,
+            )
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            input_stages, compact = _input_pipeline_stages(pack, run_timing)
-            result = _postprocess_generation_with_stages(result, pack, input_stages, compact, run_timing)
+            if input_stages is None:
+                input_stages, compact = _input_pipeline_stages(pack, run_timing)
+            result = _postprocess_generation_with_stages(
+                result,
+                pack,
+                input_stages,
+                compact,
+                run_timing,
+                checkpoint_callback=(
+                    _analysis_stage_checkpoint_callback(run_id)
+                    if _analysis_checkpoints_enabled()
+                    else None
+                ),
+            )
         except Exception as repair_exc:  # noqa: BLE001
             if strict_delivery_gate_enabled():
                 failed = fail_closed_controlled_repair(
@@ -6147,6 +6483,15 @@ def _execute_analysis_run_background(
                     repair_exc.__class__.__name__,
                 )
     except DifyWorkflowError as exc:
+        if _analysis_checkpoints_enabled():
+            _record_stage_checkpoint(
+                run_id,
+                "provider",
+                "failed",
+                provider_input,
+                error_code=canonical_provider_failure_code(exc.code),
+            )
+            record["provider_invocation_state"] = "failed"
         warnings = list(record.get("warnings") or [])
         error_message = exc.message
         if exc.code in {"DIFY_TIMEOUT", "TIMEOUT"}:
@@ -6219,7 +6564,7 @@ def _execute_analysis_run_background(
     result["timings"] = run_timing.snapshot(finish=True)
     try:
         current_record = _read_analysis_run(run_id)
-        if current_record.get("status") != "running":
+        if current_record.get("status") in RUN_TERMINAL_STATUSES:
             logger.warning(
                 "analysis_run_late_dify_result_ignored run_id=%s pack_id=%s current_status=%s",
                 run_id,
@@ -6230,6 +6575,8 @@ def _execute_analysis_run_background(
     except HTTPException:
         pass
     record.update(result)
+    record.pop("provider_result", None)
+    record.pop("resume_stage_result", None)
     record["success"] = True
     record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
     _write_analysis_run(record)
@@ -6240,6 +6587,154 @@ def _execute_analysis_run_background(
         record.get("workflow_run_id") or "",
         record.get("status") or "",
     )
+
+
+def _resume_analysis_run_background(run_id: str, recovery_id: str) -> None:
+    try:
+        record = _read_analysis_run(run_id)
+        recovery = _recover_analysis_result(record)
+        if recovery.get("blocked"):
+            logger.warning(
+                "analysis_run_recovery_blocked run_id=%s recovery_id=%s code=%s",
+                run_id,
+                recovery_id,
+                recovery.get("error_code") or "",
+            )
+            return
+        pack_id = str(record.get("pack_id") or "")
+        provider_result = recovery.get("provider_result")
+        if not isinstance(provider_result, dict):
+            if str(record.get("provider_invocation_state") or "") == "started":
+                logger.warning(
+                    "analysis_run_recovery_provider_unknown run_id=%s recovery_id=%s",
+                    run_id,
+                    recovery_id,
+                )
+                return
+            if bool(record.get("use_report_memory")):
+                raise CheckpointError("report memory snapshot is unavailable for recovery")
+            record.update(
+                {
+                    "status": "running",
+                    "active_recovery_id": recovery_id,
+                    "recovery_status": "running",
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            _execute_analysis_run_background(pack_id, run_id)
+            return
+
+        pack = _read_database_evidence_pack(pack_id)
+        run_timing = PipelineTiming(record.get("timings"))
+        input_stages, compact = _input_pipeline_stages(pack, run_timing)
+        store = _analysis_checkpoint_store()
+        plan = store.resume_plan(run_id)
+        result = dict(provider_result)
+        store.assert_completed_hashes(
+            run_id,
+            "provider",
+            input_value=compact or {"pack_id": pack_id},
+            output_value=provider_result,
+        )
+        resume_after = ""
+        resume_stage_result = record.get("resume_stage_result")
+        if "quality_gate" in list(plan.get("skipped_steps") or []):
+            if not isinstance(resume_stage_result, dict):
+                raise CheckpointCorruptionError(
+                    "completed quality checkpoint has no persisted result"
+                )
+            result = dict(resume_stage_result)
+            store.assert_completed_hashes(
+                run_id,
+                "quality_gate",
+                output_value=result,
+            )
+        else:
+            if "repair" in list(plan.get("skipped_steps") or []):
+                if not isinstance(resume_stage_result, dict) or str(
+                    record.get("resume_stage") or ""
+                ) != "repair":
+                    raise CheckpointCorruptionError(
+                        "completed repair checkpoint has no persisted result"
+                    )
+                result = dict(resume_stage_result)
+                store.assert_completed_hashes(
+                    run_id,
+                    "repair",
+                    output_value=result,
+                )
+                resume_after = "repair"
+            result = _postprocess_generation_with_stages(
+                result,
+                pack,
+                input_stages,
+                compact,
+                run_timing,
+                checkpoint_callback=_analysis_stage_checkpoint_callback(
+                    run_id, recovery_id
+                ),
+                resume_after=resume_after,
+            )
+
+        result["timings"] = run_timing.snapshot(finish=True)
+        current = _read_analysis_run(run_id)
+        current.update(result)
+        current.update(
+            {
+                "success": bool(result.get("success", True)),
+                "active_recovery_id": recovery_id,
+                "last_recovery_id": recovery_id,
+                "recovery_status": "completed",
+                "recovered_from_step": str(plan.get("resumed_from") or ""),
+                "updated_at": datetime.now().isoformat(
+                    sep=" ", timespec="seconds"
+                ),
+            }
+        )
+        current.pop("provider_result", None)
+        current.pop("resume_stage_result", None)
+        _write_analysis_run(current)
+        logger.info(
+            "analysis_run_recovery_finished run_id=%s recovery_id=%s resumed_from=%s",
+            run_id,
+            recovery_id,
+            plan.get("resumed_from") or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            failed = _read_analysis_run(run_id)
+            failed.update(
+                {
+                    "status": "interrupted",
+                    "success": False,
+                    "recovery_status": "failed",
+                    "last_recovery_id": recovery_id,
+                    "recovery_error_code": (
+                        "RECOVERY_CHECKPOINT_CORRUPT"
+                        if isinstance(exc, CheckpointCorruptionError)
+                        else "RECOVERY_FAILED"
+                    ),
+                    "error_detail": exc.__class__.__name__,
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(failed)
+        except Exception as save_exc:  # noqa: BLE001
+            logger.warning(
+                "analysis_run_recovery_failure_save_failed run_id=%s error_type=%s",
+                run_id,
+                save_exc.__class__.__name__,
+            )
+        logger.exception(
+            "analysis_run_recovery_failed run_id=%s recovery_id=%s",
+            run_id,
+            recovery_id,
+        )
 
 
 @app.post("/analysis/run")
@@ -6278,6 +6773,7 @@ def run_analysis(req: AnalysisRunRequest):
     }
     record = _normalize_analysis_run_schema(record)
     _write_analysis_run(record)
+    _bootstrap_analysis_checkpoints(run_id, pack_for_memory)
     logger.info(
         "analysis_run_started run_id=%s pack_id=%s use_report_memory=%s report_memory_applied=%s report_memory_chars=%s memory_read_failed=%s",
         run_id,
@@ -6334,6 +6830,98 @@ def run_analysis(req: AnalysisRunRequest):
         input_strategy=str(record.get("input_strategy") or ""),
         timings=record.get("timings") if isinstance(record.get("timings"), dict) else {},
     )
+
+
+@app.post("/analysis/runs/{run_id}/recover")
+def recover_analysis_run(run_id: str, req: AnalysisRecoveryRequest):
+    if not _analysis_recovery_enabled() or not _analysis_checkpoints_enabled():
+        return _analysis_error(404, "RUN_RECOVERY_DISABLED", "analysis run 恢复未启用")
+    try:
+        record = _read_analysis_run(run_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在")
+        return _analysis_error(500, "RUN_READ_FAILED", "读取 analysis run 失败")
+
+    recovery_id = req.recovery_id.strip()
+    try:
+        with _ANALYSIS_RECOVERY_LOCK:
+            record = _read_analysis_run(run_id)
+            store = _analysis_checkpoint_store()
+            status = str(record.get("status") or "")
+            if status in {"finished", "needs_manual_review"}:
+                store.record_recovery_request(run_id, recovery_id)
+                return {
+                    "success": True,
+                    "run_id": run_id,
+                    "recovery_id": recovery_id,
+                    "status": status,
+                    "already_terminal": True,
+                    "resumed_from": "",
+                    "skipped_steps": [],
+                }
+            if str(record.get("recovery_status") or "") == "running":
+                if str(record.get("active_recovery_id") or "") != recovery_id:
+                    return _analysis_error(
+                        409,
+                        "RUN_RECOVERY_IN_PROGRESS",
+                        "另一个 analysis run 恢复请求正在执行",
+                    )
+                store.record_recovery_request(run_id, recovery_id)
+                return {
+                    "success": True,
+                    "run_id": run_id,
+                    "recovery_id": recovery_id,
+                    "status": status,
+                    "already_terminal": False,
+                    "resumed_from": str(record.get("recovered_from_step") or ""),
+                    "skipped_steps": [],
+                }
+            store.record_recovery_request(run_id, recovery_id)
+            plan = _recover_analysis_result(record)
+            if plan.get("blocked"):
+                return _analysis_error(
+                    409,
+                    str(plan.get("error_code") or "RUN_RECOVERY_BLOCKED"),
+                    "analysis run 无法安全自动恢复",
+                )
+            record.update(
+                {
+                    "active_recovery_id": recovery_id,
+                    "recovery_status": "running",
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            threading.Thread(
+                target=_resume_analysis_run_background,
+                args=(run_id, recovery_id),
+                daemon=True,
+            ).start()
+            return {
+                "success": True,
+                "run_id": run_id,
+                "recovery_id": recovery_id,
+                "status": str(record.get("status") or ""),
+                "already_terminal": False,
+                "resumed_from": str(plan.get("resumed_from") or ""),
+                "skipped_steps": list(plan.get("skipped_steps") or []),
+            }
+    except CheckpointCorruptionError:
+        return _analysis_error(
+            409,
+            "RECOVERY_CHECKPOINT_CORRUPT",
+            "analysis run checkpoint 损坏，已阻止自动恢复",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_run_recovery_request_failed run_id=%s error_type=%s",
+            run_id,
+            exc.__class__.__name__,
+        )
+        return _analysis_error(500, "RUN_RECOVERY_FAILED", "analysis run 恢复请求失败")
 
 
 @app.get("/analysis/history", response_model=None)
@@ -6718,18 +7306,60 @@ def download_analysis_run_report(run_id: str):
     filename = f"{_safe_filename(title)}_{_safe_filename(run_id)}_v{_safe_filename(version)}_{report_hash}.docx"
     path = REPORT_DIR / filename
     word_timing = PipelineTiming(record.get("timings"))
-    try:
+
+    def render_word(target: Path) -> None:
+        if report_ir is not None:
+            _publish_report_ir_docx(report_ir, target, title, word_timing)
+        else:
+            _publish_markdown_docx(report_markdown, target, title, word_timing)
+
+    def validate_word(target: Path) -> bool:
+        with word_timing.measure("word_scan_ms"):
+            return not bool(scan_docx(target))
+
+    def publish_without_checkpoint() -> bool:
         if not path.exists():
-            if report_ir is not None:
-                _publish_report_ir_docx(report_ir, path, title, word_timing)
-            else:
-                _publish_markdown_docx(report_markdown, path, title, word_timing)
+            render_word(path)
+            return False
+        if not validate_word(path):
+            raise FormalBodySafetyError("缓存 DOCX 正文安全扫描未通过")
+        return True
+
+    try:
+        reused = False
+        if _analysis_checkpoints_enabled():
+            try:
+                publish_result = publish_file_once(
+                    _analysis_checkpoint_store(),
+                    run_id,
+                    {
+                        "report_sha256": hashlib.sha256(
+                            report_source.encode("utf-8", errors="ignore")
+                        ).hexdigest(),
+                        "version": version,
+                        "title_sha256": hash_checkpoint_value(title),
+                    },
+                    path,
+                    render_word,
+                    validate=validate_word,
+                )
+                reused = bool(publish_result.get("reused"))
+            except CheckpointCorruptionError as exc:
+                raise FormalBodySafetyError(
+                    "Word checkpoint 或已发布文件校验失败"
+                ) from exc
+            except (OSError, CheckpointError) as exc:
+                logger.warning(
+                    "analysis_word_checkpoint_bypassed run_id=%s error_type=%s",
+                    run_id,
+                    exc.__class__.__name__,
+                )
+                reused = publish_without_checkpoint()
+        else:
+            reused = publish_without_checkpoint()
+        if not reused:
             logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
         else:
-            with word_timing.measure("word_scan_ms"):
-                hits = scan_docx(path)
-            if hits:
-                raise FormalBodySafetyError("缓存 DOCX 正文安全扫描未通过")
             logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
     except FormalBodySafetyError as exc:
         _persist_run_timings_nonblocking(run_id, word_timing.snapshot(finish=True))
