@@ -458,6 +458,45 @@ class ReleaseCliTests(unittest.TestCase):
 
         self.assertEqual(b"existing-artifact", preserved)
 
+    def test_artifact_fsync_uses_a_writable_file_descriptor(self) -> None:
+        import fcntl
+
+        module = support_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            repo = root / "repo"
+            repo.mkdir()
+            output = root / "release.tar"
+
+            def fake_git(command, **_kwargs):
+                if command[1:3] == ("status", "--porcelain"):
+                    return SimpleNamespace(stdout=b"")
+                if command[1:3] == ("rev-parse", "HEAD"):
+                    return SimpleNamespace(stdout=(SOURCE_SHA + "\n").encode("ascii"))
+                if command[1] == "archive":
+                    archive_path = Path(command[command.index("--output") + 1])
+                    with tarfile.open(archive_path, "w") as archive:
+                        info = tarfile.TarInfo("README.md")
+                        payload = b"fixture\n"
+                        info.size = len(payload)
+                        archive.addfile(info, io.BytesIO(payload))
+                    return SimpleNamespace(stdout=b"")
+                raise AssertionError(f"unexpected git command: {command}")
+
+            real_fsync = os.fsync
+
+            def require_writable(fd: int) -> None:
+                access_mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+                self.assertIn(access_mode, {os.O_WRONLY, os.O_RDWR})
+                real_fsync(fd)
+
+            with patch.object(module, "run_checked", side_effect=fake_git), patch.object(
+                module.os, "fsync", side_effect=require_writable
+            ):
+                digest = module.create_git_artifact(repo, SOURCE_SHA, output)
+
+        self.assertEqual(64, len(digest))
+
     def test_rollback_requires_exact_nonempty_image_revision(self) -> None:
         rollback = script_module("rollback_8099")
         manifest = {"image_ref": IMAGE_REF, "source_sha": SOURCE_SHA}

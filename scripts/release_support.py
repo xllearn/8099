@@ -602,7 +602,7 @@ def create_git_artifact(repo: Path, source_sha: str, output: Path) -> str:
             info.size = len(payload)
             info.mode = 0o600
             archive.addfile(info, io.BytesIO(payload))
-        with temporary.open("rb") as handle:
+        with temporary.open("rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, output)
     finally:
