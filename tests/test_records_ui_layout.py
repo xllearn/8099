@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -41,6 +42,53 @@ class RecordsUiLayoutTests(unittest.TestCase):
         for marker in removed:
             with self.subTest(marker=marker):
                 self.assertNotIn(marker, html)
+
+    def test_results_table_readability_contract(self) -> None:
+        html = RECORDS_HTML.read_text(encoding="utf-8")
+
+        self.assertIn('class="records-table"', html)
+        self.assertRegex(
+            html,
+            re.compile(r"\.records-table\s*\{[^}]*border-spacing:\s*0 4px;", re.S),
+        )
+        self.assertRegex(
+            html,
+            re.compile(r"body\s*\{[^}]*font-size:\s*13px;", re.S),
+        )
+        self.assertRegex(
+            html,
+            re.compile(r"\.record-meta\s*\{[^}]*font-size:\s*12px;", re.S),
+        )
+        self.assertRegex(
+            html,
+            re.compile(r"label\s*\{[^}]*font-size:\s*13px;", re.S),
+        )
+        self.assertRegex(
+            html,
+            re.compile(r"\.section-title\s*\{[^}]*font-size:\s*16px;", re.S),
+        )
+        self.assertRegex(
+            html,
+            re.compile(r"thead th\s*\{[^}]*font-size:\s*13px;", re.S),
+        )
+        self.assertRegex(
+            html,
+            re.compile(r"\.tag\s*\{[^}]*font-size:\s*12px;", re.S),
+        )
+        self.assertIn(
+            '<th class="col-area" style="width: 106px;">地区</th>',
+            html,
+        )
+        self.assertIn(
+            'title="${escapeHtml(shortDate(item.audittime))}">'
+            '${escapeHtml(shortDate(item.audittime))}</td>',
+            html,
+        )
+        self.assertNotIn(
+            'title="${escapeHtml(shortDateTime(item.audittime))}">'
+            '${escapeHtml(shortDateTime(item.audittime))}</td>',
+            html,
+        )
 
 
 if __name__ == "__main__":
