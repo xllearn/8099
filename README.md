@@ -1,7 +1,7 @@
-# 医械公告智能分析与报告生成系统
+# 医疗器械公告智能分析与报告生成系统
 
 > **Medical Notice Analyzer**  
-> 面向医药器械公告的证据约束 AI 分析与报告交付系统。
+> 面向医疗器械公告的证据约束 AI 分析与报告交付系统。
 
 本项目从数据库选取公告主材料和辅助材料，解析网页正文及多格式附件，构建可追溯的 Evidence Pack，再由后端代理 Dify Workflow 生成分析报告。模型输出还会经过结构修复、质量检查、正文安全校验和受控发布，降低资料遗漏、事实混用与无依据生成的风险。
 
@@ -9,7 +9,7 @@
 
 ## 项目解决什么问题
 
-医药器械采购、挂网、价格治理和集采接续类公告通常具有以下特点：
+医疗器械采购、挂网、价格治理和集采接续类公告通常具有以下特点：
 
 - 正文长、规则多，重要信息散落在多个章节；
 - 同一项目可能同时包含公告正文、PDF、Word、Excel、压缩包等材料；
@@ -63,8 +63,6 @@
 | 前端 | 原生 HTML、CSS、JavaScript | 材料选择、运行详情、历史和记忆页面，无前端构建链 |
 | 部署 | Docker、Docker Compose | 封装系统依赖、启动服务及受控发布 |
 
-> 当前实际可用的报告生成 Provider 只有 **Dify**。仓库已经定义 ReportGenerator 抽象，但多模型切换和自动回退仍属于后续方向。
-
 ## 系统架构
 
 ~~~mermaid
@@ -108,7 +106,7 @@ flowchart LR
    后端以 blocking 模式调用 Dify；前端不会接触 Dify API Key，也不直接连接模型工作流。
 
 8. **修复与质量门**  
-   模型结果进入结构修复、无依据事实检查、禁用表达检查、质量门和失败分层归因。无法安全交付的结果会保留问题状态或进入人工复核，而不是直接发布。
+   模型结果进入结构修复、无依据事实检查、禁用表达检查、质量门和失败分层归因。无法安全交付的结果会保留问题状态并阻止发布，等待人工线下检查。
 
 9. **展示、修订与记录历史**  
    报告详情页展示正文、进度、诊断和质量结果。用户可以提交反馈生成新版本，后端同时维护运行历史与版本记录。
@@ -164,7 +162,7 @@ Markdown 展示与 DOCX 导出基于统一结构处理，减少直接解析自�
 - 历史材料是否被误写为当前事实；
 - 正式正文是否包含推理、调试或不应交付的内容。
 
-修复流水线只处理受控问题，并记录修复结果。若发布开关关闭、QA 结果无效或正文安全检查失败，Word 导出会拒绝执行。
+修复流水线只处理受控问题，并记录修复结果。发布开关关闭或正文安全检查失败时，Word 导出会拒绝执行；启用严格质量要求时，QA 未通过也会阻断导出。
 
 ### 5. 运行状态、分层诊断与恢复基础
 
@@ -207,7 +205,10 @@ Markdown 展示与 DOCX 导出基于统一结构处理，减少直接解析自�
 Copy-Item .env.example .env
 ~~~
 
-在 <code>.env</code> 中配置可访问的数据库和 Dify Workflow。真实密码、API Key、Cookie 和 Token 只应保存在环境变量或私有密钥系统中。
+在 <code>.env</code> 中配置可访问的数据库和 Dify Workflow。至少需要填写以下变量，真实密码、API Key、Cookie 和 Token 只应保存在环境变量或私有密钥系统中：
+
+- 数据库：<code>DB_HOST</code>、<code>DB_PORT</code>、<code>DB_NAME</code>、<code>DB_USER</code>、<code>DB_PASSWORD</code>；
+- Dify：<code>DIFY_BASE_URL</code>、<code>DIFY_WORKFLOW_API_KEY</code>。
 
 ### 2. 使用 Docker Compose 启动
 
@@ -222,6 +223,8 @@ Docker 镜像包含 LibreOffice、antiword、Poppler、Tesseract 和中文字体
 ~~~powershell
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8099/health
 ~~~
+
+<code>/health</code> 返回 HTTP 200 只说明 Web 服务已经启动；还应访问 <code>/records</code> 验证数据库连接，并使用一组测试材料验证完整的 Dify 生成链路。
 
 ### 4. 打开材料选择页
 
@@ -349,109 +352,42 @@ docker exec medical-notice-analyzer python -m unittest discover -s tests -v
 
 ## 已知限制
 
-1. **当前只有 Dify Provider**  
-   虽然生成层已经抽象接口，但原生模型、OpenAI 兼容接口、DeepSeek 或本地模型尚未接入为可用实现。
-
-2. **任务仍依赖应用进程**  
-   客户端请求可以快速获得 run_id，但实际任务由进程内后台线程运行，尚无 Redis 队列、独立 Worker 和分布式锁。
-
-3. **持久化偏单机**  
-   运行、历史、检查点、记忆和报告主要依赖文件目录；历史存储要求单写者拓扑，不支持直接增加多个写入 Worker。
-
-4. **部分能力默认关闭**  
-   Word 导出、URL 兼容流程、检查点恢复、严格质量门、OCR 和并发解析需要按运行环境显式启用。
-
-5. **格式支持不等于任意文件均可解析**  
-   旧 DOC 依赖 LibreOffice，扫描 PDF 依赖 OCR；损坏、加密或超限文件可能返回解析告警。
-
-6. **尚无对外量化效果结论**  
-   仓库包含离线质量评估和固定回归基础，但 README 不虚构事实一致性、完整性、幻觉率、延迟或成本指标。
+| 限制 | 当前影响 |
+|---|---|
+| 进程内任务 | 客户端可快速获得 run_id，但任务由应用进程内后台线程执行；服务重启、并发扩展和任务重试能力有限 |
+| 单机文件持久化 | 运行、历史、检查点、记忆和报告主要写入挂载目录；历史存储要求单写者拓扑 |
+| 文件格式与系统依赖 | 旧 DOC 依赖 LibreOffice，扫描 PDF 依赖 OCR；损坏、加密或超限文件可能产生解析告警 |
+| 效果指标待实测 | 仓库具备离线评估和固定回归基础，但尚未在统一评测集上给出事实一致性、完整性、幻觉率、延迟和成本指标 |
 
 ## 后续优化方向
 
-后续路线不按普通后端功能堆叠，而优先提升 Agent 编排、模型评测、证据链和可靠任务能力。
+后续路线优先提升可评测的 Agent 编排、证据链、可靠任务执行和模型工程能力；表中的技术均为规划，不代表当前已经接入。
 
-### P0：提升 AI 与 Agent 工程辨识度
+### P0：可评测的显式编排与可靠任务执行
 
-#### 1. LangGraph 状态图与 Agent 编排
+| 方向 | 当前基础或限制 | 下一步交付与验证 |
+|---|---|---|
+| LangGraph 状态图 | 现有阶段由 Python 手动编排，并具备可选检查点 | 将 Document、Evidence、Report、QA、Repair、Export 建模为 State、Node 和 Edge；验证中断恢复与节点轨迹 |
+| 系统化 LLM Evaluation | 已有离线评估与固定回归，但指标口径尚未统一 | 建设版本化评测集，持续计算 Faithfulness、Citation Accuracy、Completeness、Hallucination Rate 和 Repair Rate；结果由可复现运行产生 |
+| Redis + Celery/Arq | 当前任务依赖应用进程内线程 | 拆分队列与 Worker，增加重试、超时、优先级、幂等和分布式锁；验证服务重启与并发任务 |
+| Claim 级证据链 | Evidence Pack 已保留材料角色、来源和证据项 | 增加 Claim–Evidence–Citation–Confidence 关联、来源位置及确认状态；用固定样例验证逐条回溯 |
 
-将现有手动编排的：
+### P1：平台化存储、模型网关与知识检索
 
-<code>prepare → attachments → evidence → compact → provider → repair → quality_gate → word_publish</code>
+| 方向 | 当前基础或限制 | 下一步交付与验证 |
+|---|---|---|
+| 关系数据库 + MinIO | 公告源数据来自 MySQL，运行制品主要保存在本地目录 | 将运行元数据和版本迁入关系数据库，附件、Evidence Pack 与报告交给对象存储；验证生命周期与一致性 |
+| 多 Provider Gateway | 已定义 ReportGenerator 抽象，当前只实现 Dify | 接入 OpenAI 兼容接口、DeepSeek 或本地模型，统一超时、重试、回退、Token、成本和延迟统计；在同一评测集比较 |
+| 历史公告 RAG | 当前依赖用户主动选择辅助材料 | 建设候选检索与重排链路，由 Evidence 校验决定能否写入报告；验证召回内容不会覆盖主材料事实 |
 
-迁移为显式 State Schema、Node、Edge 和 Checkpoint。可以进一步拆分 Document、Evidence、Report、QA、Repair 和 Export 节点，并保留 Dify 作为一种 Provider，而不是直接推翻现有流程。
+### P2：可观测性、人工门控与治理
 
-#### 2. 系统化 LLM Evaluation
-
-在现有离线评估与固定回归基础上建设可版本化数据集，持续评估：
-
-- Faithfulness：报告事实是否来自 Evidence；
-- Citation Accuracy：Claim 与引用证据是否匹配；
-- Completeness：关键规则和字段是否覆盖；
-- Hallucination Rate：无证据事实的占比；
-- Repair Rate：首次生成需要修复的比例。
-
-指标必须来自可复现运行，不在实现前预设结果。
-
-#### 3. Redis + Celery/Arq 任务系统
-
-使用 Redis 队列和独立 Worker 替换进程内线程，补齐：
-
-- 任务重试与超时；
-- 并发和优先级控制；
-- 分布式锁与幂等；
-- 服务重启后的状态恢复；
-- 解析、生成与导出的资源隔离。
-
-#### 4. Claim–Evidence–Citation–Confidence 证据链
-
-把当前 Evidence Item 继续细化为 Claim 级关联，记录：
-
-- claim_id；
-- evidence_id；
-- source_location；
-- citation；
-- confidence；
-- 验证或人工确认状态。
-
-让质量评估和报告引用可以追溯到具体来源位置。
-
-### P1：提升平台与模型工程能力
-
-#### 1. 关系数据库 + MinIO 持久化
-
-公告源数据已来自 MySQL；下一步将 analysis_run、任务状态、Evidence 索引和报告版本等运行元数据迁移到关系数据库，并使用 MinIO 管理附件、Evidence Pack 与报告文件的生命周期。
-
-#### 2. 多模型 Provider Gateway
-
-完善 ReportGenerator 接口，接入 Dify、OpenAI 兼容接口、DeepSeek 与本地模型，统一：
-
-- generate、stream、embed 和 evaluate；
-- 超时、重试与 fallback；
-- Token、成本和延迟统计；
-- 同一数据集上的质量比较。
-
-#### 3. 历史公告 RAG
-
-建立历史公告、规则和项目案例知识库。Retriever 负责发现候选材料，Evidence 系统负责确认事实，避免把“相似文本被召回”直接等同于“可以写入当前报告”。
-
-### P2：提升可观测性与治理能力
-
-#### 1. OpenTelemetry + Prometheus + Grafana
-
-补充全链路 Trace 和指标，观察 queue_time、parse_time、LLM_time、repair_time、Token、成本、质量通过率和失败分层。
-
-#### 2. Human-in-the-loop 与 Agent Trace
-
-对证据冲突、低置信 Claim 和阻断型质量问题增加 WAIT_HUMAN、APPROVED、CONTINUE 等状态，并在前端展示各节点输入摘要、耗时、结果和人工操作记录。
-
-#### 3. 企业安全治理
-
-增加用户权限、文件安全扫描、Prompt Injection 防护、敏感信息识别与脱敏，以及更细粒度的审计记录。
-
-#### 4. Prompt Registry 与 A/B 测试
-
-为 Prompt 增加版本、实验、发布和回滚机制，在相同评测集上比较不同 Prompt、模型和编排策略，避免只凭主观感受优化。
+| 方向 | 当前基础或限制 | 下一步交付与验证 |
+|---|---|---|
+| OpenTelemetry + Prometheus + Grafana | 已有阶段计时和分层诊断，尚无标准化观测栈 | 采集队列、解析、模型、修复、Token、成本、质量门和失败类型指标，并关联 run_id Trace |
+| Human-in-the-loop 与 Agent Trace | 当前阻断型问题只保留状态，等待线下检查 | 增加 WAIT_HUMAN、APPROVED、CONTINUE 状态和审核界面，记录节点摘要、耗时、结果与人工操作 |
+| 企业安全治理 | 已有凭据隔离、输入边界和正文安全检查 | 增加权限控制、文件扫描、Prompt Injection 防护、敏感信息识别脱敏和细粒度审计 |
+| Prompt Registry 与 A/B 测试 | Prompt 以仓库文件管理，缺少实验生命周期 | 增加版本、实验、发布和回滚机制，在同一评测集比较 Prompt、模型和编排策略 |
 
 ---
 
