@@ -193,7 +193,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("run-analysis-report", response.text)
         self.assertIn("useReportMemory", response.text)
         self.assertIn("报告记忆库", response.text)
-        self.assertIn("不会覆盖当前公告事实", response.text)
+        self.assertIn("不作为当前公告事实来源", response.text)
         self.assertIn('id="useReportMemory" type="checkbox" checked', response.text)
         self.assertIn('href="/memory-ui"', response.text)
         self.assertNotIn("enableAttachmentDownload", response.text)
