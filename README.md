@@ -345,6 +345,17 @@ docker exec medical-notice-analyzer python -m unittest discover -s tests -v
 
 本文档只提供测试命令，不声明某个未在当前环境复现的通过数量或成功率。
 
+### Dify 内置 token 与耗时统计
+
+需要核对 Dify 工作流的模型消耗和节点耗时时，可运行：
+
+~~~powershell
+.\scripts\dify_run_stats.ps1 -Latest
+.\scripts\dify_run_stats.ps1 -WorkflowRunId <workflow_run_id>
+~~~
+
+脚本读取 Dify 自带的 `workflow_runs.total_tokens`、`workflow_node_executions.execution_metadata` 和 `workflow_node_executions.elapsed_time`，输出工作流总 token、总耗时及节点级统计。该统计用于运行诊断和成本分析，不作为报告事实来源。
+
 ## 可靠性与安全边界
 
 - **凭据隔离**：数据库密码、Dify API Key、Cookie 和 Token 只从环境变量读取；前端不需要获得 Dify Key。
