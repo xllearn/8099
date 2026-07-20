@@ -23,6 +23,30 @@
 - Reference: app/generation/base.py and app/generation/dify_generator.py — generator abstraction and current Dify implementation.
 - Reference: tests/ — implemented behavior coverage; presence alone must not be described as a passing result.
 
+## Spec Coverage
+
+| 已批准设计要求 | 实施任务 |
+|---|---|
+| 项目名称与一句话定位 | Task 2, Step 1 |
+| 核心能力 | Task 2, Step 2 |
+| 技术选型 | Task 2, Step 3 |
+| 系统架构 | Task 2, Step 4 |
+| 端到端处理流程 | Task 2, Step 5 |
+| AI 工程设计亮点 | Task 2, Step 6 |
+| 功能状态与开关边界 | Task 2, Step 7 and Task 3, Step 3 |
+| 本地快速开始 | Task 2, Step 8 |
+| 核心 API | Task 2, Step 9 |
+| 项目结构 | Task 2, Step 9 |
+| 测试、可靠性与安全边界 | Task 2, Step 10 and Task 3 |
+| 已知限制 | Task 2, Step 10 |
+| 后续优化方向 | Task 2, Step 11 |
+| 脱敏 | Task 3, Step 2 |
+| LangGraph、Evaluation、Redis、Evidence Grounding | Task 2, Step 11 |
+| MinIO、多模型 Provider、RAG | Task 2, Step 11 |
+| OpenTelemetry、Human-in-the-loop 与 LLMOps | Task 2, Step 11 |
+| 独立事实与招聘可读性复核 | Task 4, Steps 1–3 |
+| 通过 PR 更新目标仓库 | Task 4, Step 4 |
+
 ### Task 1: Reconfirm the Branch Baseline
 
 **Files:**
