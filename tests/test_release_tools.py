@@ -410,6 +410,8 @@ class ReleaseCliTests(unittest.TestCase):
         self.assertEqual("${S4_GIT_SHA:?S4_GIT_SHA is required}", environment["APP_GIT_SHA"])
         self.assertEqual("1", environment["WEB_CONCURRENCY"])
         self.assertEqual("1", environment["UVICORN_WORKERS"])
+        self.assertEqual("false", environment["ENABLE_UNSUPPORTED_FACT_REPAIR"])
+        self.assertEqual("true", environment["ENABLE_EVIDENCE_INDEX"])
         self.assertEqual("true", environment["ENABLE_VBP_QUALITY_GATE"])
         self.assertEqual("true", environment["ENABLE_STRICT_DELIVERY_GATE"])
         self.assertEqual("true", environment["ENABLE_RUN_CHECKPOINTS"])
