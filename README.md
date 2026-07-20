@@ -201,14 +201,20 @@ Markdown 展示与 DOCX 导出基于统一结构处理，减少直接解析自�
 
 ### 1. 准备环境变量
 
-~~~powershell
-Copy-Item .env.example .env
+在项目根目录新建 <code>.env</code>，将下列占位符替换为实际环境值。这里仅列出主链路所需的最小配置；不要把真实密码、API Key、Cookie 或 Token 提交到 Git。
+
+~~~dotenv
+PUBLIC_BASE_URL=http://127.0.0.1:8099
+DB_HOST=your-db-host
+DB_PORT=3306
+DB_NAME=your-database
+DB_USER=your-db-user
+DB_PASSWORD=your-db-password
+DIFY_BASE_URL=https://your-dify-host/v1
+DIFY_WORKFLOW_API_KEY=your-dify-workflow-api-key
 ~~~
 
-在 <code>.env</code> 中配置可访问的数据库和 Dify Workflow。至少需要填写以下变量，真实密码、API Key、Cookie 和 Token 只应保存在环境变量或私有密钥系统中：
-
-- 数据库：<code>DB_HOST</code>、<code>DB_PORT</code>、<code>DB_NAME</code>、<code>DB_USER</code>、<code>DB_PASSWORD</code>；
-- Dify：<code>DIFY_BASE_URL</code>、<code>DIFY_WORKFLOW_API_KEY</code>。
+其他功能开关可先使用 Docker Compose 默认值，再按“功能状态与边界”逐项启用。
 
 ### 2. 使用 Docker Compose 启动
 
