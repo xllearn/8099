@@ -78,6 +78,7 @@ def fetch_attachment_bytes(
     enable_download: bool | None = None,
     user_cookie: str = "",
     user_headers: dict[str, str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> AttachmentDownloadResult:
     warnings: list[str] = []
     download_enabled = _bool_env("ENABLE_ATTACHMENT_DOWNLOAD", True) if enable_download is None else enable_download
@@ -91,7 +92,12 @@ def fetch_attachment_bytes(
     headers, auth_mode = build_attachment_auth_headers(user_cookie=user_cookie, user_headers=user_headers)
     base_url = (os.getenv("ATTACHMENT_DOWNLOAD_BASE_URL") or DEFAULT_ATTACHMENT_DOWNLOAD_BASE_URL).strip()
     url = f"{base_url}{articleattid}"
-    timeout = _float_env("ATTACHMENT_REQUEST_TIMEOUT", 60)
+    configured_timeout = max(0.1, _float_env("ATTACHMENT_REQUEST_TIMEOUT", 60))
+    timeout = (
+        min(configured_timeout, max(0.1, float(timeout_seconds)))
+        if timeout_seconds is not None
+        else configured_timeout
+    )
     max_download_bytes = int(_float_env("ATTACHMENT_MAX_DOWNLOAD_MB", 50) * 1024 * 1024)
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, headers=headers) as client:

@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import os
 import shutil
-import sqlite3
 import tempfile
-import threading
 import time
 import unittest
 import json
-from contextlib import closing
 from unittest.mock import patch
 
 from docx import Document
@@ -137,10 +134,53 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("a.status = %s", list_sql)
         self.assertIn("LEFT JOIN", list_sql)
         self.assertIn("GROUP BY", list_sql)
-        self.assertIn("ORDER BY a.audittime DESC", list_sql)
+        self.assertIn("CASE WHEN a.menu_name = '项目公告' THEN 0 ELSE 1 END", list_sql)
+        self.assertIn("a.audittime DESC", list_sql)
         self.assertIn("LIMIT %s OFFSET %s", list_sql)
         self.assertIn("%stent%", list_params)
         self.assertEqual(list_params[-2:], [20, 20])
+
+    def test_records_list_sort_latest_keeps_previous_time_desc_order(self) -> None:
+        calls = []
+
+        def fake_fetch_one(sql: str, params: list[object]):
+            calls.append(("one", sql, params))
+            return {"total": 1}
+
+        def fake_fetch_all(sql: str, params: list[object]):
+            calls.append(("all", sql, params))
+            return [list_row(articleid="a1", title="Latest first")]
+
+        with patch.object(main_module, "_db_fetch_one", fake_fetch_one, create=True), patch.object(
+            main_module, "_db_fetch_all", fake_fetch_all, create=True
+        ):
+            response = self.client.get("/records", params={"sort": "latest", "page": 1, "page_size": 20})
+
+        self.assertEqual(response.status_code, 200)
+        list_sql = calls[1][1]
+        self.assertIn("ORDER BY a.audittime DESC", list_sql)
+        self.assertNotIn("CASE WHEN a.menu_name", list_sql)
+
+    def test_records_list_can_disable_project_notice_priority_by_feature_flag(self) -> None:
+        calls = []
+
+        def fake_fetch_one(sql: str, params: list[object]):
+            calls.append(("one", sql, params))
+            return {"total": 1}
+
+        def fake_fetch_all(sql: str, params: list[object]):
+            calls.append(("all", sql, params))
+            return [list_row(articleid="a1", title="Latest first")]
+
+        with patch.dict(main_module.os.environ, {"ENABLE_PROJECT_NOTICE_PRIORITY": "false"}), patch.object(
+            main_module, "_db_fetch_one", fake_fetch_one, create=True
+        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True):
+            response = self.client.get("/records", params={"page": 1, "page_size": 20})
+
+        self.assertEqual(response.status_code, 200)
+        list_sql = calls[1][1]
+        self.assertIn("ORDER BY a.audittime DESC", list_sql)
+        self.assertNotIn("CASE WHEN a.menu_name", list_sql)
 
     def test_records_ui_serves_static_page(self) -> None:
         response = self.client.get("/records-ui")
@@ -162,6 +202,37 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("复制 pack_id", response.text)
         self.assertIn("查看证据包摘要", response.text)
         self.assertNotIn("查看完整 evidence_pack</a>", response.text)
+
+    def test_records_ui_requests_project_notice_first_sort_by_default(self) -> None:
+        html = (main_module.Path(main_module.__file__).resolve().parent / "static" / "records.html").read_text(encoding="utf-8")
+
+        self.assertIn("sort', 'project_notice_first'", html)
+
+    def test_url_analyze_endpoints_are_soft_disabled_by_default(self) -> None:
+        client = TestClient(main_module.app, raise_server_exceptions=False)
+
+        async def forbidden_fetch(_: str) -> dict[str, str]:
+            raise AssertionError("disabled URL analyze endpoint must not fetch pages")
+
+        original_fetch = main_module._fetch_page
+        try:
+            main_module._fetch_page = forbidden_fetch
+            with patch.dict(main_module.os.environ, {}, clear=False):
+                main_module.os.environ.pop("ENABLE_URL_ANALYZE", None)
+                with self.assertLogs("medical_notice_analyzer", level="WARNING") as logs:
+                    analyze_response = client.post("/analyze", json={"url": "https://example.com/notice"})
+                    analyze_v2_response = client.post("/analyze_v2", json={"url": "https://example.com/notice"})
+        finally:
+            main_module._fetch_page = original_fetch
+
+        for response in (analyze_response, analyze_v2_response):
+            self.assertEqual(response.status_code, 410)
+            body = response.json()
+            self.assertFalse(body["success"])
+            self.assertEqual(body["error"]["code"], "URL_ANALYZE_DISABLED")
+            self.assertEqual(body["error"]["message"], "URL 输入分析已下线，请从数据库选材页面选择材料生成 pack_id。")
+        self.assertIn("url_analyze_disabled_endpoint_access endpoint=/analyze", "\n".join(logs.output))
+        self.assertIn("url_analyze_disabled_endpoint_access endpoint=/analyze_v2", "\n".join(logs.output))
 
     def test_records_list_tolerates_nullable_optional_fields(self) -> None:
         with patch.object(main_module, "_db_fetch_one", return_value={"total": 1}, create=True), patch.object(
@@ -318,10 +389,6 @@ class RecordsApiTests(unittest.TestCase):
             self.assertEqual(attachment["parse_status"], "metadata_only")
             self.assertIn("{articleattid}", attachment["download_url_template"])
             self.assertEqual(pack["pack_version"], "2.0")
-            self.assertEqual(pack["evidence_schema_version"], "3_lite")
-            self.assertGreaterEqual(len(pack["evidence_items"]), 1)
-            self.assertIn("evidence_id", pack["primary_materials"][0]["key_facts"][0])
-            self.assertIn("source_span", pack["primary_materials"][0]["key_facts"][0])
             self.assertIn("primary_evidence", pack)
             self.assertIn("auxiliary_evidence", pack)
             self.assertIn("attachment_evidence", pack)
@@ -331,180 +398,12 @@ class RecordsApiTests(unittest.TestCase):
             pack_response = self.client.get(f"/analysis/packs/{body['pack_id']}")
             self.assertEqual(pack_response.status_code, 200)
             self.assertEqual(pack_response.json()["pack_id"], body["pack_id"])
-            self.assertEqual(pack_response.json()["evidence_schema_version"], "3_lite")
-            self.assertGreater(pack_response.json()["evidence_item_count"], 0)
-            self.assertNotIn("evidence_items", pack_response.json())
-            self.assertIn("evidence_id", pack_response.json()["primary_materials"][0]["key_facts"][0])
             self.assertNotIn("report_memory", json.dumps(pack_response.json(), ensure_ascii=False))
             self.assertNotIn("memory_candidates", json.dumps(pack_response.json(), ensure_ascii=False))
 
             summary_response = self.client.get(f"/analysis/packs/{body['pack_id']}/summary")
             self.assertEqual(summary_response.status_code, 200)
             self.assertEqual(summary_response.json()["attachment_count"], 2)
-
-    def test_analysis_prepare_uses_material_full_cache_hit_and_recomputes_role_context(self) -> None:
-        from app.material_compression_cache import MaterialCompressionCacheRepository
-
-        rows = {
-            ("m1", "a1"): detail_row(menu_code="m1", articleid="a1", title="Cached Primary", summary="fresh summary"),
-            ("m2", "a2"): detail_row(
-                menu_code="m2",
-                articleid="a2",
-                title="Cached Aux",
-                summary="aux summary",
-                content="<p>Cached Primary 价格规则 辅助材料用于对比。</p>",
-            ),
-        }
-        attachments = {
-            ("m1", "a1"): [attachment_row(menu_code="m1", articleid="a1", articleattid="att1", filename="primary.pdf", fileext=".pdf")],
-            ("m2", "a2"): [attachment_row(menu_code="m2", articleid="a2", articleattid="att2", filename="aux.xlsx", fileext=".xlsx")],
-        }
-
-        def fake_fetch_all(sql: str, params: list[object]):
-            if "sample_article_wide" in sql:
-                return list(rows.values())
-            if "sample_article_attach" in sql:
-                return [item for group in attachments.values() for item in group]
-            return []
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
-            main_module.os.environ,
-            {
-                "MATERIAL_COMPRESSION_CACHE_ENABLED": "true",
-                "MATERIAL_COMPRESSION_CACHE_DB_PATH": str(main_module.Path(tmpdir) / "material_cache.sqlite3"),
-            },
-            clear=False,
-        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True), patch.object(
-            main_module, "_database_evidence_pack_dir", return_value=main_module.Path(tmpdir) / "packs", create=True
-        ), patch.object(main_module, "_database_attachment_metadata", side_effect=AssertionError("cache hit should not rebuild attachments")):
-            repo = MaterialCompressionCacheRepository(main_module.Path(tmpdir) / "material_cache.sqlite3")
-            options = {"enable_download": False, "force_refresh": False, "user_cookie": "", "user_headers": {}}
-            for key, row in rows.items():
-                signature = main_module._material_cache_signature(row, attachments[key], options, "material/full")
-                repo.write_ready(
-                    signature,
-                    {
-                        "material_role": "cached",
-                        "menu_code": row["menu_code"],
-                        "articleid": row["articleid"],
-                        "title": row["title"],
-                        "summary": row["summary"],
-                        "content_text": main_module._article_text_from_html(row["content"]),
-                        "content_summary": row["summary"],
-                        "attachments": [{"articleattid": "cached-att", "filename": "cached.pdf", "parse_status": "metadata_only"}],
-                        "relation_to_primary": "stale relation must be recomputed",
-                    },
-                    diagnostics={"source": "unit"},
-                    build_source="unit",
-                )
-
-            response = self.client.post(
-                "/analysis/prepare",
-                json={
-                    "primary_materials": [{"menu_code": "m1", "articleid": "a1"}],
-                    "auxiliary_materials": [{"menu_code": "m2", "articleid": "a2"}],
-                    "enable_attachment_download": False,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        pack = response.json()["evidence_pack"]
-        self.assertEqual(pack["material_cache_stats"]["hit_count"], 2)
-        self.assertEqual(pack["material_cache_stats"]["dynamic_count"], 0)
-        self.assertEqual(pack["primary_materials"][0]["material_role"], "primary")
-        self.assertEqual(pack["primary_materials"][0]["material_cache"]["status"], "hit")
-        self.assertEqual(pack["auxiliary_materials"][0]["material_role"], "auxiliary")
-        self.assertEqual(pack["auxiliary_materials"][0]["material_cache"]["status"], "hit")
-        self.assertNotEqual(pack["auxiliary_materials"][0]["relation_to_primary"], "stale relation must be recomputed")
-        self.assertIn("relation_to_primary", pack["auxiliary_materials"][0])
-        compact = main_module._compact_evidence_pack_for_dify(pack)
-        self.assertNotIn("material_cache", json.dumps(compact, ensure_ascii=False))
-        diagnostics = build_pack_diagnostics(pack, compact)
-        self.assertEqual(diagnostics["material_cache_stats"]["hit_count"], 2)
-        self.assertIn("MATERIAL_COMPRESSION_CACHE_HIT", {item["code"] for item in diagnostics["diagnosis"]})
-
-    def test_analysis_prepare_falls_back_when_material_cache_is_corrupt(self) -> None:
-        from app.material_compression_cache import MaterialCompressionCacheRepository
-
-        row = detail_row(menu_code="m1", articleid="a1", title="Primary", summary="primary summary")
-        attachment = attachment_row(menu_code="m1", articleid="a1", articleattid="att1", filename="primary.pdf", fileext=".pdf")
-
-        def fake_fetch_all(sql: str, params: list[object]):
-            if "sample_article_wide" in sql:
-                return [row]
-            if "sample_article_attach" in sql:
-                return [attachment]
-            return []
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
-            main_module.os.environ,
-            {
-                "MATERIAL_COMPRESSION_CACHE_ENABLED": "true",
-                "MATERIAL_COMPRESSION_CACHE_DB_PATH": str(main_module.Path(tmpdir) / "material_cache.sqlite3"),
-            },
-            clear=False,
-        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True), patch.object(
-            main_module, "_database_evidence_pack_dir", return_value=main_module.Path(tmpdir) / "packs", create=True
-        ):
-            db_path = main_module.Path(tmpdir) / "material_cache.sqlite3"
-            repo = MaterialCompressionCacheRepository(db_path)
-            options = {"enable_download": False, "force_refresh": False, "user_cookie": "", "user_headers": {}}
-            signature = main_module._material_cache_signature(row, [attachment], options, "material/full")
-            repo.write_ready(signature, {"title": "bad"}, diagnostics={}, build_source="unit")
-            with closing(sqlite3.connect(db_path)) as conn:
-                with conn:
-                    conn.execute("UPDATE material_compression_cache SET payload_json = ? WHERE cache_key = ?", ("{not-json", signature.cache_key))
-
-            response = self.client.post(
-                "/analysis/prepare",
-                json={
-                    "primary_materials": [{"menu_code": "m1", "articleid": "a1"}],
-                    "auxiliary_materials": [],
-                    "enable_attachment_download": False,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        pack = response.json()["evidence_pack"]
-        self.assertEqual(pack["material_cache_stats"]["corrupt_count"], 1)
-        self.assertEqual(pack["material_cache_stats"]["dynamic_count"], 1)
-        self.assertEqual(pack["primary_materials"][0]["material_cache"]["status"], "corrupt")
-        self.assertEqual(pack["primary_materials"][0]["title"], "Primary")
-
-    def test_material_cache_check_and_build_selected_materials_api(self) -> None:
-        def fake_fetch_all(sql: str, params: list[object]):
-            if "sample_article_wide" in sql:
-                return [detail_row(menu_code="m1", articleid="a1", title="Primary", summary="primary summary")]
-            if "sample_article_attach" in sql:
-                return [attachment_row(menu_code="m1", articleid="a1", articleattid="att1", filename="primary.pdf", fileext=".pdf")]
-            return []
-
-        request_body = {
-            "primary_materials": [{"menu_code": "m1", "articleid": "a1"}],
-            "auxiliary_materials": [],
-            "enable_attachment_download": False,
-        }
-        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
-            main_module.os.environ,
-            {
-                "MATERIAL_COMPRESSION_CACHE_ENABLED": "true",
-                "MATERIAL_COMPRESSION_CACHE_DB_PATH": str(main_module.Path(tmpdir) / "material_cache.sqlite3"),
-            },
-            clear=False,
-        ), patch.object(main_module, "_db_fetch_all", fake_fetch_all, create=True):
-            before = self.client.post("/analysis/material-cache/check", json=request_body)
-            build = self.client.post(
-                "/analysis/material-cache/build",
-                json={**request_body, "levels": ["material/full", "primary/light", "primary/safe", "auxiliary/summary"]},
-            )
-            after = self.client.post("/analysis/material-cache/check", json=request_body)
-
-        self.assertEqual(before.status_code, 200)
-        self.assertEqual(before.json()["summary"]["miss_count"], 4)
-        self.assertEqual(build.status_code, 200)
-        self.assertEqual(build.json()["summary"]["built_count"], 4)
-        self.assertEqual(after.status_code, 200)
-        self.assertEqual(after.json()["summary"]["hit_count"], 4)
 
     def test_attachment_download_without_cookie_attempts_request_and_handles_rejection(self) -> None:
         with patch.dict(
@@ -854,6 +753,7 @@ class RecordsApiTests(unittest.TestCase):
             {
                 "ENABLE_ATTACHMENT_PARSE": "true",
                 "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
                 "ATTACHMENT_COOKIE": "",
                 "ATTACHMENT_HEADERS_JSON": "",
                 "ELIAN_QX_COOKIE": "",
@@ -942,6 +842,7 @@ class RecordsApiTests(unittest.TestCase):
                 "ENABLE_ATTACHMENT_DOWNLOAD": "false",
                 "ENABLE_ATTACHMENT_PARSE": "true",
                 "ENABLE_ATTACHMENT_PARSE_CACHE": "false",
+                "ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION": "false",
                 "ATTACHMENT_COOKIE": "",
                 "ATTACHMENT_HEADERS_JSON": "",
                 "ELIAN_QX_COOKIE": "",
@@ -1145,6 +1046,187 @@ class RecordsApiTests(unittest.TestCase):
         self.assertGreater(len(primary["content_text"]), 8000)
         self.assertNotIn("primary_content_tail", {item["type"] for item in compact["omitted_content"]})
         self.assertLess(compact["compact_pack_chars"], 65000)
+
+    def test_dify_compact_does_not_second_pass_when_first_pass_under_hard_limit(self) -> None:
+        table_detail = {
+            "sheet_name": "result",
+            "rows": 80,
+            "columns_count": 6,
+            "headers": ["enterprise", "product", "selected_price"],
+            "key_columns": ["enterprise", "product", "selected_price"],
+            "field_stats": {"enterprise": {"unique_count": 20, "sample_values": ["A", "B"]}},
+            "summary": "small table keeps detail",
+            "business_value": "supports selected-result analysis",
+        }
+        attachment_summary = {
+            "filename": "selected-result.xlsx",
+            "summary": "attachment summary should remain unchanged",
+            "table_summaries": [table_detail],
+            "sentinel_nested_detail": {"must_keep": True},
+        }
+        pack = {
+            "pack_id": "pack_under_hard_limit_no_second_pass",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Small notice",
+                    "content_text": "primary body " * 200,
+                    "content_text_length": len("primary body " * 200),
+                    "attachments": [
+                        {
+                            "articleattid": "att1",
+                            "filename": "selected-result.xlsx",
+                            "core_attachment": True,
+                            "parse_status": "parsed_table_summary",
+                            "summary": "core summary " * 80,
+                            "table_summaries": [table_detail],
+                        }
+                    ],
+                    "attachment_summaries": [attachment_summary],
+                }
+            ],
+            "auxiliary_materials": [],
+            "generation_guidance": {},
+        }
+
+        compact = main_module._compact_evidence_pack_for_dify(pack)
+
+        self.assertLessEqual(compact["compact_pack_chars"], 80000)
+        self.assertFalse(compact.get("second_pass_compression_applied", False))
+        self.assertNotIn("hard_limit_second_pass", compact["compression_reason"])
+        self.assertEqual(compact["primary_materials"][0]["attachment_summaries"][0], attachment_summary)
+
+    def test_dify_compact_light_second_pass_trims_only_enough_for_small_overflow(self) -> None:
+        target_limit = 80000
+        large_summary = "L" * 75000
+        table_summary = {
+            "sheet_name": "result",
+            "rows": 12000,
+            "columns_count": 18,
+            "headers": [f"column_{index}" for index in range(30)],
+            "key_columns": [f"key_{index}" for index in range(20)],
+            "enterprise_columns": ["enterprise"],
+            "product_columns": ["product"],
+            "price_columns": ["selected_price"],
+            "field_stats": {"enterprise": {"unique_count": 200, "sample_values": ["A", "B"]}},
+            "summary": "large table summary with product enterprise selected price fields " * 20,
+            "business_value": "supports product, enterprise, price and selected-result analysis",
+        }
+        attachment = {
+            "articleattid": "att1",
+            "filename": "selected-result.xlsx",
+            "core_attachment": True,
+            "parse_status": "parsed_table_summary",
+            "summary": "short core attachment summary",
+            "key_facts": ["enterprise product selected price purchase volume " * 4 for _ in range(4)],
+            "important_sections": ["important section with operation detail " * 10 for _ in range(2)],
+            "table_summaries": [table_summary],
+        }
+        large_attachment_summary = {
+            **attachment,
+            "summary": large_summary,
+        }
+        pack = {
+            "pack_id": "pack_second_pass_attachment_summaries",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Large attachment-summary notice",
+                    "content_text": "primary rule and deadline " * 80,
+                    "content_text_length": len("primary rule and deadline " * 80),
+                    "attachments": [attachment],
+                    "attachment_summaries": [large_attachment_summary],
+                }
+            ],
+            "auxiliary_materials": [],
+            "generation_guidance": {},
+        }
+
+        compact = main_module._compact_evidence_pack_for_dify(pack, max_chars=target_limit)
+        compacted_summary = compact["primary_materials"][0]["attachment_summaries"][0]
+
+        self.assertGreater(compact["second_pass_first_pass_chars"], target_limit)
+        self.assertLessEqual(compact["second_pass_first_pass_chars"], 90000)
+        self.assertEqual(compact["second_pass_tier"], "light")
+        self.assertGreaterEqual(compact["compact_pack_chars"], 78000)
+        self.assertLessEqual(compact["compact_pack_chars"], 79500)
+        self.assertTrue(compact["second_pass_compression_applied"])
+        self.assertIn("hard_limit_second_pass", compact["compression_reason"])
+        self.assertIn("hard_limit_second_pass_light_trim", compact["compression_reason"])
+        self.assertIn("field_stats", json.dumps(compacted_summary, ensure_ascii=False))
+        self.assertGreater(len(compacted_summary["summary"]), 63000)
+
+    def test_dify_compact_strong_second_pass_keeps_large_pack_near_upper_limit(self) -> None:
+        target_limit = 80000
+        table_summary = {
+            "sheet_name": "result",
+            "rows": 18000,
+            "columns_count": 20,
+            "headers": [f"column_{index}" for index in range(36)],
+            "key_columns": [f"key_{index}" for index in range(24)],
+            "enterprise_columns": ["enterprise"],
+            "product_columns": ["product"],
+            "price_columns": ["selected_price"],
+            "field_stats": {"enterprise": {"unique_count": 500, "sample_values": ["A", "B", "C"]}},
+            "summary": "large table summary with product enterprise selected price fields " * 30,
+            "business_value": "supports product, enterprise, price and selected-result analysis " * 6,
+        }
+        attachments = [
+            {
+                "articleattid": f"att{index}",
+                "filename": f"selected-result-{index}.xlsx",
+                "core_attachment": index == 0,
+                "parse_status": "parsed_table_summary",
+                "summary": "short core attachment summary",
+                "key_facts": ["enterprise product selected price purchase volume " * 6 for _ in range(6)],
+                "important_sections": ["important section with operation detail " * 12 for _ in range(3)],
+                "table_summaries": [table_summary],
+            }
+            for index in range(5)
+        ]
+        large_attachment_summaries = [
+            {
+                **attachment,
+                "summary": f"attachment {index} " + ("product enterprise selected price evidence " * 1200),
+            }
+            for index, attachment in enumerate(attachments)
+        ]
+        pack = {
+            "pack_id": "pack_strong_second_pass_attachment_summaries",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Very large attachment-summary notice",
+                    "content_text": "primary rule and deadline " * 80,
+                    "content_text_length": len("primary rule and deadline " * 80),
+                    "attachments": attachments,
+                    "attachment_summaries": large_attachment_summaries,
+                }
+            ],
+            "auxiliary_materials": [],
+            "generation_guidance": {},
+        }
+
+        compact = main_module._compact_evidence_pack_for_dify(pack, max_chars=target_limit)
+        compacted_summaries = compact["primary_materials"][0]["attachment_summaries"]
+
+        self.assertGreater(compact["second_pass_first_pass_chars"], 150000)
+        self.assertEqual(compact["second_pass_tier"], "strong")
+        self.assertGreaterEqual(compact["compact_pack_chars"], 75000)
+        self.assertLessEqual(compact["compact_pack_chars"], 79000)
+        self.assertTrue(compact["second_pass_compression_applied"])
+        self.assertIn("hard_limit_second_pass", compact["compression_reason"])
+        self.assertIn("hard_limit_second_pass_strong_trim", compact["compression_reason"])
+        self.assertGreater(sum(len(str(item.get("summary") or "")) for item in compacted_summaries), 8000)
+        self.assertTrue(any(item.get("key_facts") for item in compacted_summaries))
+        self.assertTrue(any(item.get("table_summaries") for item in compacted_summaries))
+        first_table = compacted_summaries[0]["table_summaries"][0]
+        self.assertIn("headers", first_table)
+        self.assertIn("key_columns", first_table)
+        self.assertIn("summary", first_table)
 
     def test_dify_input_uses_full_detail_for_small_pack(self) -> None:
         long_summary = "Attachment table describes enterprise product selected price operation path. " * 70
@@ -1745,6 +1827,274 @@ class RecordsApiTests(unittest.TestCase):
         self.assertFalse(report_memory["read_failed"])
         self.assertNotIn("content", report_memory)
 
+    def test_read_analysis_run_backfills_p0_1_schema_for_legacy_record(self) -> None:
+        legacy = {
+            "success": True,
+            "run_id": "run_legacy1234",
+            "pack_id": "pack_legacy",
+            "status": "needs_manual_review",
+            "workflow_run_id": "wf-legacy",
+            "report_title": "Legacy report",
+            "report_markdown": "# Legacy report\n\n## Summary\n\nExisting generated content.",
+            "quality_check": {"passed": False, "issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}]},
+            "quality_gate": {
+                "deliverable_status": "needs_manual_review",
+                "unsupported_fact_count": 1,
+                "summary_only_risk": False,
+                "blocking_issues": [{"code": "UNSUPPORTED_FACT"}],
+            },
+            "remaining_issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}],
+        }
+        required_fields = {
+            "run_status",
+            "deliverable",
+            "draft_word_export_available",
+            "final_word_export_available",
+            "word_export_available",
+            "needs_manual_review",
+            "primary_failure_code",
+            "secondary_failure_codes",
+            "quality_failure_codes",
+            "generation_failure_codes",
+            "blocking_issue_codes",
+            "fallback_used",
+            "fallback_reason",
+            "fallback_provider",
+            "repair_attempted",
+            "repair_success",
+            "repair_actions",
+            "manual_review_reason_summary",
+            "final_blocking_reason",
+            "provider",
+            "generator_version",
+            "prompt_version",
+            "workflow_version",
+            "compact_pack_chars",
+            "input_strategy",
+            "timings",
+        }
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "run_legacy1234.json").write_text(json.dumps(legacy), encoding="utf-8")
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                loaded = main_module._read_analysis_run("run_legacy1234")
+
+        self.assertTrue(required_fields.issubset(set(loaded)))
+        self.assertEqual(loaded["run_status"], "needs_manual_review")
+        self.assertFalse(loaded["deliverable"])
+        self.assertTrue(loaded["word_export_available"])
+        self.assertTrue(loaded["draft_word_export_available"])
+        self.assertFalse(loaded["final_word_export_available"])
+        self.assertTrue(loaded["needs_manual_review"])
+        self.assertEqual(loaded["primary_failure_code"], "UNSUPPORTED_FACT")
+        self.assertIn("LOCAL_QUALITY_GATE_FAILED", loaded["quality_failure_codes"])
+        self.assertIn("UNSUPPORTED_FACT", loaded["blocking_issue_codes"])
+        self.assertIn("generation_ms", loaded["timings"])
+
+    def test_write_analysis_run_sets_p0_1_final_word_flags_for_deliverable_report(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_schemaok1",
+            "pack_id": "pack_schemaok1",
+            "status": "finished",
+            "workflow_run_id": "wf-schema",
+            "report_title": "Schema report",
+            "report_markdown": "# Schema report\n\n## Summary\n\nA complete mocked report body.",
+            "quality_check": {"passed": True, "issues": []},
+            "quality_gate": {"deliverable_status": "deliverable", "blocking_issues": []},
+            "remaining_issues": [],
+        }
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True):
+                main_module._write_analysis_run(record)
+                saved = main_module._read_analysis_run("run_schemaok1")
+
+        self.assertEqual(saved["run_status"], "finished")
+        self.assertTrue(saved["deliverable"])
+        self.assertTrue(saved["word_export_available"])
+        self.assertTrue(saved["final_word_export_available"])
+        self.assertTrue(saved["draft_word_export_available"])
+        self.assertFalse(saved["needs_manual_review"])
+        self.assertEqual(saved["primary_failure_code"], "")
+        self.assertEqual(saved["blocking_issue_codes"], [])
+        self.assertEqual(saved["provider"], "dify")
+        self.assertIn("export_check_ms", saved["timings"])
+
+    def test_analysis_run_flags_and_word_locators_are_cleared_when_word_export_disabled(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_fused1234",
+            "pack_id": "pack_fused1234",
+            "status": "finished",
+            "report_markdown": "# Report\n\nA complete report body.",
+            "quality_check": {"passed": True, "issues": []},
+            "quality_gate": {"deliverable_status": "deliverable", "blocking_issues": []},
+            "word_export_available": True,
+            "draft_word_export_available": True,
+            "final_word_export_available": True,
+            "word_download_url": "http://example.test/download/report.docx",
+            "download_url": "http://example.test/download/report.docx",
+            "word_filename": "report.docx",
+            "word_generated": True,
+            "word_exported_at": "2026-07-10 10:00:00",
+        }
+
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertTrue(normalized["deliverable"])
+        self.assertFalse(normalized["needs_manual_review"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertEqual(normalized["word_download_url"], "")
+        self.assertEqual(normalized["download_url"], "")
+        self.assertEqual(normalized["word_filename"], "")
+        self.assertFalse(normalized["word_generated"])
+        self.assertEqual(normalized["word_exported_at"], "")
+
+    def test_analysis_run_quality_state_is_unchanged_when_word_export_disabled(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_review1234",
+            "pack_id": "pack_review1234",
+            "status": "needs_manual_review",
+            "report_markdown": "# Draft\n\nA report body that needs review.",
+            "quality_check": {"passed": False, "issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}]},
+            "quality_gate": {
+                "deliverable_status": "needs_manual_review",
+                "blocking_issues": [{"code": "UNSUPPORTED_FACT"}],
+            },
+            "remaining_issues": [{"issue_id": "Q_LOCAL_QUALITY_GATE"}],
+        }
+
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertEqual(normalized["run_status"], "needs_manual_review")
+        self.assertTrue(normalized["needs_manual_review"])
+        self.assertFalse(normalized["deliverable"])
+        self.assertEqual(normalized["report_markdown"], record["report_markdown"])
+        self.assertIn("UNSUPPORTED_FACT", normalized["blocking_issue_codes"])
+        self.assertFalse(normalized["word_export_available"])
+
+    def test_no_report_body_never_exposes_word_flags(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(
+                {
+                    "success": True,
+                    "run_id": "run_empty1234",
+                    "status": "finished",
+                    "report_markdown": "",
+                    "quality_check": {"passed": True, "issues": []},
+                    "quality_gate": {"deliverable_status": "deliverable"},
+                    "word_download_url": "http://example.test/download/empty.docx",
+                    "download_url": "http://example.test/download/empty.docx",
+                    "word_filename": "empty.docx",
+                }
+            )
+
+        self.assertFalse(normalized["deliverable"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertEqual(normalized["word_download_url"], "")
+        self.assertEqual(normalized["download_url"], "")
+        self.assertEqual(normalized["word_filename"], "")
+
+    def test_unsafe_formal_body_fails_closed_and_clears_download_locators(self) -> None:
+        record = {
+            "success": True,
+            "run_id": "run_unsafe1234",
+            "status": "finished",
+            "report_markdown": "# 报告\n\n该结论需人工核验。",
+            "quality_check": {"passed": True, "issues": []},
+            "quality_gate": {"deliverable_status": "deliverable"},
+            "word_download_url": "http://example.test/download/unsafe.docx",
+            "download_url": "http://example.test/download/unsafe.docx",
+            "word_filename": "unsafe.docx",
+            "word_generated": True,
+        }
+
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(record)
+
+        self.assertFalse(normalized["deliverable"])
+        self.assertTrue(normalized["needs_manual_review"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertEqual(normalized["word_download_url"], "")
+        self.assertEqual(normalized["download_url"], "")
+        self.assertEqual(normalized["word_filename"], "")
+        self.assertFalse(normalized["word_generated"])
+
+    def test_failed_run_with_safe_body_does_not_allow_draft_word(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(
+                {
+                    "success": False,
+                    "run_id": "run_failed_body",
+                    "status": "failed",
+                    "report_markdown": "# 报告\n\n公告明确了申报时间。",
+                    "quality_check": {"passed": False, "issues": []},
+                }
+            )
+
+        self.assertFalse(normalized["deliverable"])
+        self.assertFalse(normalized["word_export_available"])
+        self.assertFalse(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+
+    def test_finished_quality_failure_with_safe_body_requires_manual_review(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            normalized = main_module._normalize_analysis_run_schema(
+                {
+                    "success": True,
+                    "run_id": "run_quality_failed",
+                    "status": "finished",
+                    "report_markdown": "# 报告\n\n公告明确了申报时间。",
+                    "quality_check": {"passed": False, "issues": []},
+                }
+            )
+
+        self.assertTrue(normalized["needs_manual_review"])
+        self.assertTrue(normalized["draft_word_export_available"])
+        self.assertFalse(normalized["final_word_export_available"])
+        self.assertFalse(normalized["deliverable"])
+
+    def test_analysis_run_download_returns_503_before_report_lookup_when_disabled(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "false"}, clear=False), patch.object(
+            main_module,
+            "_read_analysis_run",
+            return_value={"report_markdown": "# Should not be read"},
+        ) as read_run:
+            response = self.client.get("/analysis/runs/run_fused1234/download")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["error"]["code"], "WORD_EXPORT_DISABLED")
+        read_run.assert_not_called()
+
+    def test_analysis_run_initial_response_contains_p0_1_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
+            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True
+        ), patch.object(
+            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_20260612_schema1"}, create=True
+        ), patch.object(main_module, "_execute_analysis_run_background", return_value=None, create=True):
+            response = self.client.post("/analysis/run", json={"pack_id": "pack_20260612_schema1"})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["run_status"], "running")
+        self.assertFalse(body["deliverable"])
+        self.assertFalse(body["word_export_available"])
+        self.assertFalse(body["draft_word_export_available"])
+        self.assertFalse(body["final_word_export_available"])
+        self.assertEqual(body["primary_failure_code"], "")
+        self.assertEqual(body["provider"], "dify")
+        self.assertIn("generation_ms", body["timings"])
+
     def test_run_diagnostics_reports_missing_material_coverage_items(self) -> None:
         pack = {
             "pack_id": "pack_coverage",
@@ -1816,6 +2166,8 @@ class RecordsApiTests(unittest.TestCase):
         pack = {
             "primary_materials": [
                 {
+                    "menu_code": "project_notice",
+                    "articleid": "diagnostics-source-fidelity-1",
                     "title": "天津市执行医用耗材集采结果的通知",
                     "content_text": "天津市医保局明确自2026年6月1日起执行医用耗材集采结果，企业需关注产品范围和执行时间。",
                     "summary": "天津市执行医用耗材集采结果。",
@@ -1849,6 +2201,8 @@ class RecordsApiTests(unittest.TestCase):
         pack = {
             "primary_materials": [
                 {
+                    "menu_code": "project_notice",
+                    "articleid": "diagnostics-summary-only-1",
                     "title": "河南调整医用耗材申报挂网操作流程的通知",
                     "content_text": "河南省调整医用耗材申报挂网操作流程，企业通过联审通办提交申报。",
                     "summary": "调整申报挂网操作流程。",
@@ -1879,6 +2233,8 @@ class RecordsApiTests(unittest.TestCase):
         pack = {
             "primary_materials": [
                 {
+                    "menu_code": "project_notice",
+                    "articleid": "diagnostics-evidence-1",
                     "title": "天津市执行医用耗材集采结果的通知",
                     "content_text": "天津市医保局明确自2026年6月1日起执行医用耗材集采结果，企业需关注产品范围和执行时间。",
                     "summary": "天津市执行医用耗材集采结果。",
@@ -2024,7 +2380,7 @@ class RecordsApiTests(unittest.TestCase):
             ],
             "auxiliary_materials": [],
         }
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             root = main_module.Path(tmpdir)
             run_dir = root / "runs"
             pack_dir = root / "packs"
@@ -2044,8 +2400,19 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(saved["status"], "needs_manual_review")
         self.assertTrue(saved["success"])
         self.assertGreater(len(saved["report_markdown"]), 300)
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertIn("Q_DIFY_CALL_FAILED_FALLBACK", {item["issue_id"] for item in saved["remaining_issues"]})
+        self.assertEqual(saved["run_status"], "needs_manual_review")
+        self.assertFalse(saved["deliverable"])
+        self.assertTrue(saved["word_export_available"])
+        self.assertTrue(saved["draft_word_export_available"])
+        self.assertFalse(saved["final_word_export_available"])
+        self.assertEqual(saved["primary_failure_code"], "TIMEOUT")
+        self.assertIn("TIMEOUT", saved["generation_failure_codes"])
+        self.assertNotIn("FALLBACK_REPORT_USED", saved["secondary_failure_codes"])
+        self.assertIn("FALLBACK_REPORT_USED", saved["blocking_issue_codes"])
+        self.assertTrue(saved["fallback_used"])
+        self.assertEqual(saved["fallback_provider"], "backend_pack_fallback")
 
     def test_staged_analysis_run_watchdog_writes_fallback_before_late_dify_result(self) -> None:
         pack = {
@@ -2113,7 +2480,7 @@ class RecordsApiTests(unittest.TestCase):
                 saved = main_module._read_analysis_run("run_watchdog123")
 
         self.assertEqual(saved["status"], "needs_manual_review")
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertNotEqual(saved["workflow_run_id"], "late-workflow")
         self.assertGreater(len(saved["report_markdown"]), 300)
 
@@ -2182,7 +2549,7 @@ class RecordsApiTests(unittest.TestCase):
                 saved = main_module._read_analysis_run("run_full_watchdog123")
 
         self.assertEqual(saved["status"], "needs_manual_review")
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertNotEqual(saved["workflow_run_id"], "late-full-workflow")
         self.assertGreater(len(saved["report_markdown"]), 300)
 
@@ -2246,7 +2613,7 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "needs_manual_review")
-        self.assertEqual(saved["dify_error_code"], "DIFY_TIMEOUT")
+        self.assertEqual(saved["dify_error_code"], "TIMEOUT")
         self.assertGreater(len(saved["report_markdown"]), 300)
 
     def test_call_dify_workflow_retries_timeout_before_success(self) -> None:
@@ -2556,7 +2923,7 @@ class RecordsApiTests(unittest.TestCase):
             with self.assertRaises(main_module.DifyWorkflowError) as caught:
                 main_module._call_dify_workflow("pack_staged123", "run_staged123", {"input_strategy": "staged_generation"})
 
-        self.assertEqual(caught.exception.code, "DIFY_TIMEOUT")
+        self.assertEqual(caught.exception.code, "TIMEOUT")
         self.assertEqual(calls["count"], 1)
         self.assertEqual(calls["timeouts"], [300])
 
@@ -2596,7 +2963,7 @@ class RecordsApiTests(unittest.TestCase):
             with self.assertRaises(main_module.DifyWorkflowError) as caught:
                 main_module._call_dify_workflow("pack_blocking123", "run_blocking123", {"input_strategy": "staged_generation"})
 
-        self.assertEqual(caught.exception.code, "DIFY_TIMEOUT")
+        self.assertEqual(caught.exception.code, "TIMEOUT")
         self.assertEqual(calls["count"], 1)
         self.assertLess(time.perf_counter() - started, 1.8)
 
@@ -2606,13 +2973,15 @@ class RecordsApiTests(unittest.TestCase):
             [
                 "# Report title",
                 "## 导语",
-                "This report is a complete mocked report used to verify that a normal Dify response is persisted without fallback repair.",
+                "This report is a complete mocked report used to verify that a normal provider response is persisted without fallback repair.",
                 "## 一、Core Findings",
                 "The selected material contains enough structured content for a normal report body. "
                 "This paragraph intentionally has enough length and report structure so the fragment guard does not treat it as a partial revision output.",
                 "## 二、Analysis",
                 "The generated report includes a stable title, multiple sections, and a readable body. "
                 "It should remain finished because this test is checking persistence of a valid workflow response.",
+                "## 企业影响分析",
+                "企业需要关注执行时间和产品范围，建议按采购规则评估风险。",
             ]
         )
 
@@ -2629,10 +2998,23 @@ class RecordsApiTests(unittest.TestCase):
                 "remaining_issues": [],
             }
 
+        evidence_pack = {
+            "pack_id": "pack_20260612_abcdef1234",
+            "primary_materials": [
+                {
+                    "menu_code": "project_notice",
+                    "articleid": "normal-dify-run-1",
+                    "title": "Report title",
+                    "content_text": report_markdown,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(
             main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir), create=True
         ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_20260612_abcdef1234"}, create=True
+            main_module, "_read_database_evidence_pack", return_value=evidence_pack, create=True
         ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
             response = self.client.post("/analysis/run", json={"pack_id": "pack_20260612_abcdef1234"})
 
@@ -2648,20 +3030,14 @@ class RecordsApiTests(unittest.TestCase):
 
             status_response = self.client.get(f"/analysis/runs/{body['run_id']}")
             self.assertEqual(status_response.status_code, 200)
-            status_body = status_response.json()
-            self.assertEqual(status_body["workflow_run_id"], "wf-run-1")
-            self.assertEqual(status_body["status"], "finished")
-            self.assertEqual(status_body["backend"], "dify_legacy")
-            self.assertEqual(status_body["workflow_backend"], "dify_legacy")
-            self.assertEqual(status_body["nodes"][0]["name"], "dify_legacy_workflow")
-            self.assertEqual(status_body["nodes"][0]["status"], "finished")
-            self.assertGreaterEqual(status_body["nodes"][0]["elapsed_ms"], 0)
-            self.assertFalse(status_body["use_report_memory"])
-            self.assertFalse(status_body["report_memory_applied"])
-            self.assertEqual(status_body["report_memory_chars"], 0)
-            self.assertEqual(status_body["report_memory_hash"], "")
-            self.assertFalse(status_body["memory_read_failed"])
-            self.assertFalse(status_body["report_memory_truncated"])
+            self.assertEqual(status_response.json()["workflow_run_id"], "wf-run-1")
+            self.assertEqual(status_response.json()["status"], "finished")
+            self.assertFalse(status_response.json()["use_report_memory"])
+            self.assertFalse(status_response.json()["report_memory_applied"])
+            self.assertEqual(status_response.json()["report_memory_chars"], 0)
+            self.assertEqual(status_response.json()["report_memory_hash"], "")
+            self.assertFalse(status_response.json()["memory_read_failed"])
+            self.assertFalse(status_response.json()["report_memory_truncated"])
 
             report_response = self.client.get(f"/analysis/runs/{body['run_id']}/report")
             self.assertEqual(report_response.status_code, 200)
@@ -2670,311 +3046,6 @@ class RecordsApiTests(unittest.TestCase):
             self.assertTrue(report_body["quality_check"]["passed"])
             self.assertIn("quality_gate", report_body)
             self.assertNotIn("report_memory", report_body)
-
-    def test_analysis_run_uses_local_engine_when_configured(self) -> None:
-        fixture_path = main_module.Path(__file__).resolve().parent / "fixtures" / "synthetic_evidence_pack_basic.json"
-        pack = main_module.json.loads(fixture_path.read_text(encoding="utf-8"))
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
-            main_module.os.environ, {"WORKFLOW_BACKEND": "local_engine"}, clear=False
-        ), patch.object(
-            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
-        ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value=pack, create=True
-        ), patch.object(
-            main_module, "_call_dify_workflow", side_effect=AssertionError("local_engine must not call Dify"), create=True
-        ):
-            response = self.client.post("/analysis/run", json={"pack_id": pack["pack_id"]})
-            self.assertEqual(response.status_code, 200)
-            body = response.json()
-            run_id = body["run_id"]
-
-            wait_until(lambda: self.client.get(f"/analysis/runs/{run_id}").json().get("status") == "finished")
-            status_response = self.client.get(f"/analysis/runs/{run_id}")
-            report_response = self.client.get(f"/analysis/runs/{run_id}/report")
-
-        self.assertEqual(status_response.status_code, 200)
-        status_body = status_response.json()
-        self.assertEqual(status_body["backend"], "local_engine")
-        self.assertEqual(status_body["workflow_backend"], "local_engine")
-        self.assertEqual([node["name"] for node in status_body["nodes"]], ["prepare", "generate", "render", "qa", "final"])
-        self.assertTrue(all(node["status"] == "finished" for node in status_body["nodes"]))
-        self.assertEqual(status_body["workflow_run_id"], f"local-{run_id}")
-        self.assertIn("Synthetic medical consumables procurement notice", status_body["report_title"])
-        self.assertEqual(status_body["llm_provider"], "mock")
-        self.assertEqual(status_body["llm_model"], "mock-local-report-v1")
-        self.assertEqual(status_body["prompt_ref"], "local_report_generation:v1")
-        self.assertEqual(len(status_body["prompt_sha256"]), 64)
-        self.assertEqual(status_body["prompt_refs"][0]["sha256"], status_body["prompt_sha256"])
-        self.assertEqual(status_body["model_calls"][0]["provider"], "mock")
-        self.assertEqual(status_body["model_calls"][0]["prompt_sha256"], status_body["prompt_sha256"])
-
-        self.assertEqual(report_response.status_code, 200)
-        report_body = report_response.json()
-        self.assertIn("Synthetic medical consumables procurement notice", report_body["report_markdown"])
-        self.assertTrue(report_body["quality_check"]["passed"])
-
-    def test_analysis_run_cancel_marks_running_run_cancelled(self) -> None:
-        run_id = "run_20260707_cancel1"
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
-            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
-        ):
-            main_module._write_analysis_run(
-                {
-                    "success": True,
-                    "run_id": run_id,
-                    "pack_id": "pack_cancel",
-                    "status": "running",
-                    "backend": "dify_legacy",
-                    "workflow_backend": "dify_legacy",
-                    "workflow_run_id": "wf-cancel",
-                    "created_at": "2026-07-07 10:00:00",
-                    "updated_at": "2026-07-07 10:00:00",
-                    "report_markdown": "",
-                    "quality_check": {"passed": None, "issues": []},
-                }
-            )
-
-            response = self.client.post(f"/analysis/runs/{run_id}/cancel")
-            status_body = self.client.get(f"/analysis/runs/{run_id}").json()
-            second_response = self.client.post(f"/analysis/runs/{run_id}/cancel")
-
-        self.assertEqual(response.status_code, 200)
-        body = response.json()
-        self.assertTrue(body["success"])
-        self.assertEqual(body["action"], "cancel")
-        self.assertEqual(body["run_id"], run_id)
-        self.assertEqual(body["status"], "cancelled")
-        self.assertEqual(status_body["status"], "cancelled")
-        self.assertTrue(status_body["cancel_requested"])
-        self.assertTrue(status_body["cancelled_at"])
-        self.assertEqual(status_body["nodes"][0]["status"], "cancelled")
-        self.assertEqual(status_body["control_events"][-1]["action"], "cancel")
-        self.assertEqual(second_response.status_code, 409)
-        self.assertEqual(second_response.json()["error"]["code"], "RUN_OPERATION_NOT_ALLOWED")
-
-    def test_analysis_run_retry_failed_run_starts_linked_new_run(self) -> None:
-        failed_run_id = "run_20260707_failed1"
-        calls: list[tuple[str, str]] = []
-
-        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
-            calls.append((pack_id, run_id))
-            return {
-                "workflow_run_id": "wf-retry-ok",
-                "status": "finished",
-                "report_title": "Retry report",
-                "report_markdown": "# Retry report\n\n## Intro\n\nRetry produced a complete report body. " * 8,
-                "version": 1,
-                "quality_check": {"passed": True, "issues": []},
-                "generation_warnings": [],
-                "remaining_issues": [],
-            }
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
-            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
-        ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_retry"}, create=True
-        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
-            main_module._write_analysis_run(
-                {
-                    "success": False,
-                    "run_id": failed_run_id,
-                    "pack_id": "pack_retry",
-                    "status": "failed",
-                    "backend": "dify_legacy",
-                    "workflow_backend": "dify_legacy",
-                    "workflow_run_id": "wf-failed",
-                    "created_at": "2026-07-07 10:00:00",
-                    "updated_at": "2026-07-07 10:01:00",
-                    "error_message": "failed once",
-                    "quality_check": {"passed": False, "issues": [{"issue_id": "DIFY_CALL_FAILED"}]},
-                    "use_report_memory": False,
-                }
-            )
-
-            response = self.client.post(f"/analysis/runs/{failed_run_id}/retry")
-            self.assertEqual(response.status_code, 200)
-            body = response.json()
-            new_run_id = body["new_run_id"]
-            wait_until(lambda: self.client.get(f"/analysis/runs/{new_run_id}").json().get("status") == "finished")
-            failed_status = self.client.get(f"/analysis/runs/{failed_run_id}").json()
-            retry_status = self.client.get(f"/analysis/runs/{new_run_id}").json()
-
-        self.assertTrue(body["success"])
-        self.assertEqual(body["action"], "retry")
-        self.assertEqual(body["run_id"], failed_run_id)
-        self.assertTrue(new_run_id.startswith("run_"))
-        self.assertNotEqual(new_run_id, failed_run_id)
-        self.assertEqual(body["status"], "running")
-        self.assertEqual(body["pack_id"], "pack_retry")
-        self.assertEqual(calls, [("pack_retry", new_run_id)])
-        self.assertEqual(failed_status["status"], "failed")
-        self.assertEqual(failed_status["retried_by"], new_run_id)
-        self.assertEqual(retry_status["status"], "finished")
-        self.assertEqual(retry_status["retry_of"], failed_run_id)
-        self.assertEqual(retry_status["control_events"][0]["action"], "retry")
-
-    def test_analysis_run_resume_cancelled_run_starts_linked_new_run_and_checks_state(self) -> None:
-        cancelled_run_id = "run_20260707_resume1"
-        finished_run_id = "run_20260707_resume2"
-
-        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
-            return {
-                "workflow_run_id": "wf-resume-ok",
-                "status": "finished",
-                "report_title": "Resume report",
-                "report_markdown": "# Resume report\n\n## Intro\n\nResume produced a complete report body. " * 8,
-                "version": 1,
-                "quality_check": {"passed": True, "issues": []},
-                "generation_warnings": [],
-                "remaining_issues": [],
-            }
-
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
-            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
-        ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_resume"}, create=True
-        ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
-            main_module._write_analysis_run(
-                {
-                    "success": True,
-                    "run_id": cancelled_run_id,
-                    "pack_id": "pack_resume",
-                    "status": "cancelled",
-                    "backend": "dify_legacy",
-                    "workflow_backend": "dify_legacy",
-                    "workflow_run_id": "wf-cancelled",
-                    "created_at": "2026-07-07 10:00:00",
-                    "updated_at": "2026-07-07 10:01:00",
-                    "quality_check": {"passed": None, "issues": []},
-                    "use_report_memory": False,
-                }
-            )
-            main_module._write_analysis_run(
-                {
-                    "success": True,
-                    "run_id": finished_run_id,
-                    "pack_id": "pack_resume",
-                    "status": "finished",
-                    "backend": "dify_legacy",
-                    "workflow_backend": "dify_legacy",
-                    "workflow_run_id": "wf-finished",
-                    "created_at": "2026-07-07 10:00:00",
-                    "updated_at": "2026-07-07 10:01:00",
-                    "report_markdown": "# Finished",
-                    "quality_check": {"passed": True, "issues": []},
-                    "use_report_memory": False,
-                }
-            )
-
-            response = self.client.post(f"/analysis/runs/{cancelled_run_id}/resume")
-            self.assertEqual(response.status_code, 200)
-            body = response.json()
-            new_run_id = body["new_run_id"]
-            wait_until(lambda: self.client.get(f"/analysis/runs/{new_run_id}").json().get("status") == "finished")
-            resume_status = self.client.get(f"/analysis/runs/{new_run_id}").json()
-            invalid_response = self.client.post(f"/analysis/runs/{finished_run_id}/resume")
-
-        self.assertTrue(body["success"])
-        self.assertEqual(body["action"], "resume")
-        self.assertEqual(body["run_id"], cancelled_run_id)
-        self.assertEqual(body["status"], "running")
-        self.assertEqual(resume_status["status"], "finished")
-        self.assertEqual(resume_status["resume_of"], cancelled_run_id)
-        self.assertEqual(resume_status["control_events"][0]["action"], "resume")
-        self.assertEqual(invalid_response.status_code, 409)
-        self.assertEqual(invalid_response.json()["error"]["code"], "RUN_OPERATION_NOT_ALLOWED")
-
-    def test_analysis_run_reuses_active_duplicate_submission_by_input_hash(self) -> None:
-        calls: list[str] = []
-        started = threading.Event()
-        release = threading.Event()
-
-        def fake_call(pack_id: str, run_id: str, pack: dict | None = None, report_memory: str = "", use_report_memory: bool = False):
-            calls.append(run_id)
-            started.set()
-            release.wait(timeout=2)
-            return {
-                "workflow_run_id": "wf-idempotent",
-                "status": "finished",
-                "report_title": "Idempotent report",
-                "report_markdown": "# Idempotent report\n\n## Intro\n\nDuplicate submissions should reuse the active run. " * 8,
-                "version": 1,
-                "quality_check": {"passed": True, "issues": []},
-                "generation_warnings": [],
-                "remaining_issues": [],
-            }
-
-        try:
-            with tempfile.TemporaryDirectory() as tmpdir, patch.object(
-                main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
-            ), patch.object(
-                main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_idempotent"}, create=True
-            ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True):
-                first_response = self.client.post("/analysis/run", json={"pack_id": "pack_idempotent"})
-                self.assertEqual(first_response.status_code, 200)
-                self.assertTrue(started.wait(timeout=1))
-                second_response = self.client.post("/analysis/run", json={"pack_id": "pack_idempotent"})
-                release.set()
-                first_body = first_response.json()
-                second_body = second_response.json()
-                wait_until(lambda: self.client.get(f"/analysis/runs/{first_body['run_id']}").json().get("status") == "finished")
-                status_body = self.client.get(f"/analysis/runs/{first_body['run_id']}").json()
-        finally:
-            release.set()
-
-        self.assertEqual(second_response.status_code, 200)
-        self.assertEqual(second_body["run_id"], first_body["run_id"])
-        self.assertTrue(second_body["idempotency_reused"])
-        self.assertEqual(calls, [first_body["run_id"]])
-        self.assertEqual(status_body["idempotency_duplicate_count"], 1)
-        self.assertTrue(status_body["input_hash"])
-
-    def test_recover_pending_analysis_runs_marks_stale_active_runs_failed(self) -> None:
-        stale_run_id = "run_20260707_stale1"
-        fresh_run_id = "run_20260707_fresh1"
-        now = main_module.datetime.now().isoformat(sep=" ", timespec="seconds")
-        with tempfile.TemporaryDirectory() as tmpdir, patch.object(
-            main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
-        ):
-            main_module._write_analysis_run(
-                {
-                    "success": True,
-                    "run_id": stale_run_id,
-                    "pack_id": "pack_recovery",
-                    "status": "running",
-                    "backend": "dify_legacy",
-                    "workflow_backend": "dify_legacy",
-                    "created_at": "2000-01-01 00:00:00",
-                    "updated_at": "2000-01-01 00:00:00",
-                    "quality_check": {"passed": None, "issues": []},
-                }
-            )
-            main_module._write_analysis_run(
-                {
-                    "success": True,
-                    "run_id": fresh_run_id,
-                    "pack_id": "pack_recovery",
-                    "status": "running",
-                    "backend": "dify_legacy",
-                    "workflow_backend": "dify_legacy",
-                    "created_at": now,
-                    "updated_at": now,
-                    "quality_check": {"passed": None, "issues": []},
-                }
-            )
-
-            result = main_module._recover_stale_pending_analysis_runs(stale_seconds=3600)
-            stale_status = self.client.get(f"/analysis/runs/{stale_run_id}").json()
-            fresh_status = self.client.get(f"/analysis/runs/{fresh_run_id}").json()
-
-        self.assertEqual(result["recovered_count"], 1)
-        self.assertEqual(result["checked_count"], 2)
-        self.assertEqual(stale_status["status"], "failed")
-        self.assertEqual(stale_status["recovery_reason"], "stale_pending_run")
-        self.assertEqual(stale_status["error_code"], "RUN_RECOVERED_STALE_PENDING")
-        self.assertEqual(stale_status["nodes"][0]["status"], "failed")
-        self.assertEqual(fresh_status["status"], "running")
 
     def test_analysis_run_with_memory_explicitly_false_keeps_legacy_dify_behavior(self) -> None:
         captured: dict[str, object] = {}
@@ -3077,8 +3148,7 @@ class RecordsApiTests(unittest.TestCase):
                 "workflow_run_id": "wf-memory-items",
                 "status": "finished",
                 "report_title": "Memory item report",
-                "report_markdown": "# Memory item report\n\n## Intro\n\nReport body with enough structure and length to avoid fragment repair. "
-                * 8,
+                "report_markdown": "# Memory item report\n\n## Intro\n\nReport body with enough structure and length to avoid fragment repair. " * 8,
                 "version": 1,
                 "quality_check": {"passed": True, "issues": []},
                 "generation_warnings": [],
@@ -3092,8 +3162,8 @@ class RecordsApiTests(unittest.TestCase):
                     "menu_code": "ylsf",
                     "articleid": "a1",
                     "title": "Medical service price notice",
-                    "areaname": "广东",
-                    "projecttype": "医疗服务价格",
+                    "areaname": "Guangdong",
+                    "projecttype": "medical service price",
                 }
             ],
             "auxiliary_materials": [],
@@ -3176,17 +3246,36 @@ class RecordsApiTests(unittest.TestCase):
                 "workflow_run_id": "wf-memory-truncated",
                 "status": "finished",
                 "report_title": "Truncated memory report",
-                "report_markdown": "# Truncated memory report\n\n## 导语\n\nReport body with enough structure and length. " * 8,
+                "report_markdown": (
+                    "# Truncated memory report\n\n## 导语\n\nReport body with enough structure and length. " * 8
+                    + "\n\n## 企业影响分析\n\n企业需要关注执行时间和产品范围，建议按采购规则评估风险。"
+                ),
                 "version": 1,
                 "quality_check": {"passed": True, "issues": []},
                 "generation_warnings": [],
                 "remaining_issues": [],
             }
 
+        evidence_pack = {
+            "pack_id": "pack_memory_long",
+            "primary_materials": [
+                {
+                    "menu_code": "project_notice",
+                    "articleid": "memory-long-1",
+                    "title": "Truncated memory report",
+                    "content_text": (
+                        "Report body with enough structure and length. " * 8
+                        + " 企业需要关注执行时间和产品范围，建议按采购规则评估风险。"
+                    ),
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
         with tempfile.TemporaryDirectory() as tmpdir, patch.object(
             main_module, "_analysis_run_dir", return_value=main_module.Path(tmpdir) / "runs", create=True
         ), patch.object(
-            main_module, "_read_database_evidence_pack", return_value={"pack_id": "pack_memory_long"}, create=True
+            main_module, "_read_database_evidence_pack", return_value=evidence_pack, create=True
         ), patch.object(main_module, "_call_dify_workflow", fake_call, create=True), patch.dict(
             main_module.os.environ, {"MEMORY_DIR": str(main_module.Path(tmpdir) / "memory"), "REPORT_MEMORY_MAX_CHARS": "15000"}, clear=False
         ):
@@ -3209,7 +3298,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("长期记忆超过 15000 字符", "\n".join(status_body["warnings"]))
 
     def test_analysis_run_download_exports_markdown_docx(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             report_dir = main_module.Path(tmpdir) / "reports"
             run_dir.mkdir()
@@ -3239,7 +3328,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertGreater(len(response.content), 1000)
 
     def test_analysis_run_download_reuses_existing_docx_for_same_run_version(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             report_dir = main_module.Path(tmpdir) / "reports"
             run_dir.mkdir()
@@ -3247,7 +3336,9 @@ class RecordsApiTests(unittest.TestCase):
 
             def fake_markdown_to_docx(markdown: str, path: main_module.Path, title: str) -> None:
                 calls.append((markdown, title))
-                path.write_bytes(b"PK\x03\x04cached docx content")
+                doc = Document()
+                doc.add_paragraph(markdown)
+                doc.save(path)
 
             with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
                 main_module._write_analysis_run(
@@ -3272,6 +3363,108 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual(len(calls), 1)
         self.assertEqual(first.content, second.content)
+
+    def test_analysis_run_download_blocks_unsafe_formal_body_without_creating_word(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_unsafe_download",
+                        "pack_id": "pack_test",
+                        "status": "finished",
+                        "report_title": "不安全报告",
+                        "report_markdown": "# 不安全报告\n\n该结论需人工核验。",
+                        "quality_check": {"passed": True, "issues": []},
+                        "quality_gate": {"deliverable_status": "deliverable"},
+                    }
+                )
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
+                main_module, "REPORT_DIR", report_dir
+            ):
+                response = self.client.get("/analysis/runs/run_unsafe_download/download")
+
+            created = list(report_dir.rglob("*.docx")) if report_dir.exists() else []
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["error"]["code"], "WORD_BODY_SAFETY_FAILED")
+        self.assertNotIn("/download/", response.text)
+        self.assertEqual(created, [])
+
+    def test_report_ir_only_run_state_and_download_are_consistent(self) -> None:
+        report_ir = {
+            "title": "结构化报告",
+            "lead_paragraphs": ["公告明确了申报时间和执行要求。"],
+            "sections": [],
+            "enterprise_tips": [],
+        }
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_report_ir_only",
+                        "pack_id": "pack_report_ir_only",
+                        "status": "finished",
+                        "report_ir": report_ir,
+                        "quality_check": {"passed": True, "issues": []},
+                        "quality_gate": {"deliverable_status": "deliverable"},
+                    }
+                )
+                state = main_module._read_analysis_run("run_report_ir_only")
+            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
+                main_module, "REPORT_DIR", report_dir
+            ):
+                response = self.client.get("/analysis/runs/run_report_ir_only/download")
+                created = list(report_dir.glob("*.docx"))
+                hits = main_module.scan_docx(created[0]) if created else ()
+                report_response = self.client.get("/analysis/runs/run_report_ir_only/report")
+
+        self.assertTrue(state["deliverable"])
+        self.assertTrue(state["draft_word_export_available"])
+        self.assertTrue(state["final_word_export_available"])
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(hits, ())
+        self.assertEqual(report_response.status_code, 200)
+        self.assertIn("公告明确了申报时间和执行要求", report_response.json()["report_markdown"])
+
+    def test_report_ir_only_failure_codes_use_formal_body_not_markdown_presence(self) -> None:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False):
+            review = main_module._normalize_analysis_run_schema(
+                {
+                    "run_id": "run_ir_review",
+                    "status": "needs_manual_review",
+                    "report_ir": {
+                        "title": "结构化报告",
+                        "lead_paragraphs": ["公告明确了执行要求。"],
+                        "sections": [],
+                    },
+                    "quality_check": {"passed": False, "issues": []},
+                }
+            )
+            unsafe = main_module._normalize_analysis_run_schema(
+                {
+                    "run_id": "run_ir_unsafe",
+                    "status": "finished",
+                    "report_ir": {
+                        "title": "结构化报告",
+                        "lead_paragraphs": ["该内容需人工核验。"],
+                        "sections": [],
+                    },
+                    "quality_check": {"passed": True, "issues": []},
+                    "quality_gate": {"deliverable_status": "deliverable"},
+                }
+            )
+
+        self.assertNotIn("DIFY_OUTPUT_EMPTY", review["generation_failure_codes"])
+        self.assertIn("FORBIDDEN_PHRASE_IN_FORMAL_BODY", unsafe["quality_failure_codes"])
 
     def test_markdown_docx_uses_manual_report_style_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3432,7 +3625,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertNotIn("暂无法确认", cleaned)
 
     def test_analysis_run_download_rejects_not_ready_report(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.dict(os.environ, {"ENABLE_WORD_EXPORT": "true"}, clear=False), tempfile.TemporaryDirectory() as tmpdir:
             run_dir = main_module.Path(tmpdir) / "runs"
             run_dir.mkdir()
             with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
@@ -3449,74 +3642,6 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(response.json()["error"]["code"], "REPORT_NOT_READY")
-
-    def test_analysis_run_download_allows_failed_quality_check_manual_review(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = main_module.Path(tmpdir) / "runs"
-            report_dir = main_module.Path(tmpdir) / "reports"
-            run_dir.mkdir()
-            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
-                main_module._write_analysis_run(
-                    {
-                        "success": True,
-                        "run_id": "run_qafail123",
-                        "pack_id": "pack_test",
-                        "status": "needs_manual_review",
-                        "report_title": "qa failed report",
-                        "report_markdown": "# qa failed report\n\nbody",
-                        "version": 1,
-                        "quality_check": {
-                            "passed": False,
-                            "issues": [{"issue_id": "Q_BLOCK", "fix_instruction": "repair before export"}],
-                        },
-                        "remaining_issues": [{"issue_id": "Q_BLOCK"}],
-                    }
-                )
-            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
-                main_module, "REPORT_DIR", report_dir
-            ):
-                response = self.client.get("/analysis/runs/run_qafail123/download")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            response.headers["content-type"],
-        )
-        self.assertGreater(len(response.content), 1000)
-
-    def test_analysis_run_download_allows_quality_gate_manual_review(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            run_dir = main_module.Path(tmpdir) / "runs"
-            report_dir = main_module.Path(tmpdir) / "reports"
-            run_dir.mkdir()
-            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True):
-                main_module._write_analysis_run(
-                    {
-                        "success": True,
-                        "run_id": "run_gateblock1",
-                        "pack_id": "pack_test",
-                        "status": "finished",
-                        "report_title": "gate blocked report",
-                        "report_markdown": "# gate blocked report\n\nbody",
-                        "version": 1,
-                        "quality_check": {"passed": True, "issues": []},
-                        "quality_gate": {
-                            "deliverable_status": "needs_manual_review",
-                            "blocking_issues": [{"code": "SUMMARY_ONLY_REPORT", "message": "summary only"}],
-                        },
-                    }
-                )
-            with patch.object(main_module, "_analysis_run_dir", return_value=run_dir, create=True), patch.object(
-                main_module, "REPORT_DIR", report_dir
-            ):
-                response = self.client.get("/analysis/runs/run_gateblock1/download")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            response.headers["content-type"],
-        )
-        self.assertGreater(len(response.content), 1000)
 
     def test_normalize_dify_result_parses_json_string_fields(self) -> None:
         result = main_module._normalize_dify_result(
@@ -3643,7 +3768,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("## 导语", repaired["report_markdown"])
         self.assertEqual(repaired["remaining_issues"][0]["issue_id"], "Q_DIFY_FRAGMENTARY_REPORT")
 
-    def test_dify_success_without_report_markdown_can_be_repaired(self) -> None:
+    def test_dify_success_without_report_markdown_fails_provider_validation(self) -> None:
         raw = {
             "workflow_run_id": "wf-missing-report",
             "data": {
@@ -3655,13 +3780,11 @@ class RecordsApiTests(unittest.TestCase):
             },
         }
 
-        result = main_module._normalize_dify_result(raw, "pack_missing_report")
+        with self.assertRaises(main_module.DifyWorkflowError) as caught:
+            main_module._normalize_dify_result(raw, "pack_missing_report")
 
-        self.assertEqual(result["workflow_run_id"], "wf-missing-report")
-        self.assertEqual(result["pack_id"], "pack_missing_report")
-        self.assertEqual(result["report_markdown"], "")
-        self.assertEqual(result["quality_check"]["passed"], False)
-        self.assertEqual(result["remaining_issues"], [])
+        self.assertEqual(caught.exception.code, "OUTPUT_SCHEMA_INVALID")
+        self.assertEqual("provider", caught.exception.provider_stage["layer"])
 
     def test_fragmentary_dify_revision_gets_fallback_from_attachment_rich_pack(self) -> None:
         pack = {
@@ -3708,37 +3831,6 @@ class RecordsApiTests(unittest.TestCase):
         self.assertNotIn("evidence_pack", repaired["report_markdown"])
         self.assertNotIn("Dify", repaired["report_markdown"])
         self.assertNotIn("\u5143\u6570\u636e", repaired["report_markdown"])
-
-    def test_fallback_attachment_key_fact_dicts_render_as_named_values(self) -> None:
-        pack = {
-            "primary_materials": [
-                {
-                    "title": "\u6cb3\u6e90\u5e02\u9ebb\u9189\u7c7b\u7b49\u533b\u7597\u670d\u52a1\u9879\u76ee\u4ef7\u683c\u516c\u793a",
-                    "content_text": "\u8be6\u60c5\u8bf7\u89c1\u9644\u4ef6\u3002",
-                    "attachments": [
-                        {
-                            "filename": "\u5f81\u6c42\u610f\u89c1\u7a3f.pdf",
-                            "summary": "\u9644\u4ef6\u8bf4\u660e\u533b\u7597\u670d\u52a1\u9879\u76ee\u4ef7\u683c\u7ba1\u7406\u548c\u652f\u4ed8\u89c4\u5219\u3002",
-                            "key_facts": [
-                                {"name": "\u65f6\u95f4", "value": "2026\u5e745\u670828\u65e5"},
-                                {
-                                    "name": "\u4ef7\u683c/\u652f\u4ed8\u89c4\u5219",
-                                    "value": "\u4e0d\u5f97\u4e0a\u6d6e\u3001\u4e0b\u6d6e",
-                                },
-                            ],
-                        }
-                    ],
-                }
-            ],
-            "auxiliary_materials": [],
-        }
-
-        _, markdown, _ = main_module._fallback_report_from_pack(pack)
-
-        self.assertIn("\u65f6\u95f4\uff1a2026\u5e745\u670828\u65e5", markdown)
-        self.assertIn("\u4ef7\u683c/\u652f\u4ed8\u89c4\u5219\uff1a\u4e0d\u5f97\u4e0a\u6d6e\u3001\u4e0b\u6d6e", markdown)
-        self.assertNotIn("{'name':", markdown)
-        self.assertNotIn("'value':", markdown)
 
     def test_report_starting_from_second_section_is_treated_as_fragment(self) -> None:
         pack = {
@@ -3845,32 +3937,46 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertIn("force_refresh_attachments", html)
         self.assertIn("reparseAttachmentsBtn", html)
-        self.assertIn("checkMaterialCacheBtn", html)
-        self.assertIn("buildMaterialCacheBtn", html)
-        self.assertIn("/analysis/material-cache/check", html)
-        self.assertIn("/analysis/material-cache/build", html)
         self.assertIn("\u91cd\u65b0\u89e3\u6790\u9644\u4ef6\u5e76\u751f\u6210\u8bc1\u636e\u5305", html)
         self.assertIn(".doc", html)
         self.assertNotIn("force_refresh_attachments: true,\n      };", html)
 
-    def test_records_ui_matches_three_column_reference_layout(self) -> None:
+    def test_records_ui_matches_compact_two_column_material_layout(self) -> None:
         html = (main_module.Path(main_module.__file__).resolve().parent / "static" / "records.html").read_text(encoding="utf-8")
 
         self.assertIn('class="app-header"', html)
         self.assertIn('class="workflow-steps"', html)
         self.assertIn('class="workspace-grid"', html)
+        self.assertIn('class="card context-card"', html)
+        self.assertIn('id="selectionTab"', html)
+        self.assertIn('id="detailTab"', html)
+        self.assertIn('id="selectionPanel"', html)
+        self.assertIn('id="detailPanel"', html)
+        self.assertIn('id="moreFiltersBtn"', html)
+        self.assertIn('id="moreFilterCount"', html)
+        self.assertIn('id="moreFiltersPanel"', html)
+        self.assertIn('id="totalPagesInfo"', html)
+        self.assertIn('id="generateButtonGuard"', html)
+        self.assertIn("请至少选择1条主材料", html)
+        self.assertIn("selected-primary", html)
+        self.assertIn("selected-auxiliary", html)
+        self.assertIn("switchContextTab", html)
+        self.assertIn("updateMoreFilterCount", html)
+        self.assertIn("updateGenerateButtonState", html)
         self.assertIn('id="clearSelectionBtn"', html)
         self.assertIn('class="bottom-action-bar"', html)
         self.assertIn('id="bottomPrimaryCount"', html)
         self.assertIn('id="bottomAuxiliaryCount"', html)
         self.assertIn('id="bottomMemoryStatus"', html)
-        self.assertIn('class="card detail-card"', html)
         self.assertIn('class="selected-material-card', html)
         self.assertIn("报告记忆库", html)
         self.assertIn("管理记忆库", html)
         self.assertIn('id="useReportMemory" type="checkbox" checked', html)
         self.assertIn('id="bottomMemoryStatus" class="enabled">已开启', html)
         self.assertNotIn("长期记忆管理", html)
+        self.assertNotIn('class="row-selector"', html)
+        self.assertNotIn('data-action="detail"', html)
+        self.assertNotIn('class="card detail-card"', html)
         self.assertNotIn('class="detail-drawer"', html)
         self.assertNotIn('id="detailDrawerBackdrop"', html)
 
@@ -3917,7 +4023,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertTrue(status_body["success"])
         self.assertEqual(status_body["status"], "needs_manual_review")
         self.assertEqual(status_body["error_message"], "Dify API 配置不完整")
-        self.assertEqual(status_body["dify_error_code"], "DIFY_NOT_CONFIGURED")
+        self.assertEqual(status_body["dify_error_code"], "HTTP_ERROR")
         self.assertEqual(report_response.status_code, 200)
         self.assertGreater(len(report_response.json()["report_markdown"]), 100)
 

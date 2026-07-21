@@ -5,6 +5,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from app.evidence_schema import EvidenceValidationError, fact_support_values, read_evidence_pack
+
 
 STEP_DEFINITIONS = [
     ("create_run", "创建任务"),
@@ -355,7 +357,6 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         and not _attachment_is_usable(attachment)
     ]
     warnings = list(pack.get("warnings") or [])
-    material_cache_stats = dict(pack.get("material_cache_stats") or {})
     evidence_level, suggested_length = _evidence_level(weighted_evidence_chars)
     parsed_count = attachment_counts["parsed_attachment_count"]
     attachment_count = attachment_counts["attachment_count"]
@@ -412,12 +413,6 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         diagnosis.append(_diagnosis("ATTACHMENT_PARSE_CACHE_EXPIRED", "normal", "存在附件缓存过期并重新解析。"))
     if attachment_counts["cache_hit_failure_short_count"]:
         diagnosis.append(_diagnosis("ATTACHMENT_PARSE_FAILED_SHORT_CACHED", "warning", "存在短期失败缓存，到期后会重新尝试解析。"))
-    if material_cache_stats.get("hit_count"):
-        diagnosis.append(_diagnosis("MATERIAL_COMPRESSION_CACHE_HIT", "normal", "存在材料压缩缓存命中，证据包构建复用了 material/full 派生视图。"))
-    if material_cache_stats.get("dynamic_count"):
-        diagnosis.append(_diagnosis("MATERIAL_COMPRESSION_CACHE_FALLBACK", "normal", "部分材料未使用缓存，已回退到动态构建路径。"))
-    if material_cache_stats.get("corrupt_count") or material_cache_stats.get("failed_count") or material_cache_stats.get("stale_count"):
-        diagnosis.append(_diagnosis("MATERIAL_COMPRESSION_CACHE_UNSAFE_STATE", "warning", "存在失效、损坏或失败的材料缓存，已避免直接用于证据包。"))
     if auxiliary_content_chars > max(primary_content_chars * 2, 2000) and auxiliary_relevant_snippet_chars < auxiliary_content_chars * 0.25:
         diagnosis.append(
             _diagnosis(
@@ -487,6 +482,11 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
     compression_ratio = None
     if final_dify_input_chars:
         compression_ratio = round(original_pack_chars / final_dify_input_chars, 4)
+    mandatory_retention = (
+        dict(dify_pack.get("mandatory_evidence_retention") or {})
+        if dify_pack
+        else {}
+    )
 
     return {
         "primary_count": len(primary),
@@ -513,10 +513,17 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
         "auxiliary_materials": [_material_brief(item, "auxiliary") for item in auxiliary],
         "attachment_led_primary_count": attachment_led_primary_count,
         **attachment_counts,
-        "material_cache_stats": material_cache_stats,
         "core_attachment_unparsed_names": core_unparsed_names,
         "attachment_analysis_impact": bool(core_unparsed_names),
         "compression_applied": bool(dify_pack.get("compression_applied")) if dify_pack else False,
+        "secondary_compression": bool(dify_pack.get("secondary_compression")) if dify_pack else False,
+        "secondary_compression_tier": str(dify_pack.get("second_pass_tier") or "") if dify_pack else "",
+        "secondary_compression_first_pass_chars": int(dify_pack.get("second_pass_first_pass_chars") or 0) if dify_pack else 0,
+        "mandatory_evidence_total": int(mandatory_retention.get("total") or 0),
+        "mandatory_evidence_retained": int(mandatory_retention.get("retained") or 0),
+        "mandatory_evidence_missing_count": len(list(mandatory_retention.get("missing_ids") or [])),
+        "mandatory_evidence_retention_rate": mandatory_retention.get("rate"),
+        "mandatory_evidence_retention_status": str(mandatory_retention.get("status") or "not_available"),
         "detail_preserved": bool(dify_pack.get("detail_preserved", True)) if dify_pack else True,
         "primary_detail_preserved": bool(dify_pack.get("primary_detail_preserved", True)) if dify_pack else True,
         "core_attachment_detail_preserved": bool(dify_pack.get("core_attachment_detail_preserved", True)) if dify_pack else True,
@@ -939,7 +946,11 @@ def _report_visible_text(markdown: str) -> str:
 def _pack_evidence_text(pack: dict[str, Any]) -> str:
     if not pack:
         return ""
-    return json.dumps(pack, ensure_ascii=False, default=str)
+    try:
+        values = fact_support_values(pack)
+    except EvidenceValidationError:
+        return ""
+    return json.dumps(values, ensure_ascii=False, default=str)
 
 
 def _extract_source_fact_markers(text: str) -> list[str]:
@@ -1001,6 +1012,31 @@ def _analysis_depth(markdown: str, evidence_text: str) -> dict[str, Any]:
     }
 
 
+def _build_ab_quality_coverage(pack: dict[str, Any], report_markdown: str) -> dict[str, Any]:
+    try:
+        view = read_evidence_pack(pack)
+    except EvidenceValidationError:
+        return {"is_report_too_short_by_coverage": False, "validated_ab_only": True}
+    markers: list[str] = []
+    seen: set[str] = set()
+    for item in view.get("evidence_items") or []:
+        if not isinstance(item, dict) or item.get("level") not in {"A", "B"} or not item.get("mandatory"):
+            continue
+        for marker in _extract_source_fact_markers(json.dumps(item.get("value"), ensure_ascii=False, default=str)):
+            compact = _compact_marker(marker)
+            if compact and compact not in seen:
+                seen.add(compact)
+                markers.append(marker)
+    report_text = _compact_marker(_report_visible_text(report_markdown))
+    missing = [marker for marker in markers if _compact_marker(marker) not in report_text]
+    return {
+        "is_report_too_short_by_coverage": bool(missing),
+        "validated_ab_only": True,
+        "validated_marker_count": len(markers),
+        "missing_validated_marker_count": len(missing),
+    }
+
+
 def _issue_text(issue: Any) -> str:
     if isinstance(issue, dict):
         return json.dumps(issue, ensure_ascii=False, default=str)
@@ -1031,8 +1067,13 @@ def _has_quality_blocker(record: dict[str, Any]) -> bool:
 
 def _build_quality_gate(record: dict[str, Any], pack: dict[str, Any], coverage: dict[str, Any]) -> dict[str, Any]:
     markdown = _text(record.get("report_markdown"))
-    has_material_evidence = bool(pack.get("primary_materials") or pack.get("auxiliary_materials"))
+    try:
+        evidence_values = fact_support_values(pack)
+    except EvidenceValidationError:
+        evidence_values = []
+    has_material_evidence = bool(evidence_values)
     if not has_material_evidence:
+        has_report = bool(markdown.strip())
         return {
             "source_fidelity_score": 100,
             "unsupported_fact_count": 0,
@@ -1040,10 +1081,20 @@ def _build_quality_gate(record: dict[str, Any], pack: dict[str, Any], coverage: 
             "summary_only_risk": False,
             "evidence_backed_analysis_count": 0,
             "analysis_sentence_count": 0,
-            "deliverable_status": "failed" if str(record.get("status") or "").lower() == "failed" or not markdown.strip() else "deliverable",
-            "blocking_issues": [],
+            "deliverable_status": "failed" if str(record.get("status") or "").lower() == "failed" or not has_report else "needs_manual_review",
+            "blocking_issues": (
+                [
+                    {
+                        "code": "LOCAL_QUALITY_GATE_FAILED",
+                        "level": "error",
+                        "message": "No validated A/B evidence is available for automatic delivery.",
+                    }
+                ]
+                if has_report
+                else []
+            ),
         }
-    evidence_text = _pack_evidence_text(pack)
+    evidence_text = json.dumps(evidence_values, ensure_ascii=False, default=str)
     blocking_issues: list[dict[str, Any]] = []
     source_issues = _source_fidelity_issues(_report_visible_text(markdown), evidence_text)
     blocking_issues.extend(source_issues)
@@ -1115,7 +1166,11 @@ def build_run_diagnostics(record: dict[str, Any], pack: dict[str, Any] | None = 
     versions = _version_items(record, report_chars)
     first_version_chars = next((int(item.get("chars") or 0) for item in versions if int(item.get("version") or 0) == 1), 0)
     coverage = _build_report_coverage(record, pack or {}, pack_diag, report_chars)
-    quality_gate = _build_quality_gate(record, pack or {}, coverage)
+    quality_gate = _build_quality_gate(
+        record,
+        pack or {},
+        _build_ab_quality_coverage(pack or {}, markdown),
+    )
 
     diagnosis = [item for item in pack_diag.get("diagnosis", []) if item.get("code") != "OK"]
     evidence_level = pack_diag["estimated_evidence_level"]
@@ -1219,6 +1274,10 @@ def build_run_diagnostics(record: dict[str, Any], pack: dict[str, Any] | None = 
             "hash_prefix": str(record.get("report_memory_hash") or "")[:12],
             "read_failed": bool(record.get("memory_read_failed")),
             "truncated": bool(record.get("report_memory_truncated")),
+            "used_memory_ids": list(record.get("used_memory_ids") or []),
+            "memory_item_count": int(record.get("memory_item_count") or 0),
+            "memory_item_chars": int(record.get("memory_item_chars") or 0),
+            "memory_items_read_failed": bool(record.get("memory_items_read_failed")),
         },
         "diagnosis": diagnosis,
     }

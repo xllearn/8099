@@ -1,6 +1,6 @@
 # Medical Notice Analyzer
 
-Local helper service for Dify workflows. It reads a government notice URL, discovers Word/Excel/PDF attachments, extracts text and table content, and returns a merged evidence package for LLM report generation.
+Local helper service for Dify workflows. The production report path uses database-selected materials to prepare a `pack_id`, run the backend workflow, and export Word reports. The legacy URL input endpoints are retained for rollback compatibility but are disabled by default.
 
 ## Company Server Deployment
 
@@ -18,13 +18,13 @@ http://192.168.34.88:8099
 
 For the company Dify app above, HTTP request nodes should call the helper service by server IP, not `localhost`, `127.0.0.1`, or `host.docker.internal`.
 
-Required HTTP node URLs and JSON request bodies:
+Current production UI and API entry points:
 
 ```text
-POST http://192.168.34.88:8099/analyze
-Content-Type: application/json
-
-{"url":"{{#start_node.notice_url#}}","max_attachments":25,"max_combined_chars":60000}
+GET  http://192.168.34.88:8099/records-ui
+POST http://192.168.34.88:8099/analysis/prepare
+POST http://192.168.34.88:8099/analysis/run
+GET  http://192.168.34.88:8099/analysis/runs/{run_id}/download
 ```
 
 ```text
@@ -33,6 +33,10 @@ Content-Type: application/json
 
 {"markdown":"{{#generate_report.text#}}","strict_quality":true}
 ```
+
+Legacy URL analysis endpoints `/analyze` and `/analyze_v2` are soft-disabled unless `ENABLE_URL_ANALYZE=true`. When disabled they return `410 Gone` with `URL_ANALYZE_DISABLED` and log the old endpoint access for dependency discovery.
+
+Word publication is fail-closed. `ENABLE_WORD_EXPORT` defaults to `false`; while disabled, `/report/export`, `/report/export_checked`, `/analysis/runs/{run_id}/download`, and `/download/{filename}` return `503` with `WORD_EXPORT_DISABLED`. No Word file or download URL is created, and analysis-run Word availability flags remain false. Report generation, quality state, `/report/render`, and `/report/render_v2` remain available.
 
 ```text
 POST http://192.168.34.88:8099/report/qa
@@ -54,7 +58,7 @@ Health check for Dify connectivity:
 curl -sS http://192.168.34.88:8099/health
 ```
 
-Expected result includes `status: ok`, `service: medical-notice-analyzer`, and `public_base_url: http://192.168.34.88:8099`. Sensitive values such as API keys, cookies, tokens, and passwords are never returned by `/health`.
+Expected result includes `status: ok`, `service: medical-notice-analyzer`, `public_base_url: http://192.168.34.88:8099`, and `word_export_enabled: false` while the publication fuse is active. Sensitive values such as API keys, cookies, tokens, and passwords are never returned by `/health`.
 
 Server environment setup:
 
@@ -145,7 +149,7 @@ Health check:
 Invoke-WebRequest http://127.0.0.1:8099/health
 ```
 
-Analyze a notice:
+Legacy URL analysis is disabled by default. To verify the soft-disable response:
 
 ```powershell
 Invoke-RestMethod `
@@ -155,7 +159,7 @@ Invoke-RestMethod `
   -Body '{"url":"https://example.com/notice.html"}'
 ```
 
-From Dify Docker containers, call:
+Only for rollback testing, set `ENABLE_URL_ANALYZE=true` before calling legacy URL analysis. From Dify Docker containers, the legacy URL endpoint was:
 
 ```text
 http://host.docker.internal:8099/analyze
@@ -235,11 +239,11 @@ The prompt intentionally avoids a fixed five-part structure. Reports should foll
 
 The retained Dify DSL is `dify_workflow_pack_id_human_style.yml`. It is the current pack_id workflow used for evidence-pack based report generation.
 
-Recommended Dify variables:
+Recommended Dify variables for the retained legacy chatflow:
 
-- `notice_url`: required text input for the source announcement.
+- `notice_url`: legacy URL input, unavailable unless `ENABLE_URL_ANALYZE=true`.
 - `history_report`: optional Word upload for a previous human analysis report.
-- `source_evidence`: conversation variable containing `/analyze` evidence.
+- `source_evidence`: legacy conversation variable containing `/analyze` evidence.
 - `history_insights`: conversation variable generated from the optional history Word.
 - `current_report_ir`: latest structured ReportIR.
 - `current_final_report`: latest Markdown report.

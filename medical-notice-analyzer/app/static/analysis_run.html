@@ -814,8 +814,6 @@
       const reportDiag = diag.report || {};
       const evidence = diag.evidence || {};
       const status = run.status || 'running';
-      const qualityGate = report.quality_gate || diag.quality_gate || {};
-      const exportBlocked = isExportBlocked(report.quality_check || {}, qualityGate, status);
       $('statusBadge').className = `badge ${statusClass(status)}`;
       $('statusBadge').textContent = statusLabel(status);
       $('statusText').textContent = `${statusLabel(status)} / ${status || '-'}`;
@@ -826,17 +824,12 @@
       $('charsText').textContent = reportDiag.report_markdown_chars ? `${reportDiag.report_markdown_chars} 字` : (report.report_markdown ? `${report.report_markdown.length} 字` : '-');
       $('suggestLengthText').textContent = evidence.suggested_report_length || '-';
       $('updatedAtText').textContent = run.updated_at ? `报告生成时间：${formatLocalDateTime(run.updated_at)}` : '';
-      $('downloadBtn').disabled = !report.report_markdown || exportBlocked;
-      $('downloadBtn').title = exportBlocked ? '质量门禁未通过，暂不可下载 Word' : '';
+      $('downloadBtn').disabled = !report.report_markdown;
       $('copyMarkdownBtn').disabled = !report.report_markdown;
       $('submitRevisionBtn').disabled = !report.report_markdown;
       $('downloadBtn').onclick = () => {
         if (state.runId) location.href = `/analysis/runs/${encodeURIComponent(state.runId)}/download`;
       };
-    }
-
-    function isExportBlocked(qualityCheck, qualityGate, status) {
-      return false;
     }
 
     function renderDiagnosis() {

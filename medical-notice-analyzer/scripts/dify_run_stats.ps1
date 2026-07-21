@@ -4,10 +4,14 @@ param(
     [string]$PostgresContainer = "docker-db_postgres-1",
     [string]$Database = "dify",
     [string]$User = "postgres",
-    [string]$Password = "difyai123456"
+    [string]$Password = $env:DIFY_POSTGRES_PASSWORD
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $Password) {
+    throw "Set DIFY_POSTGRES_PASSWORD or pass -Password before running this script."
+}
 
 if ($Latest -lt 1) {
     throw "-Latest must be greater than or equal to 1."

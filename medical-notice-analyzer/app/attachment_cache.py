@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -14,11 +15,12 @@ SUCCESS_STATUSES = {
     "parsed_text",
     "parsed_summary",
     "parsed_table_summary",
+    "parsed_pdf_table_cells",
     "too_large_summary_only",
     "unsupported",
 }
-FAILURE_STATUSES = {"download_failed", "network_unreachable", "parse_failed", "temp_file_cleanup_failed"}
-PARSER_CACHE_VERSION = "20260616-doc-libreoffice-v2"
+FAILURE_STATUSES = {"download_failed", "network_unreachable", "parse_failed", "partial_parse", "temp_file_cleanup_failed"}
+PARSER_CACHE_VERSION = "20260715-structured-pdf-v1"
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -46,11 +48,24 @@ def cache_dir() -> Path:
 def cache_key(attachment: dict[str, Any]) -> str:
     payload = {
         "parser_version": (os.getenv("ATTACHMENT_PARSER_VERSION") or PARSER_CACHE_VERSION).strip(),
+        "content_sha256": str(attachment.get("content_sha256") or ""),
+        "structured_pdf_tables": _bool_env("ENABLE_STRUCTURED_PDF_TABLES", False),
+        "pdf_table_rule_version": (os.getenv("PDF_TABLE_RULE_VERSION") or "20260715-text-pdf-v1").strip(),
+        "pdf_ocr": _bool_env("ENABLE_PDF_OCR", False),
+        "image_table_ocr": _bool_env("ENABLE_IMAGE_TABLE_OCR", False),
+        "pdf_ocr_lang": (os.getenv("ATTACHMENT_PDF_OCR_LANG") or "chi_sim+eng").strip(),
+        "pdf_ocr_dpi": (os.getenv("ATTACHMENT_PDF_OCR_DPI") or "160").strip(),
+        "pdf_ocr_max_pages": (os.getenv("ATTACHMENT_PDF_OCR_MAX_PAGES") or "8").strip(),
+        "pdf_ocr_low_text_threshold": (os.getenv("ATTACHMENT_PDF_OCR_LOW_TEXT_THRESHOLD") or "200").strip(),
         "articleattid": str(attachment.get("articleattid") or ""),
         "filename": str(attachment.get("filename") or ""),
         "filesize": str(attachment.get("filesize") or ""),
         "uploadtime": str(attachment.get("uploadtime") or ""),
     }
+    if _bool_env("ENABLE_VBP_COMPACT_PRESERVATION", False):
+        payload["pdf_table_evidence_max_cells"] = (
+            os.getenv("ATTACHMENT_PDF_EVIDENCE_MAX_CELLS") or "1000"
+        ).strip()
     return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
@@ -63,7 +78,7 @@ def _ttl_seconds(status: str, failure_count: int = 0) -> int:
         if failure_count >= 3:
             return 2 * 60 * 60
         return int(_float_env("ATTACHMENT_PARSE_CACHE_FAILURE_TTL_MINUTES", 10) * 60)
-    if status in {"parse_failed", "temp_file_cleanup_failed"}:
+    if status in {"parse_failed", "partial_parse", "temp_file_cleanup_failed"}:
         if failure_count >= 3:
             return 2 * 60 * 60
         return int(_float_env("ATTACHMENT_PARSE_CACHE_PARSE_FAILURE_TTL_MINUTES", 30) * 60)
@@ -135,7 +150,23 @@ def store_cached_result(attachment: dict[str, Any], result: dict[str, Any]) -> N
         "retry_after_seconds": ttl if status in FAILURE_STATUSES else 0,
         "result": result,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
 
 
 def cleanup_cache() -> dict[str, int]:

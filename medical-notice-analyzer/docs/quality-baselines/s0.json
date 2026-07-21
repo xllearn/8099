@@ -1,0 +1,190 @@
+{
+  "baseline_id": "B",
+  "coverage_mode": "fixed3_only",
+  "evaluations": [
+    {
+      "environment": "server_test",
+      "excluded_cases": [],
+      "metrics": {
+        "case_count": 3,
+        "compact_pack_chars": {
+          "max": 60529,
+          "mean": 40738.0,
+          "min": 14558
+        },
+        "completed_sample_count": 9,
+        "deliverable_count": 0,
+        "elapsed_seconds": {
+          "max": 278.463,
+          "mean": 165.38,
+          "min": 81.154,
+          "p50": 165.513,
+          "p95": 278.463
+        },
+        "failed_count": 0,
+        "failure_code_counts": {
+          "DIFY_FRAGMENTARY_REPORT": 4,
+          "UNSUPPORTED_FACT": 5
+        },
+        "forbidden_phrase_hit_count": 0,
+        "identity_hash_complete_count": 9,
+        "metrics_complete_count": 9,
+        "missing_workflow_run_id_count": 0,
+        "needs_manual_review_count": 9,
+        "passed_count": 9,
+        "provider_counts": {
+          "dify": 9
+        },
+        "replayable_snapshot_count": 9,
+        "sample_count": 9,
+        "state_contradiction_count": 0,
+        "status_counts": {
+          "needs_manual_review": 9
+        },
+        "unsupported_fact_count": 49
+      },
+      "selected_case_count": 3,
+      "subset": "fixed3"
+    }
+  ],
+  "evaluator_rules_sha256": "16a0c9972f4da33e4abc8bc79f1d11c57907d06cf58168bb6c4fc96f7a5fff48",
+  "evaluator_version": "1.4.1",
+  "excluded_cases": [],
+  "manifest_sha256": "a436446b7d3fd5e92110564cee0c4ef558cb3ac92220563178b8709034f3a7d1",
+  "metrics": {
+    "case_count": 3,
+    "compact_pack_chars": {
+      "max": 60529,
+      "mean": 40738.0,
+      "min": 14558
+    },
+    "completed_sample_count": 9,
+    "deliverable_count": 0,
+    "elapsed_seconds": {
+      "max": 278.463,
+      "mean": 165.38,
+      "min": 81.154,
+      "p50": 165.513,
+      "p95": 278.463
+    },
+    "failed_count": 0,
+    "failure_code_counts": {
+      "DIFY_FRAGMENTARY_REPORT": 4,
+      "UNSUPPORTED_FACT": 5
+    },
+    "forbidden_phrase_hit_count": 0,
+    "identity_hash_complete_count": 9,
+    "metrics_complete_count": 9,
+    "missing_workflow_run_id_count": 0,
+    "needs_manual_review_count": 9,
+    "passed_count": 9,
+    "provider_counts": {
+      "dify": 9
+    },
+    "replayable_snapshot_count": 9,
+    "sample_count": 9,
+    "state_contradiction_count": 0,
+    "status_counts": {
+      "needs_manual_review": 9
+    },
+    "unsupported_fact_count": 49
+  },
+  "performance": [
+    {
+      "environment": "server_test",
+      "metrics": {
+        "case_count": 3,
+        "compact_pack_chars": {
+          "max": 60529,
+          "mean": 40738.0,
+          "min": 14558
+        },
+        "completed_sample_count": 9,
+        "deliverable_count": 0,
+        "elapsed_seconds": {
+          "max": 278.463,
+          "mean": 165.38,
+          "min": 81.154,
+          "p50": 165.513,
+          "p95": 278.463
+        },
+        "failed_count": 0,
+        "failure_code_counts": {
+          "DIFY_FRAGMENTARY_REPORT": 4,
+          "UNSUPPORTED_FACT": 5
+        },
+        "forbidden_phrase_hit_count": 0,
+        "identity_hash_complete_count": 9,
+        "metrics_complete_count": 9,
+        "missing_workflow_run_id_count": 0,
+        "needs_manual_review_count": 9,
+        "passed_count": 9,
+        "provider_counts": {
+          "dify": 9
+        },
+        "replayable_snapshot_count": 9,
+        "sample_count": 9,
+        "state_contradiction_count": 0,
+        "status_counts": {
+          "needs_manual_review": 9
+        },
+        "unsupported_fact_count": 49
+      },
+      "selected_case_count": 3,
+      "subset": "fixed3"
+    }
+  ],
+  "quality": [
+    {
+      "environment": "server_test",
+      "metrics": {
+        "case_count": 3,
+        "compact_pack_chars": {
+          "max": 60529,
+          "mean": 40738.0,
+          "min": 14558
+        },
+        "completed_sample_count": 9,
+        "deliverable_count": 0,
+        "elapsed_seconds": {
+          "max": 278.463,
+          "mean": 165.38,
+          "min": 81.154,
+          "p50": 165.513,
+          "p95": 278.463
+        },
+        "failed_count": 0,
+        "failure_code_counts": {
+          "DIFY_FRAGMENTARY_REPORT": 4,
+          "UNSUPPORTED_FACT": 5
+        },
+        "forbidden_phrase_hit_count": 0,
+        "identity_hash_complete_count": 9,
+        "metrics_complete_count": 9,
+        "missing_workflow_run_id_count": 0,
+        "needs_manual_review_count": 9,
+        "passed_count": 9,
+        "provider_counts": {
+          "dify": 9
+        },
+        "replayable_snapshot_count": 9,
+        "sample_count": 9,
+        "state_contradiction_count": 0,
+        "status_counts": {
+          "needs_manual_review": 9
+        },
+        "unsupported_fact_count": 49
+      },
+      "selected_case_count": 3,
+      "subset": "fixed3"
+    }
+  ],
+  "required_subsets": [
+    "fixed3"
+  ],
+  "schema_version": "8099.regression-baseline/v2",
+  "unsupported_eval_version": "1",
+  "waived_subsets": [
+    "fixed10"
+  ]
+}

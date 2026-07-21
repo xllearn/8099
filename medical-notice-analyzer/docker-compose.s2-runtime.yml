@@ -1,0 +1,10 @@
+services:
+  medical-notice-analyzer:
+    image: medical-notice-analyzer:s2-99a4df4
+    environment:
+      APP_GIT_SHA: 99a4df42da9266b22f3fa8b0d7972320887d5a49
+      ENABLE_VBP_REPORT_RULES: "true"
+      ENABLE_EVIDENCE_INDEX: "true"
+      ENABLE_VBP_QUALITY_GATE: "true"
+      ENABLE_UNSUPPORTED_FACT_REPAIR: "true"
+      ENABLE_STRICT_DELIVERY_GATE: "true"

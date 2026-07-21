@@ -1,0 +1,21 @@
+[
+  ".dockerignore",
+  ".env.example",
+  ".gitignore",
+  "AGENTS.md",
+  "Dockerfile",
+  "README.md",
+  "app",
+  "dify_workflow_pack_id_human_style.yml",
+  "docker-compose.s4-runtime.yml",
+  "docker-compose.yml",
+  "docs",
+  "manual-assets",
+  "prompts",
+  "requirements.txt",
+  "scripts",
+  "start.ps1",
+  "tests",
+  "鍖绘鍏憡鏅烘瀽鎶ュ憡绯荤粺 V1.0 鎿嶄綔鎵嬪唽.docx",
+  "閸栫粯顫崗顒€鎲￠弲鐑樼€介幎銉ユ啞缁崵绮_V1.0 閹垮秳缍旈幍瀣斀.docx"
+]

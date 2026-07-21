@@ -1,0 +1,1267 @@
+{
+  "captured_at": "2026-07-14T15:34:29+08:00",
+  "cases": [
+    {
+      "articleid": "803492fa-839b-4fff-aa7c-e9c1d9a3028a",
+      "capability_tags": [
+        "project_notice",
+        "docx_xlsx_attachments",
+        "table_heavy"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 4,
+      "id": "fixed-1-shandong-incision-protector",
+      "materials": [
+        {
+          "articleid": "803492fa-839b-4fff-aa7c-e9c1d9a3028a",
+          "attachment_count": 4,
+          "attachments": [
+            {
+              "articleattid": "5c3c777a-0629-4c4d-93da-46a9a6fac142",
+              "content_hash_source": "raw_bytes",
+              "content_length": "33177",
+              "content_sha256": "d2f9fae5d1c9d2bd9b113d5b06782c10e0513bb4406e3534a37f75675858e18c",
+              "fileext": ".docx",
+              "filename": "附件1.1:切口保护器等3类医用耗材协议期满接续采购申报承诺书.docx",
+              "filepath_sha256": "6c2047a4f0e5515a029147f73524b6568d910820ba08e8b9dc1477902d8c6d04",
+              "filesize": "",
+              "metadata_sha256": "f318dc18a060badcd3f8db2f51ea10ee8628189b168372cdb27c3ab788928b64",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-22 09:28:26"
+            },
+            {
+              "articleattid": "a809e9e5-8281-4b43-8e99-dffc80b1c6a8",
+              "content_hash_source": "raw_bytes",
+              "content_length": "51189",
+              "content_sha256": "174541651733f60458d645dfa21f76c7482380a390208865057f4b1d617c9119",
+              "fileext": ".docx",
+              "filename": "附件1:切口保护器等3类医用耗材协议期满接续采购文件.docx",
+              "filepath_sha256": "b06bef433b9f35486c0bfb1470b6c0d3c8195bc8d51e3bd162b81dba448baa25",
+              "filesize": "",
+              "metadata_sha256": "0218fb596e05f1524a3ff0aded48fd1b39ddc54af2310e4db8915f4dacb16cda",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-22 09:28:26"
+            },
+            {
+              "articleattid": "d1ad4673-e702-42ee-a146-2e7d67408f5e",
+              "content_hash_source": "raw_bytes",
+              "content_length": "1308589",
+              "content_sha256": "b38a4518888b30c86690a8ac028a70deaeded6eb4ee6d572b03ce82f9439e632",
+              "fileext": ".docx",
+              "filename": "切口保护器等3类医用耗材协议期满接续采购申报、公示、申投诉操作手册.docx",
+              "filepath_sha256": "f6f06117f1c30e5bd4186f5e19b6f992eaae8ef135da1698cec2bdde14ac77aa",
+              "filesize": "",
+              "metadata_sha256": "98077055a8773b57dcd121a3099cbe02f9445e54f481583b6bcdf56d3d2ddac5",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-22 09:28:26"
+            },
+            {
+              "articleattid": "f4fc9ab8-7ed5-4b04-bb02-a70828036a87",
+              "content_hash_source": "raw_bytes",
+              "content_length": "192423",
+              "content_sha256": "c7db11e8ee9f1676871ffbeb2871cf0149b17d9fb84acfe1c9b7f387ebe44323",
+              "fileext": ".xlsx",
+              "filename": "附件1.2:医疗机构首年采购需求量.xlsx",
+              "filepath_sha256": "a3648bd692ff744d766dffafcefae16f0f587f8df8d15f84722ccd3a65f89c1a",
+              "filesize": "",
+              "metadata_sha256": "b224d3cb5c3fe6562a01055cab217fb944762751ae9a00ad5a13358aab46e863",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-22 09:28:26"
+            }
+          ],
+          "attachments_sha256": "694b19de8e922e1d017e39e934f58d8c13fa34e27ac5328dc5c0977751bd9f1e",
+          "body_sha256": "5b2052734cb1cc3b60bfa7638a8c43231ff27cee232c394862e0324d5feb87b9",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "project_notice",
+          "record_sha256": "f9b24ae02868d87be7d550d534255077ec0372bdce39c1c191785479e36d03b4",
+          "role": "primary",
+          "title": "2026年山东省关于切口保护器等3类医用耗材协议期满接续采购文件公告",
+          "title_sha256": "2d8b0467a360b7ae805f2a037f4e234a4533d5908b8800dc1657059394e128ef"
+        }
+      ],
+      "menu_code": "project_notice",
+      "name": "2026年山东省关于切口保护器等3类医用耗材协议期满接续采购文件公告",
+      "record_sha256": "f9b24ae02868d87be7d550d534255077ec0372bdce39c1c191785479e36d03b4",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "803492fa-839b-4fff-aa7c-e9c1d9a3028a",
+              "menu_code": "project_notice"
+            }
+          ]
+        }
+      },
+      "title": "2026年山东省关于切口保护器等3类医用耗材协议期满接续采购文件公告"
+    },
+    {
+      "articleid": "4695e7d8-9d04-4c5a-b198-00ed022bf413",
+      "capability_tags": [
+        "project_notice",
+        "no_attachments",
+        "long_body"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 0,
+      "id": "fixed-2-xinjiang-imaging-cloud",
+      "materials": [
+        {
+          "articleid": "4695e7d8-9d04-4c5a-b198-00ed022bf413",
+          "attachment_count": 0,
+          "attachments": [],
+          "attachments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "body_sha256": "c51e27425a6310b0e56d72c11587334c0e1640b4e3b30ccf9d57946282e9cfee",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "project_notice",
+          "record_sha256": "9172a8ab0a14ee051cd546a775938111f3728d6841c3b6a66d9d1f583bb004e8",
+          "role": "primary",
+          "title": "2025年新疆维吾尔自治区医疗保障局关于组织开展新疆医保影像云(医用耗材)集中带量采购的通告",
+          "title_sha256": "465f12f8e39ea3aef7127df1b844b0e379b50254f2373bc9e8acd33416144731"
+        }
+      ],
+      "menu_code": "project_notice",
+      "name": "2025年新疆维吾尔自治区医疗保障局关于组织开展新疆医保影像云(医用耗材)集中带量采购的通告",
+      "record_sha256": "9172a8ab0a14ee051cd546a775938111f3728d6841c3b6a66d9d1f583bb004e8",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "4695e7d8-9d04-4c5a-b198-00ed022bf413",
+              "menu_code": "project_notice"
+            }
+          ]
+        }
+      },
+      "title": "2025年新疆维吾尔自治区医疗保障局关于组织开展新疆医保影像云（医用耗材）集中带量采购的通告"
+    },
+    {
+      "articleid": "4ca0eae9-bb5f-4301-8d1a-ee4d85cc30b6",
+      "capability_tags": [
+        "project_notice",
+        "pdf_attachments",
+        "table_heavy"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 4,
+      "id": "fixed-3-coronary-stent-renewal",
+      "materials": [
+        {
+          "articleid": "4ca0eae9-bb5f-4301-8d1a-ee4d85cc30b6",
+          "attachment_count": 4,
+          "attachments": [
+            {
+              "articleattid": "31ee8c92-4f51-42bb-bcac-115dd190e0b9",
+              "content_hash_source": "raw_bytes",
+              "content_length": "302816",
+              "content_sha256": "937934c4a0e0db7f18f4f4ff56a926ab1895dba4f43b464eb2207a8d5bff6681",
+              "fileext": ".pdf",
+              "filename": "附表3:各注册证产品联盟各地区医疗机构首年采购需求量.pdf",
+              "filepath_sha256": "f47aec6a67d1ad3b3275939a4aef67ae4dcc2b3624633c1abe09a805de09634b",
+              "filesize": "",
+              "metadata_sha256": "7e9b59c712e63b91bde752dc8a39621ef3402fbcd5c3c6eab618b13e4ef5902c",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-21 15:45:41"
+            },
+            {
+              "articleattid": "3727a70b-838c-41c4-8a4c-58cf0106df78",
+              "content_hash_source": "raw_bytes",
+              "content_length": "554120",
+              "content_sha256": "debfafc0708e2849242b0b89a0bb7d9e79b0b67ac59ab9f8638fb8eb9ade2026",
+              "fileext": ".pdf",
+              "filename": "附表2:联盟各地区各注册证产品医疗机构首年采购需求量.pdf",
+              "filepath_sha256": "7c5d7f370e9ee5660ab54ce7c92873e231ad637634bf92d0e0fe462ffb666533",
+              "filesize": "",
+              "metadata_sha256": "23d5943b55b6ab2af362df70fb5ac98ceb7a7505a1b26578c56f5619c75cea6e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-21 15:45:41"
+            },
+            {
+              "articleattid": "81d15331-edfe-4aa7-9efc-302af14f1372",
+              "content_hash_source": "raw_bytes",
+              "content_length": "1082688",
+              "content_sha256": "cdca675758d8407f6bd2e2fddbf62d1ef6e6a8dd586650032d6fd09ff98bc3bf",
+              "fileext": ".pdf",
+              "filename": "附件:“国家组织冠脉支架集中带量采购”第二轮接续采购文件(采购文件编号:GH-HD2026-1).pdf",
+              "filepath_sha256": "5f972604d30f0bb1acd4ff01306f45bc380c3af3b72fb443c1f229d0c73bd533",
+              "filesize": "",
+              "metadata_sha256": "34cdcec72791ed7dbf2fb728baa480f1c19095a2d9eefc807a3ccbd5e74c2944",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-21 15:45:41"
+            },
+            {
+              "articleattid": "a47c904c-2f40-4f95-b6a3-e0f9d8d82a22",
+              "content_hash_source": "raw_bytes",
+              "content_length": "176856",
+              "content_sha256": "3d350a0b92fe05c743cc59af4872663df492eb56503a1b87418b6c8406ba0069",
+              "fileext": ".pdf",
+              "filename": "附表1:各品种各注册证产品医疗机构首年采购需求量汇总.pdf",
+              "filepath_sha256": "f8b0dc7185dd8f52e5d904a250752d799d0f8667b7d67908e10ff2bad436c740",
+              "filesize": "",
+              "metadata_sha256": "5b01600fc27d90569ebf0c4bc04a8a737ff4290cb75c20e43f6934eb39655e3e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-21 15:45:41"
+            }
+          ],
+          "attachments_sha256": "ac1c492a324a62f82d905b4984c0c1cd58cd173d4a462ce3cc03658e7829d369",
+          "body_sha256": "66c734b2c7b9ca9993b8eff69d77867a6e00038ed0ccc60f2b6aea6362089fd6",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "project_notice",
+          "record_sha256": "55f31e03e04ffc110e041c4a8ad1955c2760e31be597b577183626b36448c312",
+          "role": "primary",
+          "title": "2026年国家组织高值医用耗材联合采购办公室关于发布《“国家组织冠脉支架集中带量采购”第二轮接续采购文件(采购文件编号:GH-HD2026-1)》的公告",
+          "title_sha256": "6f624952109b13e673105707493246e438476e0068d0cb393202ca86950cac81"
+        }
+      ],
+      "menu_code": "project_notice",
+      "name": "2026年国家组织高值医用耗材联合采购办公室关于发布《“国家组织冠脉支架集中带量采购”第二轮接续采购文件(采购文件编号:GH-HD2026-1)》的公告",
+      "record_sha256": "55f31e03e04ffc110e041c4a8ad1955c2760e31be597b577183626b36448c312",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "4ca0eae9-bb5f-4301-8d1a-ee4d85cc30b6",
+              "menu_code": "project_notice"
+            }
+          ]
+        }
+      },
+      "title": "2026年国家组织高值医用耗材联合采购办公室关于发布《“国家组织冠脉支架集中带量采购”第二轮接续采购文件（采购文件编号：GH-HD2026-1）》的公告"
+    },
+    {
+      "articleid": "4a2e0dbc-1a24-490e-b807-38374f8cd530",
+      "capability_tags": [
+        "project_analysis",
+        "docx_attachment",
+        "derived_analysis"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 1,
+      "id": "fixed-4-guizhou-project-analysis",
+      "skip": {
+        "code": "SOURCE_ATTACHMENT_UNAVAILABLE",
+        "observed_at": "2026-07-14T16:00:00+08:00"
+      },
+      "materials": [
+        {
+          "articleid": "4a2e0dbc-1a24-490e-b807-38374f8cd530",
+          "attachment_count": 1,
+          "attachments": [
+            {
+              "articleattid": "3fdc43a4-db67-41db-b8f1-61a3baae5e60",
+              "content_hash_source": "unavailable",
+              "content_length": "0",
+              "content_sha256": "",
+              "fileext": ".docx",
+              "filename": "【贵州】关于开展医用耗材阳光挂网采购申报工作的通知—项目分析 易联器械【20260529】.docx",
+              "filepath_sha256": "1e9274bfe1b2aa2a4b35250320c051fdbfb74adbc297854c3ddd148701e05825",
+              "filesize": "",
+              "metadata_sha256": "a67c2d007dabf59ae2218ce232386870565bfcbc9d220a237051ca74a2b87441",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 17:11:20"
+            }
+          ],
+          "attachments_sha256": "",
+          "body_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "project_analysis",
+          "record_sha256": "",
+          "role": "primary",
+          "title": "【贵州】关于开展医用耗材阳光挂网采购申报工作的通知—项目分析",
+          "title_sha256": "382c57b50b4fc08096179250dc21c1806a24e29130f19a02db50ce28e969efdc"
+        }
+      ],
+      "menu_code": "project_analysis",
+      "name": "Guizhou sunshine procurement project analysis",
+      "record_sha256": "",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "4a2e0dbc-1a24-490e-b807-38374f8cd530",
+              "menu_code": "project_analysis"
+            }
+          ]
+        }
+      },
+      "title": "【贵州】关于开展医用耗材阳光挂网采购申报工作的通知—项目分析"
+    },
+    {
+      "articleid": "859bbf46-77b3-4664-9606-e79101c084aa",
+      "capability_tags": [
+        "policy_interpretation",
+        "no_attachments",
+        "long_body"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 0,
+      "id": "fixed-5-national-payment-reform",
+      "materials": [
+        {
+          "articleid": "859bbf46-77b3-4664-9606-e79101c084aa",
+          "attachment_count": 0,
+          "attachments": [],
+          "attachments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "body_sha256": "5cba14f48e2bbaaa9fce66d1c1e595cd8f00b13e823e93362370356f927c7d54",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "policy_interpretation",
+          "record_sha256": "614654330891f978023320626afae33f0fd22451aa3ce19af8afee4e9cbd1770",
+          "role": "primary",
+          "title": "国家医保局关于医保支付方式改革有关情况介绍(第1期)",
+          "title_sha256": "3bb3861ff992dbc70f70be87956e0699510f92c1ccc04df715a73bf1e9ab7480"
+        }
+      ],
+      "menu_code": "policy_interpretation",
+      "name": "国家医保局关于医保支付方式改革有关情况介绍(第1期)",
+      "record_sha256": "614654330891f978023320626afae33f0fd22451aa3ce19af8afee4e9cbd1770",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "859bbf46-77b3-4664-9606-e79101c084aa",
+              "menu_code": "policy_interpretation"
+            }
+          ]
+        }
+      },
+      "title": "国家医保局关于医保支付方式改革有关情况介绍（第1期）"
+    },
+    {
+      "articleid": "718b4c38-34b3-4be8-9800-c0c4c24bdb08",
+      "capability_tags": [
+        "drg_result",
+        "no_attachments",
+        "long_body"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 0,
+      "id": "fixed-6-changzhi-drg-result",
+      "materials": [
+        {
+          "articleid": "718b4c38-34b3-4be8-9800-c0c4c24bdb08",
+          "attachment_count": 0,
+          "attachments": [],
+          "attachments_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+          "body_sha256": "fabfc2e7700160e07830f5e968c603ba40a7e3e53e652597e2af965100db07a8",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "yb_drg",
+          "record_sha256": "5d3c21a920b7e8d2d1ac3638a37e897dcd8a1e01819b4fc58a64f5dc01620ad7",
+          "role": "primary",
+          "title": "山西省长治市2026年度一季度DRG付费特例单议评审结果公示",
+          "title_sha256": "b063c27921c2b2659960f71430c228cd4c5f7d7694aab0d99d137eb23b7e9dc1"
+        }
+      ],
+      "menu_code": "yb_drg",
+      "name": "山西省长治市2026年度一季度DRG付费特例单议评审结果公示",
+      "record_sha256": "5d3c21a920b7e8d2d1ac3638a37e897dcd8a1e01819b4fc58a64f5dc01620ad7",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "718b4c38-34b3-4be8-9800-c0c4c24bdb08",
+              "menu_code": "yb_drg"
+            }
+          ]
+        }
+      },
+      "title": "山西省长治市2026年度一季度DRG付费特例单议评审结果公示"
+    },
+    {
+      "articleid": "b10e3e1f-bea5-4d3b-ada6-124be038b8a9",
+      "capability_tags": [
+        "price_notice",
+        "docx_xlsx_attachments",
+        "consultation"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 2,
+      "id": "fixed-7-heyuan-price-consultation",
+      "materials": [
+        {
+          "articleid": "b10e3e1f-bea5-4d3b-ada6-124be038b8a9",
+          "attachment_count": 2,
+          "attachments": [
+            {
+              "articleattid": "6aabe001-de36-4905-b87c-bcb4c7481f95",
+              "content_hash_source": "raw_bytes",
+              "content_length": "216284",
+              "content_sha256": "c74dc04306d6d7903638f56668328fd143c6b73545a4f3e53dd587fc92217907",
+              "fileext": ".xlsx",
+              "filename": "附件1:河源市麻醉等11类医疗服务项目价格(征求意见稿)(4).xlsx",
+              "filepath_sha256": "44128d4f2e3c299bfb50e04e40fa8311fa1d109f7af9fd0b1cf8a932c141dd8a",
+              "filesize": "",
+              "metadata_sha256": "c62231082be90cc2ad67fb11fa377623b0b280662d8df8910b564a517557811e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-30 18:08:39"
+            },
+            {
+              "articleattid": "cab50715-e0bd-4688-8863-41f76e87e42e",
+              "content_hash_source": "raw_bytes",
+              "content_length": "22058",
+              "content_sha256": "0b5916607b7de61ba90e1dec1947b523829084258d3cebb9ba38ab1254a891e4",
+              "fileext": ".docx",
+              "filename": "附件2:关于河源市麻醉类等医疗服务价格项目(征求意见稿)的起草说明(2).docx",
+              "filepath_sha256": "7be8201545ad5b044fc740cb1bcb93c0f4efec1621a82d9fe7d00792123cac23",
+              "filesize": "",
+              "metadata_sha256": "c2c8fba37409a8bbada2c886bcefc4c516d5a90796add41ccd92facf08a3cebc",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-30 18:08:39"
+            }
+          ],
+          "attachments_sha256": "62004247eaad4efdba67c944b1d614193dea92879ee5bfba6b4d5aa07fe9e4bd",
+          "body_sha256": "eb406a282a54383025007ee25d68166d847b6bf5cb4471e1f2ecd6fd6a147829",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "ylsf",
+          "record_sha256": "605a1edf150b42e198901bf5eb019858935a24094114622e6d1608fd69dcc5d9",
+          "role": "primary",
+          "title": "广东省河源市医疗保障局关于公开征求麻醉类等医疗服务项目价格(征求意见稿)意见的公示",
+          "title_sha256": "42ce5ca26f3741beb658e709fef09eb9b2dec7244bb61e62a20784bfda02001e"
+        }
+      ],
+      "menu_code": "ylsf",
+      "name": "广东省河源市医疗保障局关于公开征求麻醉类等医疗服务项目价格(征求意见稿)意见的公示",
+      "record_sha256": "605a1edf150b42e198901bf5eb019858935a24094114622e6d1608fd69dcc5d9",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "b10e3e1f-bea5-4d3b-ada6-124be038b8a9",
+              "menu_code": "ylsf"
+            }
+          ]
+        }
+      },
+      "title": "广东省河源市医疗保障局关于公开征求麻醉类等医疗服务项目价格（征求意见稿）意见的公示"
+    },
+    {
+      "articleid": "81a4fe2a-04ad-4591-9613-c717a9e688b0",
+      "capability_tags": [
+        "procurement_execution",
+        "xlsx_attachment",
+        "project_information"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 1,
+      "id": "fixed-8-guangxi-ureteral-stent",
+      "materials": [
+        {
+          "articleid": "81a4fe2a-04ad-4591-9613-c717a9e688b0",
+          "attachment_count": 1,
+          "attachments": [
+            {
+              "articleattid": "5b3a9883-6e26-40e1-97c4-a3ad710c3092",
+              "content_hash_source": "raw_bytes",
+              "content_length": "1277484",
+              "content_sha256": "38c8dad7bf54cab36b5c8ee0eb47b38c044eef31958c2328b895cfb101052972",
+              "fileext": ".xlsx",
+              "filename": "附件:重庆牵头输尿管支架类医用耗材省际联盟集中带量采购中选结果.xlsx",
+              "filepath_sha256": "363ae62f5ee92bfce396bf1b287a37bb6f207b326b66731dc56fa82021cbb35f",
+              "filesize": "1248",
+              "metadata_sha256": "357e5e0d497de41e9de54c400892abc80f613c23ff954683e12020e6412dfce1",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:28:10"
+            }
+          ],
+          "attachments_sha256": "f310744bb4541d1ea5f7b3b826748d9472602f09ba25a921cd2030723e8d98df",
+          "body_sha256": "620e5e836d213d680cb503c9a9ff0d2d4ba4598c2b724ee7ca483775438beae7",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "project_information",
+          "record_sha256": "237a18f29dee2856ae7bec26e9efa75f19938544442a1ca77a5aca3cf85cc09b",
+          "role": "primary",
+          "title": "广西壮族自治区医保局关于做好省际联盟输尿管支架类医用耗材集中带量采购和使用工作的通知",
+          "title_sha256": "3f3d9052d3b79e314c2c823cfbf2301f80c4c84e20c2a787ca41792ee32d4f69"
+        }
+      ],
+      "menu_code": "project_information",
+      "name": "广西壮族自治区医保局关于做好省际联盟输尿管支架类医用耗材集中带量采购和使用工作的通知",
+      "record_sha256": "237a18f29dee2856ae7bec26e9efa75f19938544442a1ca77a5aca3cf85cc09b",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "81a4fe2a-04ad-4591-9613-c717a9e688b0",
+              "menu_code": "project_information"
+            }
+          ]
+        }
+      },
+      "title": "广西壮族自治区医保局关于做好省际联盟输尿管支架类医用耗材集中带量采购和使用工作的通知"
+    },
+    {
+      "articleid": "d6fae12f-20e2-4448-a194-c4cc3e8ece54",
+      "capability_tags": [
+        "mapping_guide",
+        "multi_attachment",
+        "table_heavy"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 16,
+      "id": "fixed-9-nanning-mapping-tables",
+      "materials": [
+        {
+          "articleid": "d6fae12f-20e2-4448-a194-c4cc3e8ece54",
+          "attachment_count": 16,
+          "attachments": [
+            {
+              "articleattid": "124cd146-35ca-4e79-a2e4-9410fb78d256",
+              "content_hash_source": "raw_bytes",
+              "content_length": "19024",
+              "content_sha256": "6e07d7afd8a5e6d4b25023569ff2f1057a1a650c69006e5eb8ef3df12e559a8c",
+              "fileext": ".xlsx",
+              "filename": "2.广西超声检查类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "c3c543f0094ec367ef40b5943f7f6722beebc18a2ca00b25352dc47aa355fe8a",
+              "filesize": "",
+              "metadata_sha256": "e9733399c772836e0441a801e8a8c51c26a3bdb27a6207221241bdb41dfe1d6b",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "12504a1b-90d0-4284-9b1e-ae92761828e3",
+              "content_hash_source": "raw_bytes",
+              "content_length": "30810",
+              "content_sha256": "052840dc40a433c269c91861c6b74f0b996a43c020956be5e83802c47f903035",
+              "fileext": ".xlsx",
+              "filename": "8.广西呼吸系统类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "2bd7da69d63547cf22f80145dd9b7dfcfc8f322da5a93aa48241245111f09fa3",
+              "filesize": "",
+              "metadata_sha256": "fcbe2bcee0d4727d30ee8f3d7e7733187a15c365cac729fc7ab513e02ee1b9af",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "14cbf801-d202-472d-a5e2-ae1271c6a92d",
+              "content_hash_source": "raw_bytes",
+              "content_length": "72900",
+              "content_sha256": "0b626b569e5de68dc163d4c22d6916bb062354aef265feb90d0fc6ae9fec9c59",
+              "fileext": ".xlsx",
+              "filename": "5.广西神经系统类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "466d6119e3ba511b60c02b00d0ed64830629a716561536761e955115c40f4ce2",
+              "filesize": "",
+              "metadata_sha256": "27748999e753665f63f3275daeb96b4b856817ee329bb581adae1d154ec40dd7",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "3b5d3511-b7b9-4b02-ac11-276c71493906",
+              "content_hash_source": "raw_bytes",
+              "content_length": "31232",
+              "content_sha256": "ca025782aefef41c144902eda7937ded0c29cbfda2b6a2a3c4ce9e46071a52ec",
+              "fileext": ".xls",
+              "filename": "16.广西精神治疗类医疗服务价格项目映射关系表.xls",
+              "filepath_sha256": "e6e3d80edb74e1181b849e65209780fef5dac0603c111fa676f8f08bae8dba33",
+              "filesize": "",
+              "metadata_sha256": "0f99ae2a4fb3a2a7a5461c9e2488e8c6d114957c8eb0a6c02bd4ef76885b70c3",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "3f614971-4268-45bb-8115-22b879ae21fe",
+              "content_hash_source": "raw_bytes",
+              "content_length": "63774",
+              "content_sha256": "b059d2276dc226e5fb297d4428c230068382ea6b1a57f87a7338f2a77b5cfe4d",
+              "fileext": ".xlsx",
+              "filename": "13.广西口腔类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "d455f583000a77b220574962c2a729371dbfde5f0730cc68ed5e1295cc5985fb",
+              "filesize": "",
+              "metadata_sha256": "d79f53d95a616bdacb830320f669f168d64229c0cbf6a16545ba1d0f27cd377c",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "4c312ffe-00eb-44ce-92e4-f218edb9109f",
+              "content_hash_source": "raw_bytes",
+              "content_length": "43681",
+              "content_sha256": "ccc2e05f887477734b4caa9399264e7e2e0e29532c135427815ca4f53617c2aa",
+              "fileext": ".xlsx",
+              "filename": "12.广西泌尿系统类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "7cbb8cc34d37a22ae3e8617f627e73d3d20910daa6b7aeb172a92b450126d004",
+              "filesize": "",
+              "metadata_sha256": "e525ad79dbd24253c2898c6c4ff6d84f692c79bd1dd0a075173a7ebcd6bc4a47",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "60f07c4e-1758-4b8d-a145-e12031feb938",
+              "content_hash_source": "raw_bytes",
+              "content_length": "63865",
+              "content_sha256": "a5f2064740c0ecab926944eff4a2cae1a7623597a386825394ba46cdea21420a",
+              "fileext": ".xlsx",
+              "filename": "6.广西眼科类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "e44973d5de3b2229bf71b5c597fb2052df3df84b38aaa5cdbaa60ccb45c84526",
+              "filesize": "",
+              "metadata_sha256": "6097757a1ad421664668c697d167692f3d6cd90a02749ba501b52d3ed265e8b8",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "869f8262-d59e-4588-984b-01f9f2cfead0",
+              "content_hash_source": "raw_bytes",
+              "content_length": "13939",
+              "content_sha256": "4498b2229e1cd2ca8850be6bd094fb04bda1e60119d526ed41b67956d61584af",
+              "fileext": ".xlsx",
+              "filename": "3.广西血液系统类医疗服务价格项目立项指南映射关系表.xlsx",
+              "filepath_sha256": "6e7d487f08c404aafe0a7a1a4c1175edb9ba548624466eed508f9808a0b3ad45",
+              "filesize": "",
+              "metadata_sha256": "504398396eaafe4eeae3bb504dca83ffcd345a8bdcbd21ebb299bede7316436d",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "917cc160-91a6-4c20-9ef4-760bdff6bf5c",
+              "content_hash_source": "raw_bytes",
+              "content_length": "35965",
+              "content_sha256": "f2794ff29e380fc48e0430d42b5b6697837a527fca28030481f919ad68581317",
+              "fileext": ".xlsx",
+              "filename": "14.广西体被系统类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "7b4cfab720f4bb775b5e23db205564a2e3919d1b31ff3a0a0bc8c93273a601e7",
+              "filesize": "",
+              "metadata_sha256": "740b9e7c99e4a40ec4b86a0710168099b55ef3f44e2ca7a256e67d046e7ca073",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "9a32858b-2175-4b34-bed4-fbe3b10041f7",
+              "content_hash_source": "raw_bytes",
+              "content_length": "34651",
+              "content_sha256": "62fb73d9d92472c51259e4c2f23a3d8ca48193996d80f6d9f850e2664e4ede0e",
+              "fileext": ".xlsx",
+              "filename": "7.广西妇科类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "647a3806f19aae2d6619e874841ec1cd75bdef0a1a3ea4fb5f13594bd9c646ac",
+              "filesize": "",
+              "metadata_sha256": "5e0e533150ba2757c0a75e4283459e6ff6251aad4c6f1ec1cc36ec9b48585428",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "9f4e04b3-5cbe-4068-ab76-6becfaba45bc",
+              "content_hash_source": "raw_bytes",
+              "content_length": "108797",
+              "content_sha256": "7257a8df23298c9659d9389bf8810a804670a8db32b8007c29733686c00b46f4",
+              "fileext": ".xlsx",
+              "filename": "9.广西骨骼肌肉系统医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "d06e4a03bcae8c61303707ff23d22d5aec59eee74b5ce516fc9bfe65f3c814a1",
+              "filesize": "",
+              "metadata_sha256": "c36760a87b44a6fd72a374935c9b5918d831d4ae07a0a52210eebc53920e2279",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "a5765177-56ea-4ad6-9599-c1ee38e2d654",
+              "content_hash_source": "raw_bytes",
+              "content_length": "19017",
+              "content_sha256": "1cb78998209d9da139d2f5f7064949f3101218346a1fdfdc95cd13300efcd9b9",
+              "fileext": ".xlsx",
+              "filename": "1.广西综合诊查类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "72274846265c3bb29d7af66cf1cd9e17b34e08a44ad4e0100c708b1ae4d9a4b1",
+              "filesize": "",
+              "metadata_sha256": "fb3746f5de40d9942df5806cee6f8111efcb5c1d8e1be8e0c866e4c05cf97238",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "abfe6ac3-cfcd-4b91-bc26-15d46e389b45",
+              "content_hash_source": "raw_bytes",
+              "content_length": "19457",
+              "content_sha256": "b5dc0f7365b81508c5627c9c5e1775c02596a526e762bbaafd30d10c70c7b555",
+              "fileext": ".xlsx",
+              "filename": "15.广西放射治疗类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "c5b58b3aea01afccab6a64750c02499e4cbb57b0d4907accc1ca6718b5faca7a",
+              "filesize": "",
+              "metadata_sha256": "0e36a08fe2438dda222e290cf6f2886308480c648f20ff626da0e8050fe4bdda",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "c55bc485-8140-4c56-9113-215a0b226caa",
+              "content_hash_source": "raw_bytes",
+              "content_length": "56606",
+              "content_sha256": "306d2405857dbc642dbf2721d38a8eb34172724016c59344e509ca3a4d67dea3",
+              "fileext": ".xlsx",
+              "filename": "10.广西耳鼻喉科医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "b794c7427497513d374e61f8eed5e61770e0ea545ae07e2e97a981f5566f8194",
+              "filesize": "",
+              "metadata_sha256": "5d4700ae47c81b58ded211439a94e9d32c411b186f9e7f9e33b5977286890260",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "c93b9349-1bfb-49d6-bf2a-d8761f8435e7",
+              "content_hash_source": "raw_bytes",
+              "content_length": "18445",
+              "content_sha256": "eae0129c4cb6a12c79bd6408d4f9f4cf530e15ec0122176a029d01c642a1ff13",
+              "fileext": ".xlsx",
+              "filename": "4.广西康复类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "71f7bf31576c372b3f5323db36b4292b54cdd911011513180a8ec8e3d099b81b",
+              "filesize": "",
+              "metadata_sha256": "05984f8850bc84d468cddd84ff7b69ba460c8ebd5882c5ef31aa7845af582162",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            },
+            {
+              "articleattid": "ff2e8514-804c-4cec-8145-7258fa1aa910",
+              "content_hash_source": "raw_bytes",
+              "content_length": "60247",
+              "content_sha256": "b27096d18950ce6a96a9ae4861918c48cb5086e40e7b6db88bd9acb971639030",
+              "fileext": ".xlsx",
+              "filename": "11.广西心血管系统类医疗服务价格项目映射关系表.xlsx",
+              "filepath_sha256": "b2d296c813481a9decebded1c2e63f4d86efa36db9e07c26ce9126d5af552ece",
+              "filesize": "",
+              "metadata_sha256": "1640176ffa2ab6088356c023362011a9cf835808047508ef2b8c78c8628c7e74",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 20:14:26"
+            }
+          ],
+          "attachments_sha256": "6265e029afb865a3d63f7ddca0fa5b82bf5f2f99862d874979b39215849d6029",
+          "body_sha256": "4dcfaf8916c569b5fc29a01292752a9eebe3adc23df7931b2e768726a0ccc84e",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "lxzn",
+          "record_sha256": "18a380afec3cfd87cc7e034f674aef2b693793a0b0f041bacca39e8b49b63309",
+          "role": "primary",
+          "title": "广西壮族自治区南宁市关于发布综合诊查类等16批医疗服务立项指南映射关系表的公告",
+          "title_sha256": "38fbe889d3756f472856aa74dcf18d47db86ca843e562ec1c1749844e6ae8bf6"
+        }
+      ],
+      "menu_code": "lxzn",
+      "name": "广西壮族自治区南宁市关于发布综合诊查类等16批医疗服务立项指南映射关系表的公告",
+      "record_sha256": "18a380afec3cfd87cc7e034f674aef2b693793a0b0f041bacca39e8b49b63309",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "d6fae12f-20e2-4448-a194-c4cc3e8ece54",
+              "menu_code": "lxzn"
+            }
+          ]
+        }
+      },
+      "title": "广西壮族自治区南宁市关于发布综合诊查类等16批医疗服务立项指南映射关系表的公告"
+    },
+    {
+      "articleid": "5340b5c6-6faf-4a7c-aa25-ac5445c95e8f",
+      "capability_tags": [
+        "price_notice",
+        "multi_attachment",
+        "compact_pressure"
+      ],
+      "captured_at": "2026-07-14T15:34:29+08:00",
+      "expected_attachment_count": 29,
+      "id": "fixed-10-guizhou-29-attachments",
+      "materials": [
+        {
+          "articleid": "5340b5c6-6faf-4a7c-aa25-ac5445c95e8f",
+          "attachment_count": 29,
+          "attachments": [
+            {
+              "articleattid": "0e5519b0-98e7-45df-acec-b08690ec0103",
+              "content_hash_source": "raw_bytes",
+              "content_length": "13854",
+              "content_sha256": "c96769204fda7f222f01b74d06e4ca14e2afbc1b2f15b4536ff44a5ceb2feee5",
+              "fileext": ".xlsx",
+              "filename": "15-精神治疗类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "90cf1d417a2e159c1c94bef967ed6a6787c3b22a80e45d179f235c230346871e",
+              "filesize": "",
+              "metadata_sha256": "e8f1eb716dca57481cc297d9d827bbb326bf992a023076bd54a22d5f16ac5e6c",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "0ef55cd9-590a-442a-b080-62c37811b348",
+              "content_hash_source": "raw_bytes",
+              "content_length": "43108",
+              "content_sha256": "72823e8d193ec27d4537e04c257a4b45839a6bb770b70e98c072cc9ae305288c",
+              "fileext": ".xlsx",
+              "filename": "25-心血管系统类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "beaa84d26e9b8385eded3f80fa161b410251aa23497f7eeae544a85a3e54c303",
+              "filesize": "",
+              "metadata_sha256": "d66dc16b341a6f15c2f6fd5389cf9bb1a5a2557b0c3470d655f5b32a64b05fd2",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "10905533-ff8b-4139-b52b-05b399f1cc4e",
+              "content_hash_source": "raw_bytes",
+              "content_length": "23765",
+              "content_sha256": "c1167ec82127c913b2376c2d3f0638fbb77b88a31db05e3ff968700d9e5ac9b5",
+              "fileext": ".xlsx",
+              "filename": "12-综合诊查类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "72b015042c520458017229b6d7fdcbf82faa4b7e891338376a8138405a3eab78",
+              "filesize": "",
+              "metadata_sha256": "fc3cf364a974e90d669a427ab5468453386f0af786060c3ec0da300c984cc3b2",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "262f7ecd-4f42-4215-b1fb-09a520615b3b",
+              "content_hash_source": "raw_bytes",
+              "content_length": "68966",
+              "content_sha256": "339c8506b3bc4c84ffcfedafd52e65a1f9864a7fa57fc3e717e8aeac63cd4b3e",
+              "fileext": ".xlsx",
+              "filename": "24-骨骼肌肉系统类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "f049f32c440502bc17e98216a675cb304c6fc80faf8f89fc0a70569e6028370b",
+              "filesize": "",
+              "metadata_sha256": "34e7340f3ee86751706822260225d835ef99084b560bc8c5edd92bafae0f912c",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "33309546-c9b4-4388-8776-f09c6c46d01a",
+              "content_hash_source": "raw_bytes",
+              "content_length": "15705",
+              "content_sha256": "371a66abbc2ea1495c82626e941473cb51167b9338491d798f0715aefc7b60f5",
+              "fileext": ".xlsx",
+              "filename": "1-器官移植医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "b9d64ceac36abeadec315bc2134d81767d47cc0a3269ad86aeb74e1911218758",
+              "filesize": "",
+              "metadata_sha256": "250968ffb101204b1fe3de354839e924c83e850dc9b4ab91b3de4dc757f306ca",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "3471312d-8477-413b-9984-de25c3cde54f",
+              "content_hash_source": "raw_bytes",
+              "content_length": "14931",
+              "content_sha256": "b64a687eb69a33f0d890dbb5a1f226be5299aa4cb741352ed486037af5aa81bf",
+              "fileext": ".xlsx",
+              "filename": "2-临床量表评估医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "9280dd7cb1b5ff8f4305ba0230de625620f6f2e1c6fbcce4cece17c2cfd3d179",
+              "filesize": "",
+              "metadata_sha256": "c8c98d3446f137555a62f9b1fe06e0095ac3eed6635ebf29281675c2273e3449",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "35778802-ab4f-438c-b903-ef9e40db5ca1",
+              "content_hash_source": "raw_bytes",
+              "content_length": "19276",
+              "content_sha256": "42f76bdd92daf4c4d32f1e3425b5e82e1db88414108adc26641d2d4e5357cf7a",
+              "fileext": ".xlsx",
+              "filename": "14-康复类医疗服务价格项目映射关表.xlsx",
+              "filepath_sha256": "0477f0a435d73267a4ddeea3c3453cf203c871ecba118f6a8ad5032f242918ff",
+              "filesize": "",
+              "metadata_sha256": "dbb2ab37cde5d572e836ad39fc78228e43b8950f491f09751546f199afb4a203",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "38a92dd9-9526-4328-bdc4-c885c2546c57",
+              "content_hash_source": "raw_bytes",
+              "content_length": "38953",
+              "content_sha256": "0fd8034bbe7216c10192886f901ebf7ebd12294c5b407701ee1fc23a1205905e",
+              "fileext": ".xlsx",
+              "filename": "27-泌尿系统医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "ebc77cb5f899565401a26aa8a07b0719f9670995ee42186f95d428a645b487b1",
+              "filesize": "",
+              "metadata_sha256": "44ec8d355b51d5fe24ab88933d5756118ef8046ae5788d2befd7413648d20425",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "435af3b2-c098-4754-9146-ca649712eb3b",
+              "content_hash_source": "raw_bytes",
+              "content_length": "18399",
+              "content_sha256": "f680a5cb0741b159709fafcd9b684d4ec4696578e5705c4e2209d19177bc3bb8",
+              "fileext": ".xlsx",
+              "filename": "5-中医外治类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "2d11b08a6298d93c758e6a0d27d695fc282a329a8e801e25ac04681451bda814",
+              "filesize": "",
+              "metadata_sha256": "9c04e8683a0f2f91f25cdb625e5176effc0a7f48999d275c7ba1d722807eba73",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "57c9e668-1868-4b8d-bc99-357fd57de858",
+              "content_hash_source": "raw_bytes",
+              "content_length": "33131",
+              "content_sha256": "21d2c82c503241cb2f64fc18dd0fbf8015307887ee92eb3a784b08a1587fee4d",
+              "fileext": ".xlsx",
+              "filename": "26-神经系统类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "32450781c870580a019fc9274843d64b4c7bde1816a6b1e34f1446074e32f10c",
+              "filesize": "",
+              "metadata_sha256": "06c29afa51fb3e8b81d0dbddbf15caef0b85301604685a04139f365e685f606e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "6063cedc-8a37-4db1-8214-e74ccb728ca6",
+              "content_hash_source": "raw_bytes",
+              "content_length": "19885",
+              "content_sha256": "8d8289dd6c10e17de018b5e0f6f5c0baaf53d73d30c78260cad202bdf2b7a489",
+              "fileext": ".xlsx",
+              "filename": "10-放射治疗类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "fee258e3f98d4f1d75f2f1890eab7dd238b23c7a421e2dbdf9eb522750d11ca3",
+              "filesize": "",
+              "metadata_sha256": "a5fe1d88af6bcd80bb9d96f3f6fd7052514414751b67f40dc67c07a38e13678f",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "6064f799-4e80-42d8-ac12-4fc1ee53b01b",
+              "content_hash_source": "raw_bytes",
+              "content_length": "13331",
+              "content_sha256": "2d9e6e197bcab3f6a97fc7c81822b095f27b5afc580d2e0a7d848b67868aecd7",
+              "fileext": ".xlsx",
+              "filename": "21-血液系统医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "dd699148f2aaebdf85549c5ab368741c1490cd7e2c6e4783299005ef09353abb",
+              "filesize": "",
+              "metadata_sha256": "f93d2fd7d39cfaa9dadbd6fefa51a8caab7f58c2028ccebbc5e1e77fd36441ab",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "6276c36f-d073-4c72-8f70-135910dd09d8",
+              "content_hash_source": "raw_bytes",
+              "content_length": "15110",
+              "content_sha256": "6fc8b25bbe283a4823b6104105fd634a51892b04cff1e6c43cb0b117fab5e887",
+              "fileext": ".xlsx",
+              "filename": "9-护理类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "1523b8e18c5e67da858e5ebd26ea2a5499a28a530fe0222e29932b785e3e9164",
+              "filesize": "",
+              "metadata_sha256": "c035c7a71bc3e8afa08f5c84f9842c2bc4301b8d8c3ac3fbeccee419d6277cab",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "68f051b9-d58f-4053-a381-d618346dba38",
+              "content_hash_source": "raw_bytes",
+              "content_length": "41601",
+              "content_sha256": "5b43de1fdf257c3e48c4d6c94cbf9e3345426c1eb04bfb9b68f7bcf12d6d81b5",
+              "fileext": ".xlsx",
+              "filename": "23-耳鼻喉类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "13c2d78eff47f5a380972f3747751a9d5bc98cd24dd887f8691ee06f773297eb",
+              "filesize": "",
+              "metadata_sha256": "5ec12ef7e1d57caa28b6020855c31d0a36222377ac35dba2d54b21e61d2ed07e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "8bfdac25-8353-402c-b410-e491e89c3a14",
+              "content_hash_source": "raw_bytes",
+              "content_length": "29992",
+              "content_sha256": "750eee8fc944520de7d792bc9c5e5e08166c6c481763605ce1c2285b57a59eee",
+              "fileext": ".xlsx",
+              "filename": "17-妇科类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "90eba61843188c99030ebf0793da3d34311b578f758ec2e90349c497d8804fd5",
+              "filesize": "",
+              "metadata_sha256": "f1025ac24df231780b3bb5bc32f72f1535ef10bced87f6ce0e6526dfac4dfce5",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "947ac338-bfec-4b91-92cc-5654c7e97e89",
+              "content_hash_source": "raw_bytes",
+              "content_length": "24515",
+              "content_sha256": "9a165d528ce918150b315f2f51e7d33cb6a89d35f0ed5a6261b7c4c9fb713a2e",
+              "fileext": ".xlsx",
+              "filename": "22-呼吸系统医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "2ab57de9cd16561bdfbe1411e02c161c8d254c785a71349cb9c946866c69403e",
+              "filesize": "",
+              "metadata_sha256": "0574aa5373df7e319e93bf3e6f6fb3aa6e3b718efe3956d5a07ad2a294a7b243",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "9e4b437d-56ce-4608-b5ec-ca497bfcc4df",
+              "content_hash_source": "raw_bytes",
+              "content_length": "44847",
+              "content_sha256": "3e29b3d4f60b7b8c45d5d3ac3b0e056ed65ea2946e27d90b2a739fe922d8edec",
+              "fileext": ".xlsx",
+              "filename": "19-眼科类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "4e32dfed06452be58dd74c446985435e5f0ac121458450e553e908f23965daf7",
+              "filesize": "",
+              "metadata_sha256": "8997c17a7bf8664cb43d1bba82f613ebb2bbf6b3e6e8e36f13ff2f2f87202d95",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "a8bfce8a-9016-4c21-ae2b-fad9c97ea05f",
+              "content_hash_source": "raw_bytes",
+              "content_length": "16152",
+              "content_sha256": "6443f04c8ce5894f061c47e6f9926fdb50385a2b10249e43835fc6f5fa999b4a",
+              "fileext": ".xlsx",
+              "filename": "3-辅助生殖类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "a10621f90ae056ffa238207fb82629bfcb33c40ba7d6644eeffa9d71b39a5187",
+              "filesize": "",
+              "metadata_sha256": "bbc900a0643dbc3f2af2f6eb6873f5d86710fffb95b2f4cf8a5d5f2ba74c5559",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "c1a037fe-b4aa-4b2e-9a82-d39d0deeec8e",
+              "content_hash_source": "raw_bytes",
+              "content_length": "50979",
+              "content_sha256": "51a7a6aba352e6af335146745fc1d4396d2ccd0e145763fa8f009ab98fb65df9",
+              "fileext": ".xlsx",
+              "filename": "20-口腔类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "1ba7dd62d2b7690057d60e064b45df6d5ff7fcd61d0185c4ae5f2eec04bc1660",
+              "filesize": "",
+              "metadata_sha256": "3e61978dd0f8a2e29b6e9445b6e75d3309e0338b9836525005e9a28f0af2167b",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "c1e67fe2-63e6-48f5-8b0a-f131620081a3",
+              "content_hash_source": "raw_bytes",
+              "content_length": "32686",
+              "content_sha256": "44f6d2e999fb741a936c5e9a8b906cdc1f324669e7aa227bede7c09df2e64b9f",
+              "fileext": ".xlsx",
+              "filename": "28-体被系统医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "4b7478b984a733ea6cdb7979130c8848328bd1ac8bf7b739211373871553717d",
+              "filesize": "",
+              "metadata_sha256": "7ccadcc85e4b1abdd782be23285153d776cdec1a91ced9818eef2cc6abc6f716",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "c932b1f6-a464-422e-b46e-029e3b862ad0",
+              "content_hash_source": "raw_bytes",
+              "content_length": "20253",
+              "content_sha256": "84c9833f061c1cf0921806640dc012ee9bf4647f06ab9bd0613a5ec86f76ae19",
+              "fileext": ".xlsx",
+              "filename": "29-物理治疗类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "31a5061f43b852cac0211af69616da78a0c1a3101ce922a2a6c29b48ab2e6d6d",
+              "filesize": "",
+              "metadata_sha256": "19340d1ca0aedf76bce83e13c7e7366c2eefa3f6c11e4e8516f35ad1b82f6c56",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "d62966cc-d1d0-4d4b-af3c-94ea0ac08f9d",
+              "content_hash_source": "raw_bytes",
+              "content_length": "13408",
+              "content_sha256": "97665d7b4a87218d0c4abb2bdbb48df7e6f816e65407f197a09e3d3fe7c56dbe",
+              "fileext": ".xlsx",
+              "filename": "6-中医针法医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "15337ab7b3b34b462c812267a63528ef06019d2e5e103d3a860d6e3967eaa74e",
+              "filesize": "",
+              "metadata_sha256": "38f141a5750b926b7be22d332c68b2b0bd41f2fdee507e62c1957e1333f4492e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "d7e4110b-6666-46fe-9e4c-755e7f24d587",
+              "content_hash_source": "raw_bytes",
+              "content_length": "33478",
+              "content_sha256": "769f7cdda1cdad6bbb86533a5d15ba072a85b27b4b1a420eeb8536fbecaf5814",
+              "fileext": ".xlsx",
+              "filename": "13-放射检查类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "1c8f35830b44f2fd0d4bb6e9d1d365734ca7f88501974f705431300e662b3479",
+              "filesize": "",
+              "metadata_sha256": "dcdde4e2fbd9aaec5b756606f0dba85e5846d46c44e1ad6a3114ea4305ee778e",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "df1c77de-8239-413a-b715-4b30b1a77134",
+              "content_hash_source": "raw_bytes",
+              "content_length": "25423",
+              "content_sha256": "d4893fcee0051771f1e43c0c12eef29b0a7ef6250c36d81dc5f1bf55532e584b",
+              "fileext": ".xlsx",
+              "filename": "11-超声检查类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "a9f1cf7f7b63912a3474c4220f256f5d3afbd1f122650f04d7df7851d30ae78d",
+              "filesize": "",
+              "metadata_sha256": "b550c3a6035681bb505beb7731545cb032d5cc0ae482697e3ddb6b273425560b",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "eb2e6bfd-6ea6-474f-b50d-bf8d2e826dac",
+              "content_hash_source": "raw_bytes",
+              "content_length": "11763",
+              "content_sha256": "6fe24e5fd48726e28c9b3b00a16f31545c5f1fe528126f1d4a4dd9199c5dc3de",
+              "fileext": ".xlsx",
+              "filename": "8-中医特殊疗法类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "0b97b01048c0248d7803ae8774a8a6d3395cef242e3c1b692d0a191c18389782",
+              "filesize": "",
+              "metadata_sha256": "5d359685a95a380e5d8ece74d8561b79236dcb8dd8a1972a9e7395bf807d7384",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "ec21f06e-19fc-40e5-94dd-f50656365a50",
+              "content_hash_source": "raw_bytes",
+              "content_length": "13918",
+              "content_sha256": "e43d40c1eb63f744279b5f5c70ecc6f08d9035b2e3bcd8ed874f39c66343dabd",
+              "fileext": ".xlsx",
+              "filename": "7-中医骨伤类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "be0bbdfc43f0a220acdce2c568fe854bd0b6d6d9e473836f44219a96c17dbca5",
+              "filesize": "",
+              "metadata_sha256": "8530fe09cb486ed050e1ede6ea8e2a8f2ed6210824522a27de0e6b00f4e8a0e0",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "ef7783d4-2a78-446a-9535-203928a64e56",
+              "content_hash_source": "raw_bytes",
+              "content_length": "17338",
+              "content_sha256": "2191cbe21bca28c8a99f50be2a5b9dc1338a6296ce0ec151d6fabab84afae087",
+              "fileext": ".xlsx",
+              "filename": "18-产科类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "7f7f288dc1387af816bc65c62aad313803dbcd4c513630d2df96dfd4ed707af6",
+              "filesize": "",
+              "metadata_sha256": "e018d7f523fa70b1048b97c2fa2eb9b900173e9b62c41b309b81e5ed18169c7c",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "fc567135-02ef-428d-8af9-ff8963cb6cce",
+              "content_hash_source": "raw_bytes",
+              "content_length": "16188",
+              "content_sha256": "5df9ed2a70f4e55c9c1fed1e9f41b48a9f21e68068ea40caaef7f0b19fb777b2",
+              "fileext": ".xlsx",
+              "filename": "16-麻醉类医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "6fcb63bdf0bea8d328a12aee53f6ead88086d181083777e5b12105aad53ed768",
+              "filesize": "",
+              "metadata_sha256": "d94bc2da5c336218e503eeaa55d2861fe2c2cb5537f39dd8b0e94d3d0bf2d25c",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            },
+            {
+              "articleattid": "ff65cf55-13e6-4b5a-a06d-81d6b546979c",
+              "content_hash_source": "raw_bytes",
+              "content_length": "21317",
+              "content_sha256": "00f7a80a74ac6df4aa72a14a431843700155cb4f22896dc5eb8d7ef5b3a8a5d7",
+              "fileext": ".xlsx",
+              "filename": "4-中医类灸法拔罐推拿医疗服务价格项目映射表.xlsx",
+              "filepath_sha256": "b753e94003fc2cb4ecc6e0db308c804241ad1c372223481f1cb87cb739af54b3",
+              "filesize": "",
+              "metadata_sha256": "40fbc4ffe41869781c04eaf214ddbefb4235d05866c03b74b96c68fc51e5cbf4",
+              "sortnum": "",
+              "source_url": "",
+              "uploadtime": "2026-05-29 19:39:19"
+            }
+          ],
+          "attachments_sha256": "c209e36c51450b2a4baf8663394f65516eeb3dc2cee95097d8938f22172fdb99",
+          "body_sha256": "9ca155c79c24bcadfb0b40f18b918bdddd1874b82272010fd95c502c80a75fa3",
+          "captured_at": "2026-07-14T15:34:29+08:00",
+          "menu_code": "ylsf",
+          "record_sha256": "2d0dd239548e3562a6e3f32d2650f8d3d83a1eaaccc9d1ba517e13ce2ac009f5",
+          "role": "primary",
+          "title": "贵州省医疗服务价格项目映射表",
+          "title_sha256": "0d4790d3737eea289861362931a31659a5c84af67e8a7abba0dc4ea42644412e"
+        }
+      ],
+      "menu_code": "ylsf",
+      "name": "贵州省医疗服务价格项目映射表",
+      "record_sha256": "2d0dd239548e3562a6e3f32d2650f8d3d83a1eaaccc9d1ba517e13ce2ac009f5",
+      "replay": {
+        "method": "POST",
+        "path": "/analysis/prepare",
+        "request": {
+          "auxiliary_materials": [],
+          "primary_materials": [
+            {
+              "articleid": "5340b5c6-6faf-4a7c-aa25-ac5445c95e8f",
+              "menu_code": "ylsf"
+            }
+          ]
+        }
+      },
+      "title": "贵州省医疗服务价格项目映射表"
+    }
+  ],
+  "hash_algorithm": "sha256",
+  "manifest_version": "2026-07-14.3",
+  "schema_version": "8099.regression-manifest/v2",
+  "source": "production-record-detail-api",
+  "subsets": {
+    "fixed10": [
+      "fixed-1-shandong-incision-protector",
+      "fixed-2-xinjiang-imaging-cloud",
+      "fixed-3-coronary-stent-renewal",
+      "fixed-4-guizhou-project-analysis",
+      "fixed-5-national-payment-reform",
+      "fixed-6-changzhi-drg-result",
+      "fixed-7-heyuan-price-consultation",
+      "fixed-8-guangxi-ureteral-stent",
+      "fixed-9-nanning-mapping-tables",
+      "fixed-10-guizhou-29-attachments"
+    ],
+    "fixed3": [
+      "fixed-1-shandong-incision-protector",
+      "fixed-2-xinjiang-imaging-cloud",
+      "fixed-3-coronary-stent-renewal"
+    ]
+  }
+}

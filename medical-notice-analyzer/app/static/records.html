@@ -35,8 +35,8 @@
 
     body {
       margin: 0;
-      min-width: 1180px;
-      padding-bottom: 78px;
+      min-width: 0;
+      padding-bottom: 70px;
       background: #f5f7fb;
       color: var(--text);
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
@@ -52,10 +52,10 @@
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      height: 32px;
+      height: 30px;
       border: 1px solid var(--line-strong);
       border-radius: 6px;
-      padding: 0 11px;
+      padding: 0 10px;
       background: #fff;
       color: #344054;
       cursor: pointer;
@@ -66,7 +66,7 @@
     button:hover { border-color: #b8c2d6; color: #111827; }
     button:disabled { cursor: not-allowed; opacity: .5; }
     button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
-    button.primary:hover { background: var(--brand-dark); border-color: var(--brand-dark); color: #fff; }
+    button.primary:not(:disabled):hover { background: var(--brand-dark); border-color: var(--brand-dark); color: #fff; }
     button.secondary { background: #fff; }
     button.ghost { border-color: transparent; background: transparent; color: var(--blue); padding: 0 4px; }
     button.ghost:hover { background: var(--blue-soft); }
@@ -77,7 +77,7 @@
 
     input {
       width: 100%;
-      height: 34px;
+      height: 32px;
       border: 1px solid var(--line-strong);
       border-radius: 6px;
       padding: 7px 10px;
@@ -97,14 +97,14 @@
       gap: 6px;
       min-width: 0;
       color: #475467;
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 500;
     }
 
     a { color: var(--blue); text-decoration: none; }
     a:hover { text-decoration: underline; }
 
-    .page { padding: 0 24px 18px; }
+    .page { padding: 0 16px 16px; }
 
     .workspace {
       max-width: 1720px;
@@ -112,12 +112,12 @@
     }
 
     .app-header {
-      height: 58px;
+      height: 54px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin: 0 -24px 0;
-      padding: 0 24px;
+      margin: 0 -16px 0;
+      padding: 0 16px;
       border-bottom: 1px solid #e8edf5;
       background: linear-gradient(90deg, #fff, #f8fbff);
     }
@@ -186,20 +186,48 @@
 
     .filter-card {
       margin-top: 0;
-      padding: 11px 14px;
+      padding: 8px 12px;
       border-top: 0;
       border-radius: 0 0 8px 8px;
     }
 
     .filters {
       display: grid;
-      grid-template-columns: 1.15fr .9fr .9fr .9fr .95fr .8fr .8fr auto auto;
-      gap: 10px;
+      grid-template-columns: minmax(230px, 1.25fr) minmax(150px, .8fr) minmax(150px, .8fr) auto;
+      gap: 8px;
       align-items: end;
     }
 
+    .filter-actions {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .more-filter-toggle {
+      min-width: 104px;
+      color: #344054;
+    }
+
+    .more-filter-toggle.has-filters {
+      border-color: #9ec5ff;
+      background: var(--brand-soft);
+      color: var(--brand-dark);
+    }
+
+    .more-filters {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--line);
+    }
+
+    .more-filters[hidden] { display: none; }
+
     .workflow-steps {
-      height: 46px;
+      height: 40px;
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       align-items: center;
@@ -252,14 +280,18 @@
 
     .workspace-grid {
       display: grid;
-      grid-template-columns: minmax(650px, 1fr) 282px 246px;
+      grid-template-columns: minmax(0, 3fr) minmax(286px, 1fr);
       gap: 10px;
       align-items: stretch;
-      min-height: calc(100vh - 236px);
+      height: calc(100vh - 234px);
+      min-height: 430px;
     }
 
     .result-card {
       min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
       overflow: hidden;
     }
 
@@ -268,14 +300,14 @@
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      min-height: 42px;
-      padding: 10px 13px;
+      min-height: 38px;
+      padding: 7px 11px;
       border-bottom: 1px solid var(--line);
     }
 
     .section-title {
       margin: 0;
-      font-size: 15px;
+      font-size: 16px;
       font-weight: 750;
     }
 
@@ -291,9 +323,10 @@
 
     .table-wrap {
       position: relative;
-      overflow: auto;
-      min-height: 455px;
-      max-height: calc(100vh - 276px);
+      flex: 1;
+      min-height: 0;
+      overflow-x: hidden;
+      overflow-y: auto;
     }
 
     table {
@@ -303,49 +336,49 @@
       table-layout: fixed;
     }
 
+    .records-table {
+      border-spacing: 0 4px;
+    }
+
     thead th {
       position: sticky;
       top: 0;
       z-index: 1;
-      padding: 10px 9px;
+      padding: 7px 7px;
       background: #f8fafc;
       color: #667085;
       border-bottom: 1px solid var(--line);
-      font-size: 12px;
+      font-size: 13px;
       font-weight: 700;
       text-align: left;
       white-space: nowrap;
     }
 
     tbody td {
-      padding: 10px 8px;
+      padding: 6px 7px;
       border-bottom: 1px solid var(--line);
-      vertical-align: top;
+      vertical-align: middle;
       background: #fff;
     }
 
+    tbody tr {
+      cursor: pointer;
+    }
+
     tbody tr:hover td { background: #fbfdff; }
-    tbody tr.active td { background: #eef5ff; }
+    tbody tr.active:not(.selected-primary):not(.selected-auxiliary) td { background: #eef5ff; }
+    tbody tr.selected-primary td { background: #f0fbf5; }
+    tbody tr.selected-primary:hover td { background: #e9f8f0; }
+    tbody tr.selected-auxiliary td { background: #f7f3ff; }
+    tbody tr.selected-auxiliary:hover td { background: #f1ebff; }
+    tbody tr.selected-primary .title-cell { box-shadow: inset 3px 0 #12b76a; }
+    tbody tr.selected-auxiliary .title-cell { box-shadow: inset 3px 0 #8b5cf6; }
+    tbody tr:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
 
     .title-cell {
       position: relative;
       min-width: 0;
-      padding-left: 35px;
-    }
-
-    .row-selector {
-      position: absolute;
-      left: 12px;
-      top: 16px;
-      width: 13px;
-      height: 13px;
-      border: 1px solid #ced7e5;
-      border-radius: 50%;
-      background: #fff;
-    }
-
-    tr.active .row-selector {
-      border: 4px solid #2e73e8;
+      padding-left: 10px;
     }
 
     .nowrap-cell {
@@ -360,18 +393,19 @@
       -webkit-box-orient: vertical;
       overflow: hidden;
       color: #101828;
+      font-size: 13px;
       font-weight: 750;
-      line-height: 1.45;
+      line-height: 1.35;
     }
 
     .record-meta {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
       min-width: 0;
-      margin-top: 7px;
+      margin-top: 2px;
       color: #667085;
-      font-size: 11px;
+      font-size: 12px;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -387,10 +421,10 @@
       align-items: center;
       justify-content: center;
       max-width: 100%;
-      min-height: 24px;
+      min-height: 20px;
       border: 1px solid #dbeafe;
       border-radius: 5px;
-      padding: 2px 8px;
+      padding: 1px 6px;
       background: #eff6ff;
       color: #175cd3;
       font-size: 12px;
@@ -409,13 +443,14 @@
     .row-actions {
       display: flex;
       align-items: center;
-      justify-content: flex-start;
+      justify-content: flex-end;
       gap: 4px;
       flex-wrap: nowrap;
       min-width: 0;
     }
 
     .action-link {
+      min-width: 48px;
       height: 24px;
       border-color: #b9d6ff;
       border-radius: 4px;
@@ -435,47 +470,153 @@
     .action-link.auxiliary-choice { border-color: #d2bcff; color: var(--purple); }
 
     .selection-status {
+      min-width: 54px;
       min-height: 22px;
-      padding: 1px 7px;
+      padding: 1px 6px;
       font-size: 11px;
     }
 
+    th.action-column,
+    td.action-column {
+      position: sticky;
+      right: 0;
+      z-index: 2;
+      box-shadow: -5px 0 8px -8px rgba(16, 24, 40, .45);
+    }
+
+    thead th.action-column {
+      z-index: 4;
+      background: #f8fafc;
+    }
+
     .pager {
+      flex: 0 0 auto;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 10px;
-      min-height: 42px;
-      padding: 7px 14px;
+      gap: 9px;
+      min-height: 38px;
+      padding: 5px 12px;
+      border-top: 1px solid var(--line);
       color: var(--muted);
       background: #fff;
     }
 
-    .selection-card {
+    .pager button {
+      height: 26px;
+      border-color: transparent;
+      background: transparent;
+      color: #475467;
+    }
+
+    .pager button:not(:disabled):hover {
+      border-color: #d6e4fb;
+      background: var(--brand-soft);
+      color: var(--brand-dark);
+    }
+
+    .context-card {
+      min-width: 0;
+      min-height: 0;
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
+    .context-tabs {
+      flex: 0 0 auto;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      border-bottom: 1px solid var(--line);
+      background: #fff;
+    }
+
+    .context-tab {
+      position: relative;
+      height: 40px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: #667085;
+      font-weight: 700;
+    }
+
+    .context-tab:hover {
+      background: #f8fbff;
+      color: var(--brand-dark);
+    }
+
+    .context-tab.active {
+      color: var(--brand);
+    }
+
+    .context-tab.active::after {
+      content: "";
+      position: absolute;
+      left: 14px;
+      right: 14px;
+      bottom: -1px;
+      height: 2px;
+      background: var(--brand);
+    }
+
+    .context-tab-count {
+      margin-left: 4px;
+      color: inherit;
+      font-size: 11px;
+      font-weight: 650;
+    }
+
+    .context-panel {
+      min-width: 0;
+      min-height: 0;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .context-panel[hidden] {
+      display: none !important;
+    }
+
+    .selection-panel {
+      display: flex;
+      flex-direction: column;
+    }
+
+    .selection-panel-toolbar {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 34px;
+      padding: 5px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #fbfcfe;
+    }
+
     .selection-body {
-      padding: 11px;
+      min-height: 0;
+      flex: 1;
+      padding: 9px 10px;
       overflow: auto;
       display: grid;
-      gap: 13px;
+      align-content: start;
+      gap: 10px;
     }
 
     .selected-head {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      margin-bottom: 8px;
+      margin-bottom: 5px;
       font-weight: 750;
       color: #344054;
     }
 
     .selected-list {
       display: grid;
-      gap: 7px;
+      gap: 5px;
     }
 
     .selected-material-card {
@@ -484,7 +625,7 @@
       grid-template-columns: 28px minmax(0, 1fr) 20px;
       align-items: start;
       gap: 8px;
-      padding: 10px 8px;
+      padding: 7px 7px;
       border: 1px solid #e0e7f1;
       border-radius: 6px;
       background: #fbfcfe;
@@ -531,8 +672,8 @@
     .empty-card {
       display: grid;
       place-items: center;
-      min-height: 64px;
-      padding: 12px;
+      min-height: 52px;
+      padding: 9px;
       border: 1px dashed var(--line-strong);
       border-radius: 7px;
       background: #fcfcfd;
@@ -543,11 +684,11 @@
 
     .memory-module {
       display: grid;
-      gap: 10px;
-      padding: 12px;
+      gap: 7px;
+      padding: 9px;
       border: 1px solid #b9d8ff;
-      border-radius: 9px;
-      background: linear-gradient(145deg, #f5f9ff, #edf5ff);
+      border-radius: 7px;
+      background: #f3f8ff;
     }
 
     .memory-module-head {
@@ -566,8 +707,8 @@
     }
 
     .memory-module-icon {
-      width: 30px;
-      height: 30px;
+      width: 26px;
+      height: 26px;
       display: grid;
       place-items: center;
       border-radius: 7px;
@@ -631,18 +772,22 @@
       text-decoration: none;
     }
 
-    .detail-card {
+    .detail-panel {
       min-width: 0;
+      min-height: 0;
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
     .detail-body {
+      min-height: 0;
+      flex: 1;
       overflow: auto;
-      padding: 11px 12px;
+      padding: 9px 10px;
       display: grid;
-      gap: 14px;
+      align-content: start;
+      gap: 11px;
     }
 
     .detail-grid {
@@ -730,27 +875,27 @@
       display: grid;
       grid-template-columns: 1fr 1fr;
       gap: 10px;
-      padding: 14px 16px;
+      padding: 9px 10px;
       border-top: 1px solid var(--line);
       background: #fff;
     }
 
     .bottom-action-bar {
       position: fixed;
-      left: 24px;
-      right: 24px;
-      bottom: 8px;
+      left: 16px;
+      right: 16px;
+      bottom: 6px;
       z-index: 40;
-      min-height: 64px;
+      min-height: 52px;
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 18px;
+      gap: 14px;
       max-width: 1672px;
       margin: 0 auto;
-      padding: 10px 14px 10px 18px;
+      padding: 7px 10px 7px 14px;
       border: 1px solid #dce3ee;
-      border-radius: 9px;
+      border-radius: 7px;
       background: rgba(255,255,255,.96);
       box-shadow: 0 12px 34px rgba(15, 23, 42, .14);
       backdrop-filter: blur(12px);
@@ -784,21 +929,76 @@
     .bottom-stat.memory b.enabled { color: var(--green); }
 
     .bottom-actions button {
-      height: 40px;
-      min-width: 132px;
+      height: 36px;
+      min-width: 142px;
       font-weight: 750;
     }
 
     .bottom-actions .generate-button {
-      min-width: 210px;
+      min-width: 190px;
       background: #1677ff;
       border-color: #1677ff;
       box-shadow: 0 4px 12px rgba(22, 119, 255, .2);
     }
 
-    .bottom-actions .generate-button:hover {
+    .bottom-actions .generate-button:not(:disabled):hover {
       background: #1264d6;
       border-color: #1264d6;
+    }
+
+    .bottom-actions .generate-button:disabled {
+      opacity: 1;
+      border-color: #8fc2ff;
+      background: #a9d0ff;
+      color: #fff;
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+
+    .generate-button-guard {
+      position: relative;
+      display: inline-flex;
+      border-radius: 6px;
+      outline: none;
+    }
+
+    .generate-button-guard:focus-visible {
+      box-shadow: 0 0 0 3px rgba(22, 119, 255, .2);
+    }
+
+    .generate-tooltip {
+      position: absolute;
+      right: 0;
+      bottom: calc(100% + 8px);
+      z-index: 60;
+      width: max-content;
+      max-width: 220px;
+      padding: 6px 9px;
+      border-radius: 5px;
+      background: #101828;
+      color: #fff;
+      font-size: 11px;
+      line-height: 1.4;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(3px);
+      transition: opacity .14s ease, transform .14s ease;
+    }
+
+    .generate-tooltip::after {
+      content: "";
+      position: absolute;
+      right: 20px;
+      top: 100%;
+      border: 5px solid transparent;
+      border-top-color: #101828;
+    }
+
+    .generate-button-guard[data-disabled="true"]:hover .generate-tooltip,
+    .generate-button-guard[data-disabled="true"]:focus .generate-tooltip,
+    .generate-button-guard[data-disabled="true"]:focus-within .generate-tooltip {
+      opacity: 1;
+      transform: translateY(0);
     }
 
     .loading {
@@ -898,12 +1098,6 @@
 
     .pack-actions .wide {
       grid-column: 1 / -1;
-    }
-    .cache-result {
-      display: grid;
-      gap: 8px;
-      padding-top: 8px;
-      border-top: 1px solid var(--line);
     }
     .attachment-options {
       border: 1px solid var(--line);
@@ -1043,23 +1237,33 @@
     .toast.error { border-color: #fecdca; background: var(--danger-soft); color: var(--danger); }
     .toast.success { border-color: #abefc6; background: var(--green-soft); color: #067647; }
 
-    @media (max-width: 1240px) {
-      body { min-width: 1024px; }
-      .workspace-grid { grid-template-columns: minmax(600px, 1fr) 272px; }
-      .detail-card { display: none; }
+    @media (max-width: 1180px) {
+      .workspace-grid {
+        grid-template-columns: minmax(0, 2.5fr) minmax(276px, 1fr);
+      }
     }
 
-    @media (max-width: 860px) {
-      body { padding-bottom: 144px; }
+    @media (max-width: 1040px) {
+      .col-type,
+      .col-attachment {
+        display: none;
+      }
+    }
+
+    @media (max-width: 900px) {
+      body { padding-bottom: 136px; }
       .page { padding: 10px; }
       .app-header { margin: -10px -10px 0; padding: 0 12px; }
-      .workspace-grid { display: block; }
-      .result-card, .selection-card { margin-bottom: 10px; }
-      .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .selection-card {
-        position: static;
-        max-height: none;
+      .workspace-grid {
+        height: auto;
+        min-height: 0;
+        grid-template-columns: minmax(0, 1fr);
       }
+      .result-card { height: 560px; }
+      .context-card { min-height: 500px; }
+      .filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .filter-actions { justify-content: flex-start; }
+      .more-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .bottom-action-bar {
         left: 8px;
         right: 8px;
@@ -1075,6 +1279,53 @@
       .bottom-actions { gap: 8px; }
       .bottom-actions button { min-width: 0; flex: 1; }
       .bottom-actions .generate-button { min-width: 0; }
+    }
+
+    @media (max-width: 680px) {
+      body { padding-bottom: 0; }
+      .header-tools > span:not(.user-chip) { display: none; }
+      .brand-copy strong { font-size: 14px; }
+      .filters,
+      .more-filters {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .filter-actions {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .filter-actions button { min-width: 0; }
+      .workflow-steps { padding: 0; }
+      .workflow-step { gap: 5px; }
+      .workflow-step:not(:last-child)::after {
+        left: calc(50% + 42px);
+        right: calc(-50% + 42px);
+      }
+      .col-date,
+      .col-area {
+        display: none;
+      }
+      .bottom-summary {
+        justify-content: flex-start;
+        overflow-x: auto;
+      }
+      .bottom-action-bar {
+        position: static;
+        width: auto;
+        margin: 10px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .header-tools .user-chip { font-size: 0; }
+      .bottom-actions {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .bottom-action-bar { min-height: 150px; }
+      .generate-button-guard,
+      .generate-button-guard .generate-button {
+        width: 100%;
+      }
     }
   </style>
 </head>
@@ -1092,6 +1343,7 @@
           </div>
         </div>
         <div class="header-tools">
+          <a id="analysisHistoryLink" href="/analysis-history-ui" hidden>分析历史</a>
           <span>ⓘ 帮助中心</span>
           <span class="user-chip"><span class="user-avatar">医</span> 医保分析员⌄</span>
         </div>
@@ -1108,20 +1360,31 @@
           <label>项目阶段
             <input name="projectphase" placeholder="请选择阶段">
           </label>
-          <label>项目类型
-            <input name="projecttype" placeholder="请选择类型">
-          </label>
-          <label>菜单名称/编码
-            <input name="menu_code" placeholder="请输入名称或编码">
-          </label>
-          <label>开始日期
-            <input name="start_date" type="date">
-          </label>
-          <label>结束日期
-            <input name="end_date" type="date">
-          </label>
-          <button class="primary" type="submit">搜索</button>
-          <button class="secondary" type="button" id="resetBtn">重置</button>
+          <div class="filter-actions">
+            <button class="primary" type="submit">搜索</button>
+            <button class="secondary" type="button" id="resetBtn">重置</button>
+            <button
+              class="secondary more-filter-toggle"
+              type="button"
+              id="moreFiltersBtn"
+              aria-expanded="false"
+              aria-controls="moreFiltersPanel"
+            >更多筛选（<span id="moreFilterCount">0</span>）<span id="moreFilterChevron" aria-hidden="true">⌄</span></button>
+          </div>
+          <div class="more-filters" id="moreFiltersPanel" hidden>
+            <label>项目类型
+              <input name="projecttype" placeholder="请选择类型">
+            </label>
+            <label>菜单名称/编码
+              <input name="menu_code" placeholder="请输入名称或编码">
+            </label>
+            <label>开始日期
+              <input name="start_date" type="date">
+            </label>
+            <label>结束日期
+              <input name="end_date" type="date">
+            </label>
+          </div>
         </form>
       </section>
 
@@ -1153,16 +1416,16 @@
         </div>
         <div class="table-wrap" id="tableWrap">
           <div class="loading">正在加载文章...</div>
-          <table>
+          <table class="records-table">
             <thead>
               <tr>
                 <th>标题</th>
-                <th style="width: 108px;">发布时间</th>
-                <th style="width: 66px;">地区</th>
-                <th style="width: 82px;">项目阶段</th>
-                <th style="width: 82px;">项目类型</th>
-                <th style="width: 66px;">附件</th>
-                <th style="width: 98px;">操作</th>
+                <th class="col-date" style="width: 94px;">发布时间</th>
+                <th class="col-area" style="width: 106px;">地区</th>
+                <th class="col-phase" style="width: 74px;">项目阶段</th>
+                <th class="col-type" style="width: 70px;">项目类型</th>
+                <th class="col-attachment" style="width: 58px;">附件</th>
+                <th class="action-column" style="width: 116px;">操作</th>
               </tr>
             </thead>
             <tbody id="recordsBody"></tbody>
@@ -1170,62 +1433,91 @@
           <div class="empty-state" id="emptyState">没有找到符合条件的文章，请调整筛选条件后重试。</div>
         </div>
         <div class="pager">
-          <span id="pageInfo">第 1 / 1 页</span>
-          <button class="secondary small" type="button" id="prevPage">上一页</button>
-          <button class="secondary small" type="button" id="nextPage">下一页</button>
+          <span id="totalPagesInfo">共 0 页</span>
+          <button class="secondary small" type="button" id="prevPage">‹ 上一页</button>
+          <span id="pageInfo">1 / 1</span>
+          <button class="secondary small" type="button" id="nextPage">下一页 ›</button>
         </div>
         </section>
 
-        <aside class="card selection-card" aria-labelledby="selectionTitle">
-        <div class="card-head">
-          <h2 class="section-title" id="selectionTitle">已选材料</h2>
-          <button class="ghost small" type="button" id="clearSelectionBtn">清空</button>
-        </div>
-        <div class="selection-body">
-          <section>
-            <div class="selected-head">
-              <span>主材料</span>
-              <span id="primaryCount">0/3</span>
-            </div>
-            <div class="selected-list" id="primaryList"></div>
-          </section>
-          <section>
-            <div class="selected-head">
-              <span>辅助材料</span>
-              <span id="auxiliaryCount">0/10</span>
-            </div>
-            <div class="selected-list" id="auxiliaryList"></div>
-          </section>
-          <section class="memory-module" aria-labelledby="memoryModuleTitle">
-            <div class="memory-module-head">
-              <div class="memory-module-title" id="memoryModuleTitle">
-                <span class="memory-module-icon" aria-hidden="true">▤</span>
-                <span>报告记忆库</span>
-              </div>
-              <label class="switch" title="启用报告记忆库">
-                <input id="useReportMemory" type="checkbox" checked aria-label="启用报告记忆库">
-                <span class="switch-track"></span>
-              </label>
-            </div>
-            <span class="muted">用于参考历史分析经验、写作规则和常用表达，不会覆盖当前公告事实。</span>
-            <a class="memory-manage-link" href="/memory-ui">管理记忆库</a>
-          </section>
-          <div class="preview-box" id="previewResult"></div>
-        </div>
-        </aside>
+        <aside class="card context-card" aria-label="材料上下文">
+          <div class="context-tabs" role="tablist" aria-label="材料信息">
+            <button
+              class="context-tab active"
+              id="selectionTab"
+              type="button"
+              role="tab"
+              aria-selected="true"
+              aria-controls="selectionPanel"
+            >已选材料 <span class="context-tab-count" id="contextSelectionCount">0/13</span></button>
+            <button
+              class="context-tab"
+              id="detailTab"
+              type="button"
+              role="tab"
+              aria-selected="false"
+              aria-controls="detailPanel"
+            >文章详情</button>
+          </div>
 
-        <aside class="card detail-card" aria-labelledby="detailHeading">
-          <div class="card-head">
-            <h2 class="section-title" id="detailHeading">文章详情</h2>
-            <span class="muted">•••</span>
-          </div>
-          <div class="detail-body" id="detailBody">
-            <div class="empty-card">请选择文章查看详情。</div>
-          </div>
-          <div class="detail-footer">
-            <button class="primary" type="button" id="detailPrimaryBtn" disabled>设为主材料</button>
-            <button class="secondary" type="button" id="detailAuxBtn" disabled>设为辅助材料</button>
-          </div>
+          <section
+            class="context-panel selection-panel"
+            id="selectionPanel"
+            role="tabpanel"
+            aria-labelledby="selectionTab"
+          >
+            <div class="selection-panel-toolbar">
+              <span class="muted">主材与辅助材料</span>
+              <button class="ghost small" type="button" id="clearSelectionBtn">清空</button>
+            </div>
+            <div class="selection-body">
+              <section>
+                <div class="selected-head">
+                  <span>主材料</span>
+                  <span id="primaryCount">0/3</span>
+                </div>
+                <div class="selected-list" id="primaryList"></div>
+              </section>
+              <section>
+                <div class="selected-head">
+                  <span>辅助材料</span>
+                  <span id="auxiliaryCount">0/10</span>
+                </div>
+                <div class="selected-list" id="auxiliaryList"></div>
+              </section>
+              <section class="memory-module" aria-labelledby="memoryModuleTitle">
+                <div class="memory-module-head">
+                  <div class="memory-module-title" id="memoryModuleTitle">
+                    <span class="memory-module-icon" aria-hidden="true">▤</span>
+                    <span>报告记忆库</span>
+                  </div>
+                  <label class="switch" title="启用报告记忆库">
+                    <input id="useReportMemory" type="checkbox" checked aria-label="启用报告记忆库">
+                    <span class="switch-track"></span>
+                  </label>
+                </div>
+                <span class="muted">仅参考结构、风格与历史偏好，不作为当前公告事实来源。</span>
+                <a class="memory-manage-link" href="/memory-ui">管理记忆库</a>
+              </section>
+              <div class="preview-box" id="previewResult"></div>
+            </div>
+          </section>
+
+          <section
+            class="context-panel detail-panel"
+            id="detailPanel"
+            role="tabpanel"
+            aria-labelledby="detailTab"
+            hidden
+          >
+            <div class="detail-body" id="detailBody">
+              <div class="empty-card">点击文章标题或行内空白区域查看详情。</div>
+            </div>
+            <div class="detail-footer">
+              <button class="primary" type="button" id="detailPrimaryBtn" disabled>设为主材料</button>
+              <button class="secondary" type="button" id="detailAuxBtn" disabled>设为辅助材料</button>
+            </div>
+          </section>
         </aside>
       </div>
     </div>
@@ -1247,10 +1539,18 @@
       </span>
     </div>
     <div class="bottom-actions">
-      <button class="secondary" id="checkMaterialCacheBtn" type="button">检查材料缓存</button>
-      <button class="secondary" id="buildMaterialCacheBtn" type="button">预构建材料缓存</button>
       <button class="secondary" id="reparseAttachmentsBtn" type="button">↻ 重新解析附件</button>
-      <button class="primary generate-button" id="confirmBtn" type="button">生成分析报告</button>
+      <div
+        class="generate-button-guard"
+        id="generateButtonGuard"
+        data-disabled="true"
+        tabindex="0"
+        aria-disabled="true"
+        aria-describedby="generateButtonTooltip"
+      >
+        <button class="primary generate-button" id="confirmBtn" type="button" disabled>生成分析报告</button>
+        <span class="generate-tooltip" id="generateButtonTooltip" role="tooltip">请至少选择1条主材料</span>
+      </div>
     </div>
   </footer>
 
@@ -1275,7 +1575,6 @@
       lastPrepareResult: null,
       lastForceRefresh: false,
       lastRunResult: null,
-      lastMaterialCacheResult: null,
       toastTimer: null,
     };
 
@@ -1372,6 +1671,55 @@
       return `<span class="tag ${className}" title="${escapeHtml(text)}">${escapeHtml(text)}</span>`;
     }
 
+    function isMeaningfulMeta(value) {
+      const text = String(value ?? '').trim();
+      return Boolean(text) && !['-', '--', '—', 'null', 'undefined', '暂无', '无'].includes(text.toLowerCase());
+    }
+
+    function recordMetaHtml(item) {
+      const parts = [
+        ['来源', item.source],
+        ['菜单', item.menu_name || item.menu_code],
+        ['机构', item.publicorg],
+      ].filter(([, value]) => isMeaningfulMeta(value));
+      if (!parts.length) return '';
+      const title = parts.map(([label, value]) => `${label}：${value}`).join(' / ');
+      return `
+        <div class="record-meta" title="${escapeHtml(title)}">
+          ${parts.map(([label, value]) => `<span>${label}：${escapeHtml(value)}</span>`).join('')}
+        </div>
+      `;
+    }
+
+    function switchContextTab(name) {
+      const showSelection = name !== 'detail';
+      $('selectionTab').classList.toggle('active', showSelection);
+      $('selectionTab').setAttribute('aria-selected', String(showSelection));
+      $('selectionPanel').hidden = !showSelection;
+      $('detailTab').classList.toggle('active', !showSelection);
+      $('detailTab').setAttribute('aria-selected', String(!showSelection));
+      $('detailPanel').hidden = showSelection;
+    }
+
+    function updateMoreFilterCount() {
+      const fields = ['projecttype', 'menu_code', 'start_date', 'end_date'];
+      const count = fields.reduce((total, name) => {
+        const control = $('filters').elements.namedItem(name);
+        return total + (control && String(control.value || '').trim() ? 1 : 0);
+      }, 0);
+      $('moreFilterCount').textContent = String(count);
+      $('moreFiltersBtn').classList.toggle('has-filters', count > 0);
+    }
+
+    function updateGenerateButtonState() {
+      const missingPrimary = state.primary.length < 1;
+      const guard = $('generateButtonGuard');
+      $('confirmBtn').disabled = missingPrimary;
+      guard.dataset.disabled = String(missingPrimary);
+      guard.tabIndex = missingPrimary ? 0 : -1;
+      guard.setAttribute('aria-disabled', String(missingPrimary));
+    }
+
     function showToast(message, type = 'warning') {
       const toast = $('toast');
       toast.textContent = message;
@@ -1392,6 +1740,7 @@
     function paramsFromForm() {
       const data = new FormData($('filters'));
       const params = new URLSearchParams({ page: state.page, page_size: state.pageSize });
+      params.set('sort', 'project_notice_first');
       for (const [key, value] of data.entries()) {
         const trimmed = String(value).trim();
         if (trimmed) params.set(key, trimmed);
@@ -1432,10 +1781,24 @@
       }
     }
 
+    async function initializeHistoryNavigation() {
+      const link = $('analysisHistoryLink');
+      if (!link) return;
+      try {
+        const response = await fetch('/health', { headers: { Accept: 'application/json' } });
+        if (!response.ok) return;
+        const health = await response.json();
+        link.hidden = health.analysis_history_ui_enabled !== true;
+      } catch (_error) {
+        link.hidden = true;
+      }
+    }
+
     function renderPager(data) {
       const page = data.page || state.page;
       const totalPages = state.totalPages || 1;
-      $('pageInfo').textContent = `第 ${page} / ${totalPages} 页`;
+      $('totalPagesInfo').textContent = `共 ${state.totalPages} 页`;
+      $('pageInfo').textContent = `${page} / ${totalPages}`;
       $('resultSummary').textContent = `共 ${state.total} 条`;
       $('prevPage').disabled = state.page <= 1;
       $('nextPage').disabled = state.totalPages === 0 || state.page >= state.totalPages;
@@ -1455,26 +1818,26 @@
         const selected = selectionType(item);
         const active = state.detailRecord && keyOf(state.detailRecord) === key;
         return `
-          <tr class="${active ? 'active' : ''}">
+          <tr
+            class="${active ? 'active' : ''}${selected ? ` selected-${selected}` : ''}"
+            tabindex="0"
+            data-menu-code="${escapeHtml(item.menu_code)}"
+            data-articleid="${escapeHtml(item.articleid)}"
+            aria-label="查看文章详情：${escapeHtml(item.title)}"
+          >
             <td class="title-cell">
-              <span class="row-selector" aria-hidden="true"></span>
               <div class="record-title" title="${escapeHtml(item.title)}">${escapeHtml(item.title)}</div>
-              <div class="record-meta" title="${escapeHtml([item.source, item.menu_name || item.menu_code, item.publicorg].filter(Boolean).join(' / '))}">
-                <span>来源：${escapeHtml(item.source || '-')}</span>
-                <span>菜单：${escapeHtml(item.menu_name || item.menu_code || '-')}</span>
-                <span>机构：${escapeHtml(item.publicorg || '-')}</span>
-              </div>
+              ${recordMetaHtml(item)}
             </td>
-            <td class="nowrap-cell" title="${escapeHtml(shortDateTime(item.audittime))}">${escapeHtml(shortDateTime(item.audittime))}</td>
-            <td class="nowrap-cell" title="${escapeHtml(item.areaname || '-')}">${escapeHtml(item.areaname || '-')}</td>
-            <td>${tag(item.projectphase, 'green')}</td>
-            <td>${tag(item.projecttype, 'purple')}</td>
-            <td>${tag(`附件 ${item.attachment_count}`, 'gray')}</td>
-            <td>
+            <td class="nowrap-cell col-date" title="${escapeHtml(shortDate(item.audittime))}">${escapeHtml(shortDate(item.audittime))}</td>
+            <td class="nowrap-cell col-area" title="${escapeHtml(item.areaname || '-')}">${escapeHtml(item.areaname || '-')}</td>
+            <td class="col-phase">${tag(item.projectphase, 'green')}</td>
+            <td class="col-type">${tag(item.projecttype, 'purple')}</td>
+            <td class="col-attachment">${tag(`附件 ${item.attachment_count}`, 'gray')}</td>
+            <td class="action-column">
               <div class="row-actions">
-                <button class="action-link" type="button" data-action="detail" data-menu-code="${escapeHtml(item.menu_code)}" data-articleid="${escapeHtml(item.articleid)}">详情</button>
                 ${selected
-                  ? `<span class="tag selection-status ${selected === 'primary' ? 'green' : 'purple'}">${selected === 'primary' ? '已选主材' : '已选辅助'}</span>`
+                  ? `<span class="tag selection-status ${selected === 'primary' ? 'green' : 'purple'}">${selected === 'primary' ? '✓主材' : '✓辅助'}</span>`
                   : `
                     <button class="action-link primary-choice" type="button" data-action="primary" data-key="${escapeHtml(key)}">主材</button>
                     <button class="action-link auxiliary-choice" type="button" data-action="auxiliary" data-key="${escapeHtml(key)}">辅助</button>
@@ -1512,7 +1875,6 @@
       target.push(normalized);
       state.lastPrepareResult = null;
       state.lastRunResult = null;
-      state.lastMaterialCacheResult = null;
       $('previewResult').classList.remove('show');
       $('previewResult').textContent = '';
       renderSelected();
@@ -1525,7 +1887,6 @@
       state[type] = state[type].filter((row) => keyOf(row) !== key);
       state.lastPrepareResult = null;
       state.lastRunResult = null;
-      state.lastMaterialCacheResult = null;
       $('previewResult').classList.remove('show');
       $('previewResult').textContent = '';
       renderSelected();
@@ -1538,7 +1899,6 @@
       state.auxiliary = [];
       state.lastPrepareResult = null;
       state.lastRunResult = null;
-      state.lastMaterialCacheResult = null;
       $('previewResult').classList.remove('show');
       $('previewResult').textContent = '';
       renderSelected();
@@ -1570,96 +1930,14 @@
 
       $('primaryCount').textContent = `${state.primary.length}/3`;
       $('auxiliaryCount').textContent = `${state.auxiliary.length}/10`;
+      $('contextSelectionCount').textContent = `${state.primary.length + state.auxiliary.length}/13`;
       $('bottomPrimaryCount').textContent = `${state.primary.length}/3`;
       $('bottomAuxiliaryCount').textContent = `${state.auxiliary.length}/10`;
-      $('confirmBtn').disabled = state.primary.length < 1;
-      $('checkMaterialCacheBtn').disabled = state.primary.length < 1;
-      $('buildMaterialCacheBtn').disabled = state.primary.length < 1;
-    }
-
-    function selectedPayload(extra = {}) {
-      return {
-        primary_materials: state.primary.map(({ menu_code, articleid }) => ({ menu_code, articleid })),
-        auxiliary_materials: state.auxiliary.map(({ menu_code, articleid }) => ({ menu_code, articleid })),
-        ...extra,
-      };
-    }
-
-    function renderMaterialCacheResult(data, actionLabel) {
-      state.lastMaterialCacheResult = data;
-      const summary = data.summary || {};
-      $('previewResult').classList.add('show');
-      $('previewResult').innerHTML = `
-        <div class="cache-result">
-          <strong>${escapeHtml(actionLabel)}</strong>
-          <div class="pack-stats">
-            <div class="pack-stat"><span>命中</span><b>${escapeHtml(summary.hit_count ?? 0)}</b></div>
-            <div class="pack-stat"><span>未命中</span><b>${escapeHtml(summary.miss_count ?? 0)}</b></div>
-            <div class="pack-stat"><span>已构建</span><b>${escapeHtml(summary.built_count ?? 0)}</b></div>
-          </div>
-          <div class="pack-stats">
-            <div class="pack-stat"><span>失效</span><b>${escapeHtml(summary.stale_count ?? 0)}</b></div>
-            <div class="pack-stat"><span>损坏</span><b>${escapeHtml(summary.corrupt_count ?? 0)}</b></div>
-            <div class="pack-stat"><span>失败</span><b>${escapeHtml(summary.failed_count ?? 0)}</b></div>
-          </div>
-          <div class="muted">仅检查或构建当前已选材料；报告正文和 Word 不会包含缓存内部信息。</div>
-        </div>
-      `;
-    }
-
-    async function checkMaterialCache() {
-      if (state.primary.length < 1) {
-        showToast('请至少选择 1 条主分析材料。', 'warning');
-        return;
-      }
-      const button = $('checkMaterialCacheBtn');
-      const originalText = button.textContent;
-      button.disabled = true;
-      button.textContent = '检查中...';
-      try {
-        const response = await fetch('/analysis/material-cache/check', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(selectedPayload()),
-        });
-        if (!response.ok) throw new Error(await readError(response));
-        renderMaterialCacheResult(await response.json(), '材料缓存检查结果');
-      } catch (error) {
-        showToast(`材料缓存检查失败：${error.message}`, 'error');
-      } finally {
-        button.disabled = state.primary.length < 1;
-        button.textContent = originalText;
-      }
-    }
-
-    async function buildMaterialCache() {
-      if (state.primary.length < 1) {
-        showToast('请至少选择 1 条主分析材料。', 'warning');
-        return;
-      }
-      const button = $('buildMaterialCacheBtn');
-      const originalText = button.textContent;
-      button.disabled = true;
-      button.textContent = '构建中...';
-      try {
-        const response = await fetch('/analysis/material-cache/build', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(selectedPayload({
-            levels: ['material/full', 'primary/light', 'primary/safe', 'auxiliary/summary'],
-          })),
-        });
-        if (!response.ok) throw new Error(await readError(response));
-        renderMaterialCacheResult(await response.json(), '材料缓存构建结果');
-      } catch (error) {
-        showToast(`材料缓存构建失败：${error.message}`, 'error');
-      } finally {
-        button.disabled = state.primary.length < 1;
-        button.textContent = originalText;
-      }
+      updateGenerateButtonState();
     }
 
     async function showDetail(menuCode, articleId) {
+      switchContextTab('detail');
       try {
         $('detailBody').innerHTML = '<div class="empty-card">正在加载文章详情...</div>';
         $('detailPrimaryBtn').disabled = true;
@@ -1687,13 +1965,16 @@
       const sourceLink = item.sourceurl
         ? `<a href="${escapeHtml(item.sourceurl)}" target="_blank" rel="noreferrer">${escapeHtml(item.sourceurl)}</a>`
         : '-';
+      const organizationRow = isMeaningfulMeta(item.publicorg)
+        ? `<dt>发布机构</dt><dd>${escapeHtml(item.publicorg)}</dd>`
+        : '';
       $('detailBody').innerHTML = `
         <h3 class="detail-title">${escapeHtml(item.title)}</h3>
         <dl class="detail-grid">
           <dt>发布时间</dt><dd>${escapeHtml(shortDateTime(item.audittime))}</dd>
           <dt>地区</dt><dd>${escapeHtml(item.areaname || '-')}</dd>
           <dt>来源</dt><dd>${escapeHtml(item.source || '-')}</dd>
-          <dt>发布机构</dt><dd>${escapeHtml(item.publicorg || '-')}</dd>
+          ${organizationRow}
           <dt>原文链接</dt><dd>${sourceLink}</dd>
         </dl>
         <section class="detail-section">
@@ -1874,24 +2155,17 @@
       return qualityCheck.passed ? '通过' : '未通过';
     }
 
-    function isExportBlocked(qualityCheck, qualityGate, status) {
-      return false;
-    }
-
     function renderRunResult(runData, reportData = null) {
       state.lastRunResult = { run: runData, report: reportData };
       const warnings = reportData?.warnings || runData?.warnings || [];
       const remainingIssues = reportData?.remaining_issues || runData?.remaining_issues || [];
       const qualityCheck = reportData?.quality_check || runData?.quality_check || {};
-      const qualityGate = reportData?.quality_gate || runData?.quality_gate || {};
-      const exportBlocked = isExportBlocked(qualityCheck, qualityGate, runData?.status);
-      const downloadAttrs = exportBlocked ? ' disabled title="质量门禁未通过，暂不可下载 Word"' : '';
       const reportHtml = reportData ? `
         <div class="report-preview">
           <strong>${escapeHtml(reportData.report_title || runData.report_title || '分析报告')}</strong>
           <div class="muted">质检：${escapeHtml(qualityText(qualityCheck))} · 版本：${escapeHtml(reportData.version || runData.version || 1)}</div>
           <div class="report-actions">
-            <button class="primary small" type="button" data-action="download-run-report" data-run-id="${escapeHtml(runData.run_id || '')}"${downloadAttrs}>下载 Word</button>
+            <button class="primary small" type="button" data-action="download-run-report" data-run-id="${escapeHtml(runData.run_id || '')}">下载 Word</button>
             <button class="secondary small" type="button" data-action="copy-report-markdown">复制 Markdown</button>
           </div>
           <div class="report-markdown">${renderMarkdown(reportData.report_markdown || '')}</div>
@@ -1958,8 +2232,8 @@
       } catch (error) {
         showToast(`报告生成失败：${error.message}`, 'error');
       } finally {
-        button.disabled = state.primary.length < 1;
         button.textContent = '生成分析报告';
+        updateGenerateButtonState();
       }
     }
 
@@ -1994,7 +2268,7 @@
       } catch (error) {
         showToast(`证据包生成失败：${error.message}`, 'error');
       } finally {
-        $('confirmBtn').disabled = state.primary.length < 1;
+        updateGenerateButtonState();
         $('reparseAttachmentsBtn').disabled = false;
         targetButton.textContent = originalText;
       }
@@ -2008,9 +2282,24 @@
 
     $('resetBtn').addEventListener('click', () => {
       $('filters').reset();
+      $('moreFiltersPanel').hidden = true;
+      $('moreFiltersBtn').setAttribute('aria-expanded', 'false');
+      $('moreFilterChevron').textContent = '⌄';
+      updateMoreFilterCount();
       state.page = 1;
       loadRecords();
     });
+
+    $('moreFiltersBtn').addEventListener('click', () => {
+      const panel = $('moreFiltersPanel');
+      const willOpen = panel.hidden;
+      panel.hidden = !willOpen;
+      $('moreFiltersBtn').setAttribute('aria-expanded', String(willOpen));
+      $('moreFilterChevron').textContent = willOpen ? '⌃' : '⌄';
+    });
+
+    $('filters').addEventListener('input', updateMoreFilterCount);
+    $('filters').addEventListener('change', updateMoreFilterCount);
 
     $('refreshBtn').addEventListener('click', loadRecords);
 
@@ -2028,23 +2317,35 @@
       }
     });
 
+    function openRecordDetail(row) {
+      if (!row) return;
+      showDetail(row.dataset.menuCode, row.dataset.articleid);
+    }
+
     $('recordsBody').addEventListener('click', (event) => {
-      const button = event.target.closest('button');
-      if (!button) return;
-      const action = button.dataset.action;
-      if (action === 'detail') {
-        showDetail(button.dataset.menuCode, button.dataset.articleid);
-        return;
-      }
-      if (action === 'primary' || action === 'auxiliary') {
+      const button = event.target.closest('button[data-action]');
+      if (button) {
+        const action = button.dataset.action;
         const item = state.records.find((row) => keyOf(row) === button.dataset.key);
         if (item) addMaterial(action, item);
+        return;
       }
+      openRecordDetail(event.target.closest('tr[data-menu-code]'));
+    });
+
+    $('recordsBody').addEventListener('keydown', (event) => {
+      if (!['Enter', ' '].includes(event.key) || event.target.closest('button')) return;
+      const row = event.target.closest('tr[data-menu-code]');
+      if (!row) return;
+      event.preventDefault();
+      openRecordDetail(row);
     });
 
     $('primaryList').addEventListener('click', handleRemoveClick);
     $('auxiliaryList').addEventListener('click', handleRemoveClick);
     $('clearSelectionBtn').addEventListener('click', clearSelection);
+    $('selectionTab').addEventListener('click', () => switchContextTab('selection'));
+    $('detailTab').addEventListener('click', () => switchContextTab('detail'));
 
     function handleRemoveClick(event) {
       const button = event.target.closest('button[data-action="remove"]');
@@ -2053,8 +2354,6 @@
     }
 
     $('confirmBtn').addEventListener('click', () => confirmSelection(false, true));
-    $('checkMaterialCacheBtn').addEventListener('click', checkMaterialCache);
-    $('buildMaterialCacheBtn').addEventListener('click', buildMaterialCache);
     $('reparseAttachmentsBtn').addEventListener('click', () => confirmSelection(true));
     $('previewResult').addEventListener('click', (event) => {
       const button = event.target.closest('button');
@@ -2080,8 +2379,11 @@
       $('bottomMemoryStatus').classList.toggle('enabled', enabled);
     });
 
+    updateMoreFilterCount();
+    switchContextTab('selection');
     renderSelected();
     renderDetail();
+    initializeHistoryNavigation();
     loadRecords();
   </script>
 </body>

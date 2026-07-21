@@ -15,6 +15,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,30 +40,82 @@ from PIL import Image, ImageDraw, ImageFont
 from pydantic import BaseModel, Field, HttpUrl
 from pypdf import PdfReader
 
-from app.attachment_cache import cache_dir as attachment_parse_cache_dir
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
-from app.core.llm import LLMProviderError, get_llm_provider
-from app.core.evidence import annotate_evidence_pack_v3_lite
-from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
-from app.core.quality import analysis_run_export_precheck
-from app.core.workflow.engine import run_local_workflow
-from app.core.workflow.state import WorkflowBackend, make_workflow_node
-from app.core.workflow.store import WorkflowRunStore, WorkflowRunStoreError
-from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
-from app.material_compression_cache import (
-    MaterialCacheSignature,
-    MaterialCompressionCacheRepository,
-    attachment_options_hash,
-    make_material_cache_key,
-    material_attachment_hash,
-    material_cache_db_path,
-    material_cache_enabled,
-    material_source_hash,
+from app.attachment_task_process import (
+    AttachmentTaskProcessError,
+    AttachmentTaskProcessTimeout,
+    run_attachment_task_isolated,
 )
-from app.material_compressor import SUPPORTED_MATERIAL_VIEW_TYPES, build_material_compression_view
-from app.ops_health import cleanup_local_storage, directory_snapshot, file_snapshot, summarize_json_directory
+from app.pdf_table_parser import rule_version as pdf_table_rule_version
+from app.compact_pack import (
+    CompactPolicyError,
+    annotate_secondary_compression,
+    mandatory_evidence_retention,
+    protected_evidence_items,
+    reduce_optional_evidence,
+    secondary_compression_plan,
+)
+from app.compact_cache import CompactCache, CompactCacheError, compact_cache_enabled, compact_content_view
+from app.analysis_history import (
+    AnalysisHistoryStore,
+    HistoryTopologyError,
+    enrich_record_with_pack_identity,
+)
+from app.core.memory import MemoryItem, MemoryItemStore, format_memory_items_for_prompt, memory_items_path, retrieve_scoped_memory_items
+from app.dify_attribution import (
+    ProviderResponseError,
+    canonical_provider_failure_code,
+    extract_provider_output,
+    provider_stage_from_exception,
+)
+from app.diagnostics import build_pack_diagnostics, build_run_diagnostics, build_run_progress
+from app.evidence_schema import (
+    EvidenceValidationError,
+    create_evidence_item,
+    read_evidence_pack,
+    validate_evidence_pack,
+)
+from app.formal_body import FormalBodyDocument
+from app.formal_body_safety import (
+    FormalBodySafetyError,
+    publish_docx_atomically,
+    sanitize_formal_body,
+    scan_docx,
+    scan_formal_body,
+)
+from app.generation.base import ReportGenerationResult, ReportGenerator
+from app.generation.dify_generator import DifyReportGenerator
+from app.layered_diagnostics import (
+    FAILURE_SCHEMA_VERSION,
+    build_failure_attribution,
+    make_layer_result,
+)
+from app.pipeline_timing import DEFAULT_TIMINGS, PipelineTiming, normalize_pipeline_timings
+from app.quality_gate import QualityGate
+from app.run_checkpoints import (
+    CheckpointCorruptionError,
+    CheckpointError,
+    RunCheckpointStore,
+    hash_checkpoint_value,
+    publish_file_once,
+)
+from app.schema_migrations import (
+    REPORT_IR_SCHEMA_VERSION,
+    upgrade_report_ir_schema,
+    upgrade_run_schema,
+)
+from app.repair_pipeline import (
+    fail_closed_controlled_repair,
+    ForbiddenPhraseRepairer,
+    RepairPipeline,
+    StructureRepairer,
+    parse_repair_count,
+    strict_delivery_gate_enabled,
+    UnsupportedFactRepairer,
+)
+from app.vbp_facts import enrich_vbp_facts, vbp_fact_extraction_enabled
 from app.report_memory import (
     MemoryContentError,
     MemoryKind,
@@ -102,6 +155,18 @@ DEFAULT_MAX_COMBINED_CHARS = 120_000
 CHATFLOW_SAFE_MAX_COMBINED_CHARS = 60_000
 DEFAULT_MAX_ATTACHMENTS = 25
 DEFAULT_REPORT_TITLE = "医药器械采购项目分析报告"
+WORD_EXPORT_DISABLED_CODE = "WORD_EXPORT_DISABLED"
+WORD_EXPORT_DISABLED_MESSAGE = "Word 发布当前已暂停"
+WORD_BODY_SAFETY_FAILED_CODE = "WORD_BODY_SAFETY_FAILED"
+WORD_BODY_SAFETY_FAILED_MESSAGE = "正式报告正文未通过安全发布检查"
+WORD_EXPORT_LOCATOR_FIELDS = (
+    "word_download_url",
+    "download_url",
+    "word_filename",
+    "word_file_path",
+    "word_path",
+)
+WORD_EXPORT_METADATA_FIELDS = ("word_exported_at",)
 DEFAULT_DISCLAIMER = (
     "本文基于互联网公开资料进行整理，目的在于传递分享信息，仅供读者参考之用。"
     "本网站不保证信息的准确性、有效性、及时性和完整性。"
@@ -210,6 +275,7 @@ class ReportSection(BaseModel):
 
 
 class ReportIR(BaseModel):
+    schema_version: int = Field(default=REPORT_IR_SCHEMA_VERSION, ge=1, le=REPORT_IR_SCHEMA_VERSION)
     title: str = ""
     suggested_filename: str = ""
     notice_type: str = ""
@@ -226,6 +292,7 @@ class ExportReportRequest(BaseModel):
     title: str = Field(default=DEFAULT_REPORT_TITLE)
     markdown: str = ""
     report_ir: ReportIR | None = None
+    evidence_text: str = ""
     strict_quality: bool = Field(default=True)
 
 
@@ -233,6 +300,7 @@ class ExportReportResponse(BaseModel):
     success: bool = True
     filename: str
     download_url: str
+    timings: dict[str, Any] = Field(default_factory=dict)
 
 
 class RenderReportRequest(ExportReportRequest):
@@ -264,6 +332,7 @@ class CheckedExportReportResponse(BaseModel):
     blocked: bool = False
     qa_summary: str = ""
     report_markdown: str = ""
+    timings: dict[str, Any] = Field(default_factory=dict)
 
 
 class ReportQAIssue(BaseModel):
@@ -384,11 +453,6 @@ class SelectionPreviewRequest(BaseModel):
     attachment_headers: dict[str, str] = Field(default_factory=dict)
 
 
-class MaterialCacheBuildRequest(SelectionPreviewRequest):
-    levels: list[str] = Field(default_factory=lambda: list(SUPPORTED_MATERIAL_VIEW_TYPES))
-    force_refresh_cache: bool = False
-
-
 class SelectionPreviewResponse(BaseModel):
     success: bool
     primary_materials: list[RecordListItem]
@@ -410,29 +474,50 @@ class AnalysisRunRequest(BaseModel):
     use_report_memory: bool = False
 
 
+class AnalysisRecoveryRequest(BaseModel):
+    recovery_id: str = Field(min_length=1, max_length=120)
+
+
 class AnalysisRunResponse(BaseModel):
     success: bool
     run_id: str
     pack_id: str
     status: str
+    run_status: str = "running"
     workflow_run_id: str = ""
+    provider_run_id: str = ""
     report_title: str = ""
     quality_passed: bool | None = None
     version: int = 1
     warnings: list[str] = Field(default_factory=list)
-    input_hash: str = ""
-    idempotency_reused: bool = False
-
-
-class AnalysisRunControlResponse(BaseModel):
-    success: bool
-    action: str
-    run_id: str
-    status: str
-    pack_id: str = ""
-    new_run_id: str = ""
-    workflow_run_id: str = ""
-    warnings: list[str] = Field(default_factory=list)
+    deliverable: bool = False
+    draft_word_export_available: bool = False
+    final_word_export_available: bool = False
+    word_export_available: bool = False
+    needs_manual_review: bool = False
+    failure_schema_version: str = ""
+    primary_layer: str = ""
+    primary_failure_code: str = ""
+    secondary_failure_codes: list[str] = Field(default_factory=list)
+    quality_failure_codes: list[str] = Field(default_factory=list)
+    generation_failure_codes: list[str] = Field(default_factory=list)
+    blocking_issue_codes: list[str] = Field(default_factory=list)
+    fallback_used: bool = False
+    fallback_reason: str = ""
+    fallback_provider: str = ""
+    repair_attempted: bool = False
+    repair_success: bool = False
+    repair_count: int = 0
+    repair_actions: list[Any] = Field(default_factory=list)
+    manual_review_reason_summary: str = ""
+    final_blocking_reason: str = ""
+    provider: str = "dify"
+    generator_version: str = ""
+    prompt_version: str = ""
+    workflow_version: str = ""
+    compact_pack_chars: int = 0
+    input_strategy: str = ""
+    timings: dict[str, Any] = Field(default_factory=dict)
 
 
 class AnalysisRunReportResponse(BaseModel):
@@ -532,32 +617,25 @@ app = FastAPI(title="Medical Notice Analyzer", version="0.1.0")
 REPORT_DIR = Path(os.getenv("REPORT_DIR", "/tmp/medical-notice-reports"))
 SITE_CACHE_DIR = Path(os.getenv("SITE_CACHE_DIR", "/app/site-cache"))
 DEFAULT_PUBLIC_BASE_URL = "http://192.168.34.88:8099"
-_ANALYSIS_RUN_CREATE_LOCK = threading.Lock()
+URL_ANALYZE_DISABLED_CODE = "URL_ANALYZE_DISABLED"
+URL_ANALYZE_DISABLED_MESSAGE = "URL 输入分析已下线，请从数据库选材页面选择材料生成 pack_id。"
+_ANALYSIS_RECOVERY_LOCK = threading.RLock()
 
 
 @app.on_event("startup")
 def _cleanup_attachment_parse_cache_on_start() -> None:
-    if _env_bool("ATTACHMENT_PARSE_CACHE_CLEANUP_ON_START", True):
-        try:
-            result = cleanup_cache()
-            if result.get("deleted_files"):
-                logger.info(
-                    "attachment_parse_cache_cleanup deleted_files=%s freed_bytes=%s",
-                    result.get("deleted_files"),
-                    result.get("freed_bytes"),
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("attachment_parse_cache_cleanup_failed error_type=%s", exc.__class__.__name__)
+    if not _env_bool("ATTACHMENT_PARSE_CACHE_CLEANUP_ON_START", True):
+        return
     try:
-        recovery = _recover_stale_pending_analysis_runs()
-        if recovery.get("recovered_count"):
-            logger.warning(
-                "analysis_run_startup_recovered_stale_pending checked_count=%s recovered_count=%s",
-                recovery.get("checked_count"),
-                recovery.get("recovered_count"),
+        result = cleanup_cache()
+        if result.get("deleted_files"):
+            logger.info(
+                "attachment_parse_cache_cleanup deleted_files=%s freed_bytes=%s",
+                result.get("deleted_files"),
+                result.get("freed_bytes"),
             )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("analysis_run_startup_recovery_failed error_type=%s", exc.__class__.__name__)
+        logger.warning("attachment_parse_cache_cleanup_failed error_type=%s", exc.__class__.__name__)
 
 ARTICLE_LIST_FIELDS = [
     "menu_code",
@@ -613,7 +691,11 @@ ATTACHMENT_FIELDS = [
 async def log_requests(request: Request, call_next):
     started = time.perf_counter()
     try:
-        response = await call_next(request)
+        word_endpoint = _word_export_route_template(request.method, request.url.path)
+        if word_endpoint and not _word_export_enabled():
+            response = _word_export_disabled_response(word_endpoint)
+        else:
+            response = await call_next(request)
     except Exception:
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         logger.exception(
@@ -645,167 +727,14 @@ def health() -> dict[str, Any]:
         "public_base_url": public_base_url,
         "report_dir_configured": bool((os.getenv("REPORT_DIR") or "").strip()),
         "report_dir": str(REPORT_DIR),
+        "word_export_enabled": _word_export_enabled(),
+        "analysis_history_ui_enabled": _analysis_history_ui_enabled(),
+        "run_checkpoints_enabled": _analysis_checkpoints_enabled(),
+        "run_recovery_enabled": _analysis_recovery_enabled(),
+        "compact_cache_enabled": compact_cache_enabled(),
+        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
         "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
-    }
-
-
-@app.get("/health/db")
-def health_db(check: bool = Query(False, description="Run a lightweight SELECT 1 database check")) -> dict[str, Any]:
-    cfg = _db_config()
-    configured = bool(cfg.get("database") and cfg.get("user"))
-    payload: dict[str, Any] = {
-        "success": True,
-        "component": "db",
-        "dependency_class": "external_database",
-        "status": "configured" if configured else "unconfigured",
-        "configured": configured,
-        "checked": False,
-        "config": {
-            "host": cfg.get("host") or "",
-            "port": cfg.get("port") or 0,
-            "database": cfg.get("database") or "",
-            "user_configured": bool(cfg.get("user")),
-            "charset": cfg.get("charset") or "",
-        },
-    }
-    if not check or not configured:
-        return payload
-    started = time.perf_counter()
-    payload["checked"] = True
-    try:
-        row = _db_fetch_one("SELECT 1 AS ok", [])
-        payload["status"] = "ok" if row is not None else "error"
-        payload["result"] = "select_1_ok" if row is not None else "select_1_empty"
-    except HTTPException as exc:
-        payload["status"] = "error"
-        payload["error"] = {"code": "DB_CHECK_FAILED", "status_code": exc.status_code, "message": str(exc.detail)}
-    except Exception as exc:  # noqa: BLE001
-        payload["status"] = "error"
-        payload["error"] = {"code": "DB_CHECK_FAILED", "error_type": exc.__class__.__name__}
-    payload["latency_ms"] = int((time.perf_counter() - started) * 1000)
-    return payload
-
-
-@app.get("/health/llm")
-def health_llm() -> dict[str, Any]:
-    backend = _selected_workflow_backend().value
-    base_url = (os.getenv("DIFY_BASE_URL") or "").strip().rstrip("/")
-    endpoint = (os.getenv("DIFY_REPORT_WORKFLOW_ENDPOINT") or "/workflows/run").strip() or "/workflows/run"
-    api_key_configured = bool((os.getenv("DIFY_WORKFLOW_API_KEY") or "").strip())
-    dify_configured = bool(base_url and api_key_configured)
-    provider_name = (os.getenv("LLM_PROVIDER") or "mock").strip().lower() or "mock"
-    local_provider: dict[str, Any] = {"provider": provider_name, "status": "configured"}
-    try:
-        provider = get_llm_provider(provider_name)
-        local_provider["provider"] = provider.provider
-        local_provider["model"] = provider.model
-    except LLMProviderError as exc:
-        local_provider = {"provider": provider_name, "status": "error", "error_code": exc.code}
-    status = "configured" if (backend == WorkflowBackend.DIFY_LEGACY.value and dify_configured) else "unconfigured"
-    if backend == WorkflowBackend.LOCAL_ENGINE.value:
-        status = "ok" if local_provider.get("status") != "error" else "error"
-    return {
-        "success": True,
-        "component": "llm",
-        "dependency_class": "workflow_or_model_provider",
-        "status": status,
-        "workflow_backend": backend,
-        "dify": {
-            "configured": dify_configured,
-            "base_url": base_url,
-            "endpoint": endpoint,
-            "api_key_configured": api_key_configured,
-            "response_mode": (os.getenv("DIFY_RESPONSE_MODE") or "blocking").strip() or "blocking",
-        },
-        "local_provider": local_provider,
-    }
-
-
-def _storage_health_payload() -> dict[str, Any]:
-    stores = [
-        directory_snapshot("reports", REPORT_DIR, patterns=["*.docx"]),
-        directory_snapshot("site_cache", SITE_CACHE_DIR),
-        directory_snapshot("attachment_parse_cache", attachment_parse_cache_dir(), patterns=["*.json"]),
-        directory_snapshot("database_packs", _database_evidence_pack_dir(), patterns=["pack_*.json"]),
-        directory_snapshot("analysis_runs", _analysis_run_dir(), patterns=["run_*.json"]),
-        file_snapshot("material_compression_cache", material_cache_db_path()),
-    ]
-    error_statuses = {"error", "not_directory"}
-    status = "degraded" if any(item.get("status") in error_statuses for item in stores) else "ok"
-    return {
-        "success": True,
-        "component": "storage",
-        "dependency_class": "local_filesystem",
-        "status": status,
-        "stores": stores,
-    }
-
-
-@app.get("/health/storage")
-def health_storage() -> dict[str, Any]:
-    return _storage_health_payload()
-
-
-def _parse_cleanup_scopes(scope: str) -> list[str]:
-    scopes = [item.strip().lower() for item in str(scope or "").split(",") if item.strip()]
-    scopes = scopes or ["all"]
-    allowed = {"all", "reports", "attachment_parse_cache"}
-    unknown = sorted(set(scopes) - allowed)
-    if unknown:
-        raise HTTPException(status_code=422, detail=f"unknown cleanup scope: {', '.join(unknown)}")
-    if "all" in scopes:
-        return ["all"]
-    return list(dict.fromkeys(scopes))
-
-
-@app.post("/ops/cleanup")
-def ops_cleanup(
-    scope: str = Query("all", description="Comma-separated cleanup scopes: all,reports,attachment_parse_cache"),
-    dry_run: bool = Query(True),
-    max_delete: int = Query(100, ge=0, le=1000),
-) -> dict[str, Any]:
-    scopes = _parse_cleanup_scopes(scope)
-    result = cleanup_local_storage(
-        scopes=scopes,
-        report_dir=REPORT_DIR,
-        attachment_cache_dir=attachment_parse_cache_dir(),
-        report_retention_hours=_env_int("REPORT_RETENTION_HOURS", 168),
-        dry_run=dry_run,
-        max_delete=max_delete,
-    )
-    logger.info(
-        "ops_cleanup_completed scopes=%s dry_run=%s max_delete=%s deleted_files=%s freed_bytes=%s",
-        ",".join(result.get("scopes") or []),
-        dry_run,
-        max_delete,
-        result.get("total_deleted_files"),
-        result.get("total_freed_bytes"),
-    )
-    return result
-
-
-@app.get("/ops/diagnostics")
-def ops_diagnostics() -> dict[str, Any]:
-    storage = _storage_health_payload()
-    return {
-        "success": True,
-        "service": "medical-notice-analyzer",
-        "version": app.version,
-        "diagnostics": {
-            "storage": storage,
-            "analysis_runs": summarize_json_directory(_analysis_run_dir(), "run_*.json"),
-            "database_packs": summarize_json_directory(_database_evidence_pack_dir(), "pack_*.json"),
-            "dependencies": {
-                "db": health_db(check=False),
-                "llm": health_llm(),
-            },
-            "cleanup": {
-                "available_scopes": ["reports", "attachment_parse_cache"],
-                "default_dry_run": True,
-                "max_delete_limit": 1000,
-            },
-        },
     }
 
 
@@ -825,6 +754,76 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if not value:
         return default
     return value in {"1", "true", "yes", "on"}
+
+
+def _url_analyze_enabled() -> bool:
+    return _env_bool("ENABLE_URL_ANALYZE", False)
+
+
+def _word_export_enabled() -> bool:
+    return _env_bool("ENABLE_WORD_EXPORT", False)
+
+
+def _word_export_disabled_response(endpoint: str) -> JSONResponse:
+    logger.warning("word_export_disabled endpoint=%s", endpoint)
+    response = _analysis_error(503, WORD_EXPORT_DISABLED_CODE, WORD_EXPORT_DISABLED_MESSAGE)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _word_body_safety_failed_response(endpoint: str, detail: str = "") -> JSONResponse:
+    logger.warning("word_body_safety_failed endpoint=%s", endpoint)
+    response = _analysis_error(
+        409,
+        WORD_BODY_SAFETY_FAILED_CODE,
+        WORD_BODY_SAFETY_FAILED_MESSAGE,
+        detail,
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+def _word_export_route_template(method: str, path: str) -> str:
+    if method == "POST" and path in {"/report/export", "/report/export_checked"}:
+        return path
+    if method == "GET" and path.startswith("/analysis/runs/") and path.endswith("/download"):
+        return "/analysis/runs/{run_id}/download"
+    if method == "GET" and path.startswith("/download/"):
+        return "/download/{filename}"
+    return ""
+
+
+def _project_notice_priority_enabled() -> bool:
+    return _env_bool("ENABLE_PROJECT_NOTICE_PRIORITY", True)
+
+
+def _records_order_by(sort: str = "") -> str:
+    normalized = (sort or "").strip().lower()
+    if not normalized:
+        normalized = "project_notice_first" if _project_notice_priority_enabled() else "latest"
+    if normalized == "latest":
+        return "ORDER BY a.audittime DESC"
+    if normalized == "project_notice_first":
+        return "ORDER BY CASE WHEN a.menu_name = '项目公告' THEN 0 ELSE 1 END, a.audittime DESC"
+    raise HTTPException(status_code=422, detail="Invalid records sort")
+
+
+def _url_analyze_disabled_response(endpoint: str, raw_url: str) -> JSONResponse:
+    logger.warning(
+        "url_analyze_disabled_endpoint_access endpoint=%s url=%s",
+        endpoint,
+        _safe_url_for_log(raw_url),
+    )
+    return JSONResponse(
+        status_code=410,
+        content={
+            "success": False,
+            "error": {
+                "code": URL_ANALYZE_DISABLED_CODE,
+                "message": URL_ANALYZE_DISABLED_MESSAGE,
+            },
+        },
+    )
 
 
 def _db_connect():
@@ -1010,6 +1009,8 @@ def _database_pack_path(pack_id: str) -> Path:
 
 
 def _write_database_evidence_pack(pack: dict[str, Any]) -> None:
+    if pack.get("evidence_schema_version") is not None:
+        pack = validate_evidence_pack(pack)
     pack_id = str(pack.get("pack_id") or "")
     path = _database_pack_path(pack_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1022,7 +1023,15 @@ def _read_database_evidence_pack(pack_id: str) -> dict[str, Any]:
     if not path.exists():
         raise HTTPException(status_code=404, detail="evidence pack not found")
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        return read_evidence_pack(loaded)
+    except EvidenceValidationError as exc:
+        logger.warning(
+            "database_evidence_pack_schema_failed pack_id=%s error_type=%s",
+            pack_id,
+            exc.__class__.__name__,
+        )
+        raise HTTPException(status_code=500, detail="evidence pack schema validation failed") from exc
     except Exception as exc:  # noqa: BLE001
         logger.warning("database_evidence_pack_read_failed pack_id=%s error_type=%s", pack_id, exc.__class__.__name__)
         raise HTTPException(status_code=500, detail="evidence pack read failed") from exc
@@ -1480,10 +1489,6 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
         business_value = str(table.get("business_value") or "")
         table_summaries.append(
             {
-                "evidence_id": table.get("evidence_id") or "",
-                "source_span": copy.deepcopy(table.get("source_span") or {}),
-                "confidence": table.get("confidence") or "",
-                "parse_risks": list(table.get("parse_risks") or [])[:8],
                 "sheet_name": table.get("sheet_name") or "",
                 "rows": table.get("rows") or 0,
                 "columns_count": table.get("columns_count") or 0,
@@ -1533,10 +1538,6 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
         section_limit = max(section_limit, len(list(attachment.get("important_sections") or [])))
         section_chars = 1200
     compact = {
-        "evidence_id": attachment.get("evidence_id") or "",
-        "source_span": copy.deepcopy(attachment.get("source_span") or {}),
-        "confidence": attachment.get("confidence") or "",
-        "parse_risks": list(attachment.get("parse_risks") or [])[:8],
         "articleattid": attachment.get("articleattid") or "",
         "filename": attachment.get("filename") or "",
         "fileext": attachment.get("fileext") or "",
@@ -1556,10 +1557,6 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
         ],
         "table_summaries": table_summaries,
     }
-    if attachment.get("key_fact_evidence_refs"):
-        compact["key_fact_evidence_refs"] = list(attachment.get("key_fact_evidence_refs") or [])[:key_fact_limit]
-    if attachment.get("important_section_evidence_refs"):
-        compact["important_section_evidence_refs"] = list(attachment.get("important_section_evidence_refs") or [])[:section_limit]
     compact["evidence_value_score"] = _evidence_value_score_attachment(attachment, role=role)
     return compact
 
@@ -1586,10 +1583,6 @@ def _compact_material_for_dify(
     key_fact_limit = max(16, len(list(material.get("key_facts") or []))) if preserve_detail else 16
     compact = {
         "material_role": material.get("material_role") or role,
-        "evidence_id": material.get("evidence_id") or "",
-        "source_span": copy.deepcopy(material.get("source_span") or {}),
-        "confidence": material.get("confidence") or "",
-        "parse_risks": list(material.get("parse_risks") or [])[:8],
         "evidence_source_type": "attachment_led_primary"
         if role == "primary" and _is_attachment_led_primary_material(material)
         else ("primary_body" if role == "primary" else "auxiliary_reference"),
@@ -1652,6 +1645,718 @@ def _compact_material_for_dify(
     return compact
 
 
+def _second_pass_window(first_pass_chars: int, target_max_chars: int) -> dict[str, Any]:
+    plan = secondary_compression_plan(first_pass_chars, hard_limit=target_max_chars)
+    return {
+        "tier": plan["tier"],
+        "floor": plan["target_floor_chars"],
+        "ceiling": plan["target_ceiling_chars"],
+    }
+
+
+def _profile_table_summary_for_dify(
+    table: dict[str, Any],
+    *,
+    header_limit: int,
+    key_column_limit: int,
+    summary_limit: int,
+    business_limit: int,
+    keep_field_stats: bool = False,
+    field_stats_field_limit: int = 0,
+    minimal_table: bool = False,
+) -> dict[str, Any]:
+    compact = {
+        "sheet_name": table.get("sheet_name") or "",
+        "rows": table.get("rows") or 0,
+        "columns_count": table.get("columns_count") or 0,
+        "headers": list(table.get("headers") or [])[:header_limit],
+        "key_columns": list(table.get("key_columns") or [])[:key_column_limit],
+        "enterprise_columns": list(table.get("enterprise_columns") or [])[: max(4, key_column_limit // 2)],
+        "product_columns": list(table.get("product_columns") or [])[: max(4, key_column_limit // 2)],
+        "registration_cert_columns": list(table.get("registration_cert_columns") or [])[: max(4, key_column_limit // 2)],
+        "medical_insurance_code_columns": list(table.get("medical_insurance_code_columns") or [])[: max(4, key_column_limit // 2)],
+        "price_columns": list(table.get("price_columns") or [])[: max(4, key_column_limit // 2)],
+        "purchase_volume_columns": list(table.get("purchase_volume_columns") or [])[: max(4, key_column_limit // 2)],
+        "selected_status_columns": list(table.get("selected_status_columns") or [])[: max(4, key_column_limit // 2)],
+        "region_columns": list(table.get("region_columns") or [])[: max(4, key_column_limit // 2)],
+        "group_columns": list(table.get("group_columns") or [])[: max(4, key_column_limit // 2)],
+        "contains_enterprise": bool(table.get("contains_enterprise")),
+        "contains_product": bool(table.get("contains_product")),
+        "contains_registration_cert": bool(table.get("contains_registration_cert")),
+        "contains_medical_insurance_code": bool(table.get("contains_medical_insurance_code")),
+        "contains_specification": bool(table.get("contains_specification")),
+        "contains_price": bool(table.get("contains_price")),
+        "contains_selected_status": bool(table.get("contains_selected_status")),
+        "contains_purchase_volume": bool(table.get("contains_purchase_volume")),
+        "table_heavy": bool(table.get("table_heavy") or _table_summary_is_heavy(table)),
+        "evidence_value_score": int(table.get("evidence_value_score") or 0),
+        "data_completeness_hint": table.get("data_completeness_hint") or "",
+        "recommended_report_usage": _limit_text(
+            table.get("recommended_report_usage")
+            or "Use this structured table summary to analyze product scope, enterprise scope, price or purchase-volume fields; do not invent row-level values that are not provided.",
+            220,
+        ),
+        "summary": _limit_text(table.get("summary"), summary_limit),
+        "business_value": _limit_text(table.get("business_value"), business_limit),
+    }
+    if keep_field_stats:
+        compact["field_stats"] = copy.deepcopy(table.get("field_stats") or {})
+    elif field_stats_field_limit > 0:
+        field_stats = table.get("field_stats") or {}
+        if isinstance(field_stats, dict):
+            compact["field_stats"] = {
+                str(field_name): {
+                    "columns": list(stats.get("columns") or [])[:4],
+                    "non_empty_count": stats.get("non_empty_count", 0),
+                    "unique_count": stats.get("unique_count", 0),
+                    "sample_values": [_limit_text(item, 120) for item in list(stats.get("sample_values") or [])[:5]],
+                }
+                for field_name, stats in list(field_stats.items())[:field_stats_field_limit]
+                if isinstance(stats, dict)
+            }
+    if minimal_table:
+        allowed_keys = {
+            "sheet_name",
+            "rows",
+            "columns_count",
+            "headers",
+            "key_columns",
+            "enterprise_columns",
+            "product_columns",
+            "price_columns",
+            "contains_enterprise",
+            "contains_product",
+            "contains_price",
+            "contains_selected_status",
+            "contains_purchase_volume",
+            "table_heavy",
+            "evidence_value_score",
+            "summary",
+            "business_value",
+        }
+        compact = {key: value for key, value in compact.items() if key in allowed_keys}
+    return compact
+
+
+def _profile_attachment_for_dify(
+    attachment: dict[str, Any],
+    *,
+    role: str = "primary",
+    summary_limit: int,
+    key_fact_limit: int,
+    section_limit: int,
+    section_chars: int,
+    table_limit: int,
+    table_header_limit: int,
+    table_key_column_limit: int,
+    table_summary_limit: int,
+    table_business_limit: int,
+    keep_field_stats: bool = False,
+    field_stats_field_limit: int = 0,
+    minimal_table: bool = False,
+    preserve_key_facts: bool = False,
+    preserve_all_table_headers: bool = False,
+) -> dict[str, Any]:
+    compact = {
+        "articleattid": attachment.get("articleattid") or "",
+        "filename": attachment.get("filename") or "",
+        "fileext": attachment.get("fileext") or "",
+        "filesize": attachment.get("filesize") or 0,
+        "core_attachment": bool(attachment.get("core_attachment")),
+        "business_type": attachment.get("business_type") or "普通附件",
+        "parse_status": attachment.get("parse_status") or "metadata_only",
+        "download_status": attachment.get("download_status") or "",
+        "cache_status": attachment.get("cache_status") or "",
+        "text_length": attachment.get("text_length") or 0,
+        "summary": _limit_text(attachment.get("summary"), summary_limit),
+        "key_facts": copy.deepcopy(list(attachment.get("key_facts") or []))
+        if preserve_key_facts
+        else [_limit_text(item, 180) for item in list(attachment.get("key_facts") or [])[:key_fact_limit]],
+        "important_sections": [_limit_text(item, section_chars) for item in list(attachment.get("important_sections") or [])[:section_limit]],
+        "table_summaries": [
+            _profile_table_summary_for_dify(
+                table,
+                header_limit=table_header_limit,
+                key_column_limit=table_key_column_limit,
+                summary_limit=table_summary_limit,
+                business_limit=table_business_limit,
+                keep_field_stats=keep_field_stats,
+                field_stats_field_limit=field_stats_field_limit,
+                minimal_table=minimal_table,
+            )
+            for table in list(attachment.get("table_summaries") or [])[:table_limit]
+            if isinstance(table, dict)
+        ],
+        "evidence_value_score": int(attachment.get("evidence_value_score") or _evidence_value_score_attachment(attachment, role=role)),
+    }
+    if preserve_all_table_headers:
+        compact["table_header_catalog"] = list(
+            dict.fromkeys(
+                str(header)
+                for table in list(attachment.get("table_summaries") or [])
+                if isinstance(table, dict)
+                for header in list(table.get("headers") or [])
+                if str(header)
+            )
+        )
+    return compact
+
+
+def _attachment_summary_entries(compact: dict[str, Any]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for materials in (
+        compact.get("primary_materials") or [],
+        compact.get("auxiliary_materials") or [],
+    ):
+        for material in materials:
+            for summary in material.get("attachment_summaries") or []:
+                if isinstance(summary, dict):
+                    entries.append(summary)
+    return entries
+
+
+def _build_attachment_fidelity_catalog(compact: dict[str, Any]) -> list[dict[str, Any]]:
+    records: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    fact_tokens: dict[tuple[str, str, str, str, str], set[str]] = {}
+    header_tokens: dict[tuple[str, str, str, str, str], set[str]] = {}
+    summary_lengths: dict[tuple[str, str, str, str, str], int] = {}
+    for role, materials in (
+        ("primary", compact.get("primary_materials") or []),
+        ("auxiliary", compact.get("auxiliary_materials") or []),
+    ):
+        for material in materials:
+            menu_code = str(material.get("menu_code") or "")
+            articleid = str(material.get("articleid") or "")
+            for field in ("attachments", "attachment_summaries"):
+                for attachment in material.get(field) or []:
+                    if not isinstance(attachment, dict):
+                        continue
+                    key = (
+                        role,
+                        menu_code,
+                        articleid,
+                        str(attachment.get("articleattid") or ""),
+                        str(attachment.get("filename") or ""),
+                    )
+                    if key not in records:
+                        records[key] = {
+                            "role": role,
+                            "menu_code": menu_code,
+                            "articleid": articleid,
+                            "articleattid": key[3],
+                            "filename": key[4],
+                            "summary": "",
+                            "key_facts": [],
+                            "table_headers": [],
+                        }
+                        fact_tokens[key] = set()
+                        header_tokens[key] = set()
+                        summary_lengths[key] = 0
+                    summary = str(attachment.get("summary") or "")
+                    if len(summary) > summary_lengths[key]:
+                        records[key]["summary"] = _limit_text(summary, 160)
+                        summary_lengths[key] = len(summary)
+                    for fact in list(attachment.get("key_facts") or []):
+                        token = json.dumps(fact, ensure_ascii=False, sort_keys=True)
+                        if token not in fact_tokens[key]:
+                            fact_tokens[key].add(token)
+                            records[key]["key_facts"].append(copy.deepcopy(fact))
+                    headers = list(attachment.get("table_header_catalog") or [])
+                    headers.extend(
+                        header
+                        for table in list(attachment.get("table_summaries") or [])
+                        if isinstance(table, dict)
+                        for header in list(table.get("headers") or [])
+                    )
+                    for header in headers:
+                        value = str(header)
+                        if not value.strip() or value in header_tokens[key]:
+                            continue
+                        header_tokens[key].add(value)
+                        records[key]["table_headers"].append(value)
+    return list(records.values())
+
+
+def _apply_minimal_attachment_fidelity_profile(compact: dict[str, Any]) -> None:
+    for role, materials in (
+        ("primary", compact.get("primary_materials") or []),
+        ("auxiliary", compact.get("auxiliary_materials") or []),
+    ):
+        for material in materials:
+            for field in ("attachments", "attachment_summaries"):
+                material[field] = [
+                    _profile_attachment_for_dify(
+                        attachment,
+                        role=role,
+                        summary_limit=160,
+                        key_fact_limit=0,
+                        section_limit=0,
+                        section_chars=0,
+                        table_limit=0,
+                        table_header_limit=0,
+                        table_key_column_limit=0,
+                        table_summary_limit=0,
+                        table_business_limit=0,
+                    )
+                    for attachment in list(material.get(field) or [])
+                    if isinstance(attachment, dict)
+                ]
+
+
+_SECOND_PASS_TEXT_TRIM_EXCLUDED_KEYS = {
+    "pack_id",
+    "pack_version",
+    "source",
+    "menu_code",
+    "articleid",
+    "articleattid",
+    "filename",
+    "fileext",
+    "sourceurl",
+    "created_at",
+    "audittime",
+    "updatetime",
+    "input_strategy",
+    "input_strategy_type",
+    "input_strategy_description",
+    "strategy_basis",
+    "detail_policy",
+    "generation_mode",
+}
+
+
+def _second_pass_string_trim_candidates(value: Any, *, min_chars: int) -> list[tuple[int, Any, Any, str]]:
+    candidates: list[tuple[int, Any, Any, str]] = []
+
+    def walk(node: Any, parent: Any = None, key: Any = None, field_name: str = "") -> None:
+        if isinstance(node, dict):
+            for child_key, child in node.items():
+                if str(child_key) in _SECOND_PASS_TEXT_TRIM_EXCLUDED_KEYS:
+                    continue
+                walk(child, node, child_key, str(child_key))
+        elif isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, node, index, field_name)
+        elif isinstance(node, str) and parent is not None and len(node) > min_chars:
+            candidates.append((len(node), parent, key, field_name))
+
+    walk(value)
+    return candidates
+
+
+def _trim_evidence_strings_to_target(
+    compact: dict[str, Any],
+    *,
+    target_ceiling: int,
+    min_chars: int,
+) -> bool:
+    changed = False
+    roots = [
+        compact.get("primary_materials") or [],
+        compact.get("auxiliary_materials") or [],
+        compact.get("combined_key_facts") or [],
+        compact.get("report_focus") or [],
+        compact.get("warnings") or [],
+    ]
+    while _refresh_dify_char_fields(compact) > target_ceiling:
+        candidates: list[tuple[int, Any, Any, str]] = []
+        for root in roots:
+            candidates.extend(_second_pass_string_trim_candidates(root, min_chars=min_chars))
+        if not candidates:
+            return changed
+        remaining_reduction = max(1, compact["final_dify_input_chars"] - target_ceiling + 600)
+        trimmed_this_round = False
+        for current_len, parent, key, _field_name in sorted(candidates, key=lambda item: item[0], reverse=True):
+            possible_reduction = current_len - min_chars
+            if possible_reduction <= 0:
+                continue
+            reduction = min(possible_reduction, remaining_reduction)
+            new_limit = current_len - reduction
+            if new_limit >= current_len:
+                continue
+            if isinstance(parent, dict):
+                before = str(parent.get(key) or "")
+                parent[key] = _limit_text(before, new_limit)
+                actual_reduction = max(0, len(before) - len(str(parent.get(key) or "")))
+            elif isinstance(parent, list) and isinstance(key, int) and 0 <= key < len(parent):
+                before = str(parent[key] or "")
+                parent[key] = _limit_text(before, new_limit)
+                actual_reduction = max(0, len(before) - len(str(parent[key] or "")))
+            else:
+                continue
+            if actual_reduction > 0:
+                changed = True
+                trimmed_this_round = True
+                remaining_reduction -= actual_reduction
+            if remaining_reduction <= 0:
+                break
+        if not trimmed_this_round:
+            return changed
+    return changed
+
+
+def _trim_attachment_summary_texts_to_target(
+    compact: dict[str, Any],
+    *,
+    target_ceiling: int,
+    min_summary_chars: int,
+) -> bool:
+    changed = False
+    while _refresh_dify_char_fields(compact) > target_ceiling:
+        candidates = [
+            (len(str(summary.get("summary") or "")), summary)
+            for summary in _attachment_summary_entries(compact)
+            if len(str(summary.get("summary") or "")) > min_summary_chars
+        ]
+        if not candidates:
+            return changed
+        current_len, summary = max(candidates, key=lambda item: item[0])
+        excess = max(1, compact["final_dify_input_chars"] - target_ceiling)
+        new_limit = max(min_summary_chars, current_len - excess - 250)
+        if new_limit >= current_len:
+            new_limit = max(min_summary_chars, current_len - 512)
+        if new_limit >= current_len:
+            return changed
+        summary["summary"] = _limit_text(summary.get("summary"), new_limit)
+        changed = True
+    return changed
+
+
+def _apply_attachment_summary_profile(compact: dict[str, Any], *, summary_limit: int, profile: dict[str, Any]) -> None:
+    for role, materials in (
+        ("primary", compact.get("primary_materials") or []),
+        ("auxiliary", compact.get("auxiliary_materials") or []),
+    ):
+        for material in materials:
+            summaries = material.get("attachment_summaries") or []
+            material["attachment_summaries"] = [
+                _profile_attachment_for_dify(
+                    summary,
+                    role=role,
+                    summary_limit=summary_limit,
+                    key_fact_limit=int(profile["key_fact_limit"]),
+                    section_limit=int(profile["section_limit"]),
+                    section_chars=int(profile["section_chars"]),
+                    table_limit=int(profile["table_limit"]),
+                    table_header_limit=int(profile["table_header_limit"]),
+                    table_key_column_limit=int(profile["table_key_column_limit"]),
+                    table_summary_limit=int(profile["table_summary_limit"]),
+                    table_business_limit=int(profile["table_business_limit"]),
+                    keep_field_stats=bool(profile.get("keep_field_stats")),
+                    field_stats_field_limit=int(profile.get("field_stats_field_limit") or 0),
+                    minimal_table=bool(profile.get("minimal_table")),
+                    preserve_key_facts=bool(profile.get("preserve_key_facts")),
+                    preserve_all_table_headers=bool(profile.get("preserve_all_table_headers")),
+                )
+                for summary in summaries[: int(profile["attachment_summary_limit"])]
+                if isinstance(summary, dict)
+            ]
+
+
+def _max_attachment_summary_table_headers(compact: dict[str, Any]) -> int:
+    max_headers = 0
+    for summary in _attachment_summary_entries(compact):
+        for table in summary.get("table_summaries") or []:
+            if isinstance(table, dict):
+                max_headers = max(max_headers, len(list(table.get("headers") or [])))
+    return max_headers
+
+
+def _fit_attachment_summary_profile_to_target(
+    compact: dict[str, Any],
+    *,
+    target_ceiling: int,
+    profile: dict[str, Any],
+) -> bool:
+    original = copy.deepcopy(compact)
+    max_summary_len = max([len(str(summary.get("summary") or "")) for summary in _attachment_summary_entries(original)] or [0])
+    if max_summary_len <= 0:
+        return False
+    if profile.get("adaptive_header_limit"):
+        low = int(profile["table_header_limit"])
+        high = max(low, _max_attachment_summary_table_headers(original))
+        best: dict[str, Any] | None = None
+        while low <= high:
+            mid = (low + high) // 2
+            candidate = copy.deepcopy(original)
+            adaptive_profile = dict(profile)
+            adaptive_profile["table_header_limit"] = mid
+            _apply_attachment_summary_profile(candidate, summary_limit=max_summary_len, profile=adaptive_profile)
+            size = _refresh_dify_char_fields(candidate)
+            if size <= target_ceiling:
+                best = candidate
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best is not None:
+            compact.clear()
+            compact.update(best)
+            return True
+    low = int(profile["min_summary_limit"])
+    high = max(low, max_summary_len)
+    best: dict[str, Any] | None = None
+    while low <= high:
+        mid = (low + high) // 2
+        candidate = copy.deepcopy(original)
+        _apply_attachment_summary_profile(candidate, summary_limit=mid, profile=profile)
+        size = _refresh_dify_char_fields(candidate)
+        if size <= target_ceiling:
+            best = candidate
+            low = mid + 1
+        else:
+            high = mid - 1
+    if best is None:
+        return False
+    compact.clear()
+    compact.update(best)
+    return True
+
+
+def _compact_for_dify_hard_limit_second_pass(
+    compact: dict[str, Any],
+    *,
+    target_max_chars: int,
+    compression_reason: list[str],
+    first_pass_chars_override: int | None = None,
+    preserve_structure: bool = False,
+) -> bool:
+    current_chars = _refresh_dify_char_fields(compact)
+    if current_chars <= target_max_chars:
+        return False
+    first_pass_chars = int(first_pass_chars_override or current_chars)
+
+    if preserve_structure:
+        fidelity_catalog = _build_attachment_fidelity_catalog(compact)
+        if fidelity_catalog:
+            compact["attachment_fidelity_catalog_version"] = "8099.attachment-fidelity/v1"
+            compact["attachment_fidelity_catalog"] = fidelity_catalog
+        combined_key_facts = list(compact.get("combined_key_facts") or [])
+        if combined_key_facts:
+            compact["combined_key_fact_catalog"] = copy.deepcopy(combined_key_facts)
+        _refresh_dify_char_fields(compact)
+
+    omitted_content = compact.setdefault("omitted_content", [])
+    compact["second_pass_compression_applied"] = True
+    compact["compression_applied"] = True
+    compact["second_pass_first_pass_chars"] = first_pass_chars
+    window = _second_pass_window(first_pass_chars, target_max_chars)
+    compact["second_pass_tier"] = window["tier"]
+    compact["second_pass_target_floor_chars"] = window["floor"]
+    compact["second_pass_target_ceiling_chars"] = window["ceiling"]
+    compression_reason.append("hard_limit_second_pass")
+    effective_target_ceiling = int(max(window["floor"], window["ceiling"] - 700))
+
+    min_summary_chars = {"light": 1_000, "medium": 900, "strong": 700}.get(str(window["tier"]), 700)
+    if _trim_evidence_strings_to_target(compact, target_ceiling=effective_target_ceiling, min_chars=min_summary_chars):
+        compression_reason.append(f"hard_limit_second_pass_{window['tier']}_trim")
+        omitted_content.append(
+            _omitted_content_entry(
+                f"hard_limit_second_pass_{window['tier']}_trim",
+                reason="第一阶段压缩后仍超过 Dify 变量限制，仅按超限量裁剪主材料 attachment_summaries 中最长的摘要文本。",
+                risk="被裁剪的是附件摘要尾部；附件目录、key_facts、table_summaries 和字段结构保持不变。",
+                manual_review=window["tier"] != "light",
+                affects_core_attachment_detail=window["tier"] != "light",
+            )
+        )
+    if compact["final_dify_input_chars"] > int(window["ceiling"]):
+        _trim_evidence_strings_to_target(compact, target_ceiling=effective_target_ceiling, min_chars=min_summary_chars)
+    if compact["final_dify_input_chars"] <= int(window["ceiling"]):
+        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+        return True
+
+    profiles = []
+    if window["tier"] == "light":
+        profiles.append(
+            {
+                "name": "light_structure",
+                "attachment_summary_limit": 8,
+                "min_summary_limit": 220,
+                "key_fact_limit": 4,
+                "section_limit": 2,
+                "section_chars": 160,
+                "table_limit": 1,
+                "table_header_limit": 8,
+                "table_key_column_limit": 6,
+                "table_summary_limit": 180,
+                "table_business_limit": 140,
+                "keep_field_stats": False,
+                "field_stats_field_limit": 0,
+                "minimal_table": True,
+            }
+        )
+    profiles.extend(
+        [
+            {
+            "name": "medium_structure",
+            "attachment_summary_limit": 8,
+            "min_summary_limit": 700,
+            "key_fact_limit": 8,
+            "section_limit": 4,
+            "section_chars": 260,
+            "table_limit": 3,
+            "table_header_limit": 24,
+            "table_key_column_limit": 16,
+            "table_summary_limit": 420,
+            "table_business_limit": 260,
+            "keep_field_stats": False,
+            "field_stats_field_limit": 12,
+            "adaptive_header_limit": True,
+        },
+        {
+            "name": "strong_structure",
+            "attachment_summary_limit": 8,
+            "min_summary_limit": 360,
+            "key_fact_limit": 6,
+            "section_limit": 3,
+            "section_chars": 220,
+            "table_limit": 2,
+            "table_header_limit": 18,
+            "table_key_column_limit": 12,
+            "table_summary_limit": 320,
+            "table_business_limit": 200,
+            "keep_field_stats": False,
+            "field_stats_field_limit": 8,
+            "adaptive_header_limit": True,
+        },
+        ]
+    )
+    if preserve_structure:
+        for profile in profiles:
+            profile["preserve_key_facts"] = True
+            profile["preserve_all_table_headers"] = True
+    attachment_summaries_changed = False
+    for profile in profiles:
+        if _fit_attachment_summary_profile_to_target(compact, target_ceiling=effective_target_ceiling, profile=profile):
+            attachment_summaries_changed = True
+            compression_reason.append(f"hard_limit_attachment_summary_compacted_{profile['name']}")
+            break
+    if attachment_summaries_changed:
+        compression_reason.append("hard_limit_attachment_summary_compacted")
+        omitted_content.append(
+            _omitted_content_entry(
+                "hard_limit_attachment_summary_compacted",
+                reason="最小摘要裁剪后仍超过 Dify 变量限制，已按分级 profile 压缩主材料 attachment_summaries 的冗余字段。",
+                risk="附件摘要长文本、field_stats 和多余表格细节未进入 Dify；报告应基于保留的摘要、关键事实和表格字段结构，避免编造行级明细。",
+                manual_review=True,
+                affects_core_attachment_detail=True,
+            )
+        )
+    _refresh_dify_char_fields(compact)
+    if compact["final_dify_input_chars"] <= int(window["ceiling"]):
+        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+        return True
+
+    attachment_detail_changed = False
+    for material in [*(compact.get("primary_materials") or []), *(compact.get("auxiliary_materials") or [])]:
+        attachments = material.get("attachments") or []
+        compacted_attachments = [
+            _profile_attachment_for_dify(
+                attachment,
+                summary_limit=260 if attachment.get("core_attachment") else 180,
+                key_fact_limit=4,
+                section_limit=2,
+                section_chars=160,
+                table_limit=2 if attachment.get("core_attachment") else 1,
+                table_header_limit=8,
+                table_key_column_limit=6,
+                table_summary_limit=180,
+                table_business_limit=140,
+                role="primary" if material in (compact.get("primary_materials") or []) else "auxiliary",
+            )
+            for attachment in attachments[:8]
+            if isinstance(attachment, dict)
+        ]
+        if compacted_attachments and compacted_attachments != attachments:
+            material["attachments"] = compacted_attachments
+            attachment_detail_changed = True
+    if attachment_detail_changed:
+        compression_reason.append("hard_limit_attachment_detail_compacted")
+        omitted_content.append(
+            _omitted_content_entry(
+                "hard_limit_attachment_detail_compacted",
+                reason="二次压缩 attachment_summaries 后仍超过 Dify 变量限制，已进一步压缩附件 summary、important_sections 和 table_summaries。",
+                risk="附件细节只保留报告必要字段，产品级逐行核验需人工打开附件。",
+                manual_review=True,
+                affects_core_attachment_detail=True,
+            )
+        )
+
+    _refresh_dify_char_fields(compact)
+    if compact["final_dify_input_chars"] > int(window["ceiling"]) and not attachment_summaries_changed:
+        for profile in profiles:
+            if _fit_attachment_summary_profile_to_target(
+                compact,
+                target_ceiling=effective_target_ceiling,
+                profile=profile,
+            ):
+                attachment_summaries_changed = True
+                compression_reason.append(f"hard_limit_attachment_summary_compacted_{profile['name']}")
+                compression_reason.append("hard_limit_attachment_summary_compacted")
+                omitted_content.append(
+                    _omitted_content_entry(
+                        "hard_limit_attachment_summary_compacted",
+                        reason="附件主体压缩后，已重新按分级 profile 压缩 attachment_summaries 冗余字段。",
+                        risk="附件摘要保留关键事实和表格结构，省略重复字段与长文本尾部。",
+                        manual_review=True,
+                        affects_core_attachment_detail=True,
+                    )
+                )
+                break
+        _refresh_dify_char_fields(compact)
+    if preserve_structure and compact["final_dify_input_chars"] > target_max_chars:
+        _apply_minimal_attachment_fidelity_profile(compact)
+        compression_reason.append("hard_limit_attachment_fidelity_catalog_only")
+        omitted_content.append(
+            _omitted_content_entry(
+                "hard_limit_attachment_fidelity_catalog_only",
+                reason="附件结构仍超限，逐附件保留最小摘要，完整 key_facts 和有效表头由受保护目录承载。",
+                risk="重复表格摘要和附件结构字段被裁剪，受保护目录中的事实与表头不得作为新增事实来源。",
+                manual_review=True,
+                affects_core_attachment_detail=True,
+            )
+        )
+        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+        _refresh_dify_char_fields(compact)
+    if compact["final_dify_input_chars"] <= target_max_chars:
+        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+        return True
+
+    for material in compact.get("primary_materials") or []:
+        if len(material.get("attachments") or []) > 4:
+            material["attachments"] = material["attachments"][:4]
+        if len(material.get("attachment_summaries") or []) > 4:
+            material["attachment_summaries"] = material["attachment_summaries"][:4]
+        material["content_text"] = _limit_text(material.get("content_text"), 1800)
+        material["content_summary"] = _limit_text(material.get("content_summary"), 360)
+        material["important_passages"] = list(material.get("important_passages") or [])[:4]
+        for key in ["policy_rules", "price_rules", "time_requirements", "product_scope", "enterprise_requirements", "execution_requirements"]:
+            material[key] = [_limit_text(item, 180) for item in list(material.get(key) or [])[:4]]
+    for material in compact.get("auxiliary_materials") or []:
+        if len(material.get("attachments") or []) > 2:
+            material["attachments"] = material["attachments"][:2]
+        material["content_text"] = _limit_text(material.get("content_text"), 400)
+        material["content_summary"] = _limit_text(material.get("content_summary"), 240)
+        material["relevant_snippets"] = [_limit_text(item, 160) for item in list(material.get("relevant_snippets") or [])[:3]]
+        material["usable_points"] = [_limit_text(item, 160) for item in list(material.get("usable_points") or [])[:4]]
+    compact["combined_key_facts"] = list(compact.get("combined_key_facts") or [])[:12]
+    compact["report_focus"] = list(compact.get("report_focus") or [])[:6]
+    compact["warnings"] = [_limit_text(item, 160) for item in list(compact.get("warnings") or [])[:4]]
+    compression_reason.append("hard_limit_material_lists_trimmed")
+    omitted_content.append(
+        _omitted_content_entry(
+            "hard_limit_material_lists_trimmed",
+            reason="二次压缩附件后仍超过 Dify 变量限制，已限制材料列表、规则列表和辅助材料长度。",
+            risk="非核心材料和长列表细节不会进入 Dify，报告需人工复核覆盖范围。",
+            manual_review=True,
+            affects_primary_detail=True,
+            affects_auxiliary_detail=True,
+        )
+    )
+    compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+    _refresh_dify_char_fields(compact)
+    return True
+
+
 def _compact_primary_content_limit(primary_source: list[dict[str, Any]], auxiliary_source: list[dict[str, Any]], original_pack_chars: int, max_chars: int) -> int:
     primary_count = max(1, len(primary_source))
     if primary_count == 1 and original_pack_chars <= max_chars * 1.1:
@@ -1663,8 +2368,8 @@ def _compact_primary_content_limit(primary_source: list[dict[str, Any]], auxilia
     return 7600
 
 
-def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
-    original_pack_chars = len(json.dumps(pack, ensure_ascii=False, sort_keys=True))
+def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
+    original_pack_chars = len(json.dumps(compact_content_view(pack), ensure_ascii=False, sort_keys=True))
     primary_source = [item for item in list(pack.get("primary_materials") or [])[:3] if isinstance(item, dict)]
     auxiliary_source = [item for item in list(pack.get("auxiliary_materials") or [])[:10] if isinstance(item, dict)]
     thresholds = _dify_input_thresholds()
@@ -1795,9 +2500,6 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
         "pack_id": pack.get("pack_id") or "",
         "created_at": pack.get("created_at") or "",
         "pack_version": pack.get("pack_version") or "2.0",
-        "evidence_schema_version": pack.get("evidence_schema_version") or "",
-        "evidence_item_count": len(pack.get("evidence_items") or []),
-        "parse_risks": list(pack.get("parse_risks") or [])[:20],
         "source": pack.get("source") or "database_selection",
         "primary_materials": primary,
         "auxiliary_materials": auxiliary,
@@ -1806,6 +2508,17 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
         "warnings": [_limit_text(item, 260) for item in list(pack.get("warnings") or [])[:8]],
         "generation_guidance": copy.deepcopy(pack.get("generation_guidance") or {}),
     }
+    if (
+        pack.get("evidence_schema_version") is not None
+        and pack.get("source_evidence_schema_version") != 1
+    ):
+        evidence_view = validate_evidence_pack(pack)
+        compact["evidence_schema_version"] = evidence_view["evidence_schema_version"]
+        compact["evidence_items"] = copy.deepcopy(evidence_view["evidence_items"])
+    if isinstance(pack.get("vbp_facts"), list):
+        compact["vbp_facts"] = copy.deepcopy(pack["vbp_facts"])
+        compact["vbp_fact_extractor_version"] = str(pack.get("vbp_fact_extractor_version") or "")
+        compact["vbp_fact_rules_version"] = str(pack.get("vbp_fact_rules_version") or "")
     compact["evidence_budget"] = _evidence_budget_for_strategy(input_strategy, primary_count=len(primary_source), auxiliary_count=len(auxiliary_source))
     compact["generation_guidance"]["target_report_length"] = _target_report_length_guidance(primary_source, auxiliary_source)
     compact["generation_guidance"]["mandatory_sections"] = [
@@ -1984,54 +2697,60 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
         for material in compact.get("primary_materials", []):
             text = str(material.get("content_text") or "")
             if len(text) > 2500:
-                material["content_text"] = _limit_text(text, max(2500, len(text) - 1000))
-                primary_detail_preserved = False
-                compression_reason.append("primary_content_trimmed")
-                compact["omitted_content"].append(
-                    _omitted_content_entry(
-                        "primary_content_tail",
-                        reason="主材料正文过长，已保留前部核心正文和结构化要点。",
-                        risk="主材料尾部细节可能未完整进入 Dify，报告应优先依据保留正文、关键事实和结构化规则。",
-                        manual_review=True,
-                        affects_primary_detail=True,
+                trimmed_text = _limit_text(text, max(2500, len(text) - 1000))
+                if len(trimmed_text) < len(text):
+                    material["content_text"] = trimmed_text
+                    primary_detail_preserved = False
+                    compression_reason.append("primary_content_trimmed")
+                    compact["omitted_content"].append(
+                        _omitted_content_entry(
+                            "primary_content_tail",
+                            reason="主材料正文过长，已保留前部核心正文和结构化要点。",
+                            risk="主材料尾部细节可能未完整进入 Dify，报告应优先依据保留正文、关键事实和结构化规则。",
+                            manual_review=True,
+                            affects_primary_detail=True,
+                        )
                     )
-                )
-                changed = True
+                    changed = True
             for attachment in material.get("attachments") or []:
                 summary = str(attachment.get("summary") or "")
                 floor = 900 if attachment.get("core_attachment") else 400
                 if len(summary) > floor:
-                    attachment["summary"] = _limit_text(summary, floor)
-                    compression_reason.append("attachment_summary_trimmed")
-                    affects_core = bool(attachment.get("core_attachment"))
-                    if affects_core:
-                        core_attachment_detail_preserved = False
-                    compact["omitted_content"].append(
-                        _omitted_content_entry(
-                            "attachment_summary_tail",
-                            reason="附件摘要过长，已截断摘要尾部，但保留 table_summaries、key_facts 和字段统计。",
-                            risk="核心附件细节可能不完整，报告应优先依据结构化摘要和字段统计，避免编造行级明细。",
-                            manual_review=affects_core,
-                            affects_core_attachment_detail=affects_core,
+                    trimmed_summary = _limit_text(summary, floor)
+                    if len(trimmed_summary) < len(summary):
+                        attachment["summary"] = trimmed_summary
+                        compression_reason.append("attachment_summary_trimmed")
+                        affects_core = bool(attachment.get("core_attachment"))
+                        if affects_core:
+                            core_attachment_detail_preserved = False
+                        compact["omitted_content"].append(
+                            _omitted_content_entry(
+                                "attachment_summary_tail",
+                                reason="附件摘要过长，已截断摘要尾部，但保留 table_summaries、key_facts 和字段统计。",
+                                risk="核心附件细节可能不完整，报告应优先依据结构化摘要和字段统计，避免编造行级明细。",
+                                manual_review=affects_core,
+                                affects_core_attachment_detail=affects_core,
+                            )
                         )
-                    )
-                    changed = True
+                        changed = True
         for material in compact.get("auxiliary_materials", []):
             text = str(material.get("content_text") or "")
             if len(text) > 600:
-                material["content_text"] = _limit_text(text, 600)
-                auxiliary_detail_preserved = False
-                compression_reason.append("auxiliary_content_trimmed")
-                compact["omitted_content"].append(
-                    _omitted_content_entry(
-                        "auxiliary_content_tail",
-                        reason="辅助材料正文过长，优先保留相关片段和摘要。",
-                        risk="辅助材料细节可能未完整进入 Dify，不能作为主材料结论依据。",
-                        manual_review=False,
-                        affects_auxiliary_detail=True,
+                trimmed_text = _limit_text(text, 600)
+                if len(trimmed_text) < len(text):
+                    material["content_text"] = trimmed_text
+                    auxiliary_detail_preserved = False
+                    compression_reason.append("auxiliary_content_trimmed")
+                    compact["omitted_content"].append(
+                        _omitted_content_entry(
+                            "auxiliary_content_tail",
+                            reason="辅助材料正文过长，优先保留相关片段和摘要。",
+                            risk="辅助材料细节可能未完整进入 Dify，不能作为主材料结论依据。",
+                            manual_review=False,
+                            affects_auxiliary_detail=True,
+                        )
                     )
-                )
-                changed = True
+                    changed = True
         if changed:
             compact["compression_applied"] = True
             compact["compression_reason"] = list(dict.fromkeys(compression_reason))
@@ -2041,21 +2760,70 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
             compact["detail_preserved"] = primary_detail_preserved and core_attachment_detail_preserved
             _refresh_dify_char_fields(compact)
             continue
-        compact["omitted_content"].append(
-            _omitted_content_entry(
-                "hard_limit_residual_overflow",
-                reason="证据包已执行所有保守压缩动作后仍接近或超过 Dify 变量限制，应走分段生成或人工复核。",
-                risk="最终输入可能仍接近 Dify 上限，报告质量需人工复核。",
-                manual_review=True,
-                affects_primary_detail=not primary_detail_preserved,
-                affects_core_attachment_detail=not core_attachment_detail_preserved,
-                affects_auxiliary_detail=not auxiliary_detail_preserved,
-            )
-        )
-        compression_reason.append("final_compact_pack_exceeded_target_max_chars")
-        compact["compression_applied"] = True
-        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
         break
+    first_stage_chars = _refresh_dify_char_fields(compact)
+    first_stage_evidence_items = copy.deepcopy(compact.get("evidence_items") or [])
+    compact_preservation_enabled = _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False)
+    if first_stage_chars > target_max_chars:
+        if compact_preservation_enabled:
+            compact["evidence_items"] = protected_evidence_items(first_stage_evidence_items)
+            _refresh_dify_char_fields(compact)
+            second_pass_applied = _compact_for_dify_hard_limit_second_pass(
+                compact,
+                target_max_chars=target_max_chars,
+                compression_reason=compression_reason,
+                first_pass_chars_override=first_stage_chars,
+                preserve_structure=True,
+            )
+            compact["evidence_items"] = copy.deepcopy(first_stage_evidence_items)
+            _refresh_dify_char_fields(compact)
+        else:
+            second_pass_applied = _compact_for_dify_hard_limit_second_pass(
+                compact,
+                target_max_chars=target_max_chars,
+                compression_reason=compression_reason,
+            )
+        if second_pass_applied:
+            primary_detail_preserved = False
+            core_attachment_detail_preserved = False
+            auxiliary_detail_preserved = False if any(compact.get("auxiliary_materials") or []) else auxiliary_detail_preserved
+        if compact_preservation_enabled:
+            plan = secondary_compression_plan(first_stage_chars, hard_limit=target_max_chars)
+            compact = annotate_secondary_compression(
+                compact,
+                baseline_items=first_stage_evidence_items,
+            )
+            if compact["compact_pack_chars"] > int(plan["target_ceiling_chars"]):
+                compact = reduce_optional_evidence(
+                    compact,
+                    target_ceiling_chars=int(plan["target_ceiling_chars"]),
+                    baseline_items=first_stage_evidence_items,
+                )
+            retention = mandatory_evidence_retention(first_stage_evidence_items, compact)
+            compact["mandatory_evidence_retention"] = retention
+            retention_rate = retention.get("rate")
+            if retention_rate is not None and float(retention_rate) < 0.9:
+                raise CompactPolicyError(
+                    "COMPACT_PROVENANCE_LOST",
+                    "mandatory evidence retention fell below 90 percent",
+                    metrics=retention,
+                )
+            _refresh_dify_char_fields(compact)
+        if compact["final_dify_input_chars"] > target_max_chars:
+            compact["omitted_content"].append(
+                _omitted_content_entry(
+                    "hard_limit_residual_overflow",
+                    reason="证据包已执行所有保守压缩和二次压缩动作后仍接近或超过 Dify 变量限制，应走分段生成或人工复核。",
+                    risk="最终输入可能仍接近 Dify 上限，报告质量需人工复核。",
+                    manual_review=True,
+                    affects_primary_detail=not primary_detail_preserved,
+                    affects_core_attachment_detail=not core_attachment_detail_preserved,
+                    affects_auxiliary_detail=not auxiliary_detail_preserved,
+                )
+            )
+            compression_reason.append("final_compact_pack_exceeded_target_max_chars")
+            compact["compression_applied"] = True
+            compact["compression_reason"] = list(dict.fromkeys(compression_reason))
     compact["primary_detail_preserved"] = primary_detail_preserved
     compact["core_attachment_detail_preserved"] = core_attachment_detail_preserved
     compact["auxiliary_detail_preserved"] = auxiliary_detail_preserved
@@ -2063,9 +2831,58 @@ def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None 
     compact["detail_preserved"] = primary_detail_preserved and core_attachment_detail_preserved
     compact["compression_reason"] = list(dict.fromkeys(compression_reason))
     _refresh_dify_char_fields(compact)
+    if compact_preservation_enabled and compact["final_dify_input_chars"] > target_max_chars:
+        raise CompactPolicyError(
+            "COMPACT_LIMIT_EXCEEDED",
+            "protected compact evidence exceeds the Dify input limit",
+            metrics={
+                "compact_pack_chars": compact["final_dify_input_chars"],
+                "target_max_chars": target_max_chars,
+            },
+        )
     compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
     _refresh_dify_char_fields(compact)
     compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
+    # The ratio's serialized width can change the final JSON size.
+    _refresh_dify_char_fields(compact)
+    return compact
+
+
+def _compact_cache_version_context(pack: dict[str, Any], target_max_chars: int) -> dict[str, Any]:
+    return {
+        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
+        "pack_version": str(pack.get("pack_version") or ""),
+        "evidence_schema_version": pack.get("evidence_schema_version"),
+        "source_evidence_schema_version": pack.get("source_evidence_schema_version"),
+        "pdf_table_rule_version": (os.getenv("PDF_TABLE_RULE_VERSION") or "20260715-text-pdf-v1").strip(),
+        "vbp_fact_extractor_version": str(pack.get("vbp_fact_extractor_version") or ""),
+        "vbp_fact_rules_version": str(pack.get("vbp_fact_rules_version") or ""),
+        "vbp_compact_preservation": _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False),
+        "thresholds": _dify_input_thresholds(),
+        "target_max_chars": target_max_chars,
+    }
+
+
+def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
+    if not compact_cache_enabled():
+        return _compact_evidence_pack_for_dify_uncached(pack, max_chars)
+    target_max_chars = max_chars or _dify_input_thresholds()["hard_limit"]
+    try:
+        compact, status, key = CompactCache.from_environment().get_or_compute(
+            pack,
+            max_chars=target_max_chars,
+            version_context=_compact_cache_version_context(pack, target_max_chars),
+            compute=lambda: _compact_evidence_pack_for_dify_uncached(pack, max_chars),
+        )
+    except CompactCacheError as exc:
+        logger.warning("compact_cache_bypassed error_type=%s", exc.__class__.__name__)
+        return _compact_evidence_pack_for_dify_uncached(pack, max_chars)
+    logger.info(
+        "compact_cache_result pack_id=%s status=%s key_prefix=%s",
+        str(pack.get("pack_id") or "")[:80],
+        status,
+        key[:12],
+    )
     return compact
 
 
@@ -2074,6 +2891,388 @@ def _analysis_run_dir() -> Path:
     if configured:
         return Path(configured)
     return _database_evidence_pack_dir().parent / "analysis_runs"
+
+
+def _analysis_history_enabled() -> bool:
+    return _env_bool("ENABLE_ANALYSIS_HISTORY", True)
+
+
+def _analysis_history_ui_enabled() -> bool:
+    return _env_bool("ENABLE_ANALYSIS_HISTORY_UI", False)
+
+
+def _analysis_history_dir() -> Path:
+    configured = (os.getenv("ANALYSIS_HISTORY_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    return _analysis_run_dir().parent / "analysis_history"
+
+
+def _analysis_history_store() -> AnalysisHistoryStore:
+    return AnalysisHistoryStore(_analysis_history_dir())
+
+
+def _analysis_checkpoints_enabled() -> bool:
+    return _env_bool("ENABLE_RUN_CHECKPOINTS", False)
+
+
+def _analysis_recovery_enabled() -> bool:
+    return _env_bool("ENABLE_RUN_RECOVERY", False)
+
+
+def _analysis_checkpoint_dir() -> Path:
+    configured = (os.getenv("ANALYSIS_CHECKPOINT_DIR") or "").strip()
+    if configured:
+        return Path(configured)
+    return _analysis_run_dir().parent / "analysis_checkpoints"
+
+
+def _analysis_checkpoint_store() -> RunCheckpointStore:
+    return RunCheckpointStore(_analysis_checkpoint_dir())
+
+
+def _checkpoint_nonblocking(
+    run_id: str,
+    step: str,
+    callback,
+    *,
+    on_failure=None,
+) -> bool:
+    try:
+        callback()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_checkpoint_write_failed run_id=%s step=%s error_type=%s",
+            run_id,
+            step,
+            exc.__class__.__name__,
+        )
+        if on_failure is not None:
+            try:
+                on_failure()
+            except Exception as failure_exc:  # noqa: BLE001
+                logger.warning(
+                    "analysis_checkpoint_failure_hook_failed run_id=%s step=%s error_type=%s",
+                    run_id,
+                    step,
+                    failure_exc.__class__.__name__,
+                )
+        return False
+
+
+def _recover_analysis_result(record: dict[str, Any]) -> dict[str, Any]:
+    run_id = str(record.get("run_id") or "")
+    plan = _analysis_checkpoint_store().resume_plan(run_id)
+    if plan.get("blocked"):
+        return {**plan, "provider_result": None}
+    provider_result = record.get("provider_result")
+    provider_completed = "provider" in list(plan.get("skipped_steps") or [])
+    provider_state = str(record.get("provider_invocation_state") or "")
+    if not provider_completed and (
+        provider_state == "completed" or isinstance(provider_result, dict)
+    ):
+        return {
+            **plan,
+            "blocked": True,
+            "error_code": "RECOVERY_PROVIDER_CHECKPOINT_MISSING",
+            "next_step": "",
+            "provider_result": None,
+        }
+    if not provider_completed and provider_state == "started":
+        return {
+            **plan,
+            "blocked": True,
+            "error_code": "RECOVERY_PROVIDER_OUTCOME_UNKNOWN",
+            "next_step": "",
+            "provider_result": None,
+        }
+    if provider_completed:
+        if not isinstance(provider_result, dict):
+            raise CheckpointCorruptionError(
+                "completed provider checkpoint has no persisted provider result"
+            )
+        return {**plan, "provider_result": dict(provider_result)}
+    return {**plan, "provider_result": None}
+
+
+def _checkpoint_stage_input(pack: dict[str, Any], step: str) -> Any:
+    materials = [
+        item
+        for field in ("primary_materials", "auxiliary_materials")
+        for item in list(pack.get(field) or [])
+        if isinstance(item, dict)
+    ]
+    if step == "prepare":
+        return {
+            "pack_id": str(pack.get("pack_id") or ""),
+            "materials": [
+                {
+                    "menu_code": str(item.get("menu_code") or ""),
+                    "articleid": str(item.get("articleid") or ""),
+                    "material_role": str(item.get("material_role") or ""),
+                }
+                for item in materials
+            ],
+        }
+    if step == "attachments":
+        return [
+            {
+                "menu_code": str(material.get("menu_code") or ""),
+                "articleid": str(material.get("articleid") or ""),
+                "attachments": list(material.get("attachments") or []),
+            }
+            for material in materials
+        ]
+    if step == "evidence":
+        return {
+            "evidence_schema_version": pack.get("evidence_schema_version"),
+            "evidence_items": list(pack.get("evidence_items") or []),
+            "primary_materials": list(pack.get("primary_materials") or []),
+            "auxiliary_materials": list(pack.get("auxiliary_materials") or []),
+        }
+    return {"pack_id": str(pack.get("pack_id") or "")}
+
+
+def _bootstrap_analysis_checkpoints(run_id: str, pack: dict[str, Any]) -> None:
+    if not _analysis_checkpoints_enabled():
+        return
+    store = _analysis_checkpoint_store()
+    for step in ("prepare", "attachments", "evidence"):
+        input_value = _checkpoint_stage_input(pack, step)
+        _checkpoint_nonblocking(
+            run_id,
+            step,
+            lambda step=step, input_value=input_value: store.start(
+                run_id,
+                step,
+                input_value,
+                recovery_condition="imported_pack_hash_must_match",
+            ),
+        )
+        _checkpoint_nonblocking(
+            run_id,
+            step,
+            lambda step=step, input_value=input_value: store.complete(
+                run_id,
+                step,
+                input_value,
+                {"imported_from_pack": True},
+                recovery_condition="imported_pack_hash_must_match",
+                allow_bootstrap=True,
+            ),
+        )
+
+
+def _record_stage_checkpoint(
+    run_id: str,
+    step: str,
+    status: str,
+    input_value: Any,
+    output_value: Any = None,
+    *,
+    error_code: str = "",
+    recovery_id: str = "",
+) -> bool:
+    if not _analysis_checkpoints_enabled():
+        return True
+    store = _analysis_checkpoint_store()
+    if status == "started":
+        callback = lambda: store.start(
+            run_id,
+            step,
+            input_value,
+            recovery_id=recovery_id,
+        )
+    elif status == "completed":
+        callback = lambda: store.complete(
+            run_id,
+            step,
+            input_value,
+            output_value,
+            recovery_id=recovery_id,
+            allow_bootstrap=True,
+        )
+    elif status == "failed":
+        callback = lambda: store.fail(
+            run_id,
+            step,
+            input_value,
+            error_code=error_code or "CHECKPOINTED_STEP_FAILED",
+            recovery_id=recovery_id,
+        )
+    else:
+        raise ValueError("invalid checkpoint status")
+    return _checkpoint_nonblocking(run_id, step, callback)
+
+
+def _persist_resume_stage_nonblocking(
+    run_id: str,
+    step: str,
+    result: dict[str, Any],
+) -> None:
+    try:
+        current = _read_analysis_run(run_id)
+        current["resume_stage"] = step
+        current["resume_stage_result"] = dict(result)
+        current["status"] = "repairing" if step == "repair" else "local_quality_checking"
+        current["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
+        _write_analysis_run(current)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_resume_stage_save_failed run_id=%s step=%s error_type=%s",
+            run_id,
+            step,
+            exc.__class__.__name__,
+        )
+
+
+def _analysis_stage_checkpoint_callback(
+    run_id: str,
+    recovery_id: str = "",
+):
+    def callback(
+        step: str,
+        status: str,
+        input_value: Any,
+        output_value: Any = None,
+    ) -> None:
+        _record_stage_checkpoint(
+            run_id,
+            step,
+            status,
+            input_value,
+            output_value,
+            recovery_id=recovery_id,
+        )
+        if status == "completed" and isinstance(output_value, dict):
+            _persist_resume_stage_nonblocking(run_id, step, output_value)
+
+    return callback
+
+
+def _record_analysis_history(record: dict[str, Any]) -> None:
+    if not _analysis_history_enabled():
+        return
+    try:
+        _analysis_history_store().record_run(record)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_history_write_failed run_id=%s error_type=%s",
+            str(record.get("run_id") or ""),
+            exc.__class__.__name__,
+        )
+
+
+def _record_analysis_word_download(
+    record: dict[str, Any], download_url: str, filename: str
+) -> None:
+    if not _analysis_history_enabled():
+        return
+    try:
+        _analysis_history_store().record_word_downloaded(
+            record,
+            download_url=download_url,
+            filename=filename,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_history_word_write_failed run_id=%s error_type=%s",
+            str(record.get("run_id") or ""),
+            exc.__class__.__name__,
+        )
+
+
+def _history_item_for_response(item: dict[str, Any]) -> dict[str, Any]:
+    response_item = dict(item)
+    if _word_export_enabled():
+        return response_item
+    response_item.update(
+        {
+            "word_generated": False,
+            "word_download_available": False,
+            "word_export_available": False,
+            "draft_word_export_available": False,
+            "final_word_export_available": False,
+            "word_download_url": "",
+            "word_filename": "",
+        }
+    )
+    return response_item
+
+
+HISTORY_LIST_RESPONSE_FIELDS = (
+    "run_id",
+    "pack_id",
+    "record_id",
+    "notice_id",
+    "menu_code",
+    "menu_name",
+    "articleid",
+    "title",
+    "status",
+    "run_status",
+    "created_at",
+    "updated_at",
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "provider",
+    "workflow_run_id",
+    "compact_pack_chars",
+    "quality_status",
+    "quality_passed",
+    "quality_gate_status",
+    "primary_failure_code",
+    "word_generated",
+    "word_download_available",
+    "word_export_available",
+    "draft_word_export_available",
+    "final_word_export_available",
+    "deliverable",
+    "needs_manual_review",
+    "revision",
+    "latest_event_id",
+)
+
+HISTORY_COMPARE_FIELDS = (
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "provider",
+    "workflow_run_id",
+    "compact_pack_chars",
+    "quality_status",
+    "primary_failure_code",
+    "draft_word_export_available",
+    "final_word_export_available",
+    "deliverable",
+    "needs_manual_review",
+)
+
+
+def _history_list_item_for_response(item: dict[str, Any]) -> dict[str, Any]:
+    safe_item = _history_item_for_response(item)
+    return {field: safe_item.get(field) for field in HISTORY_LIST_RESPONSE_FIELDS}
+
+
+def _history_compare_item(item: dict[str, Any]) -> dict[str, Any]:
+    safe_item = _history_item_for_response(item)
+    return {field: safe_item.get(field) for field in HISTORY_COMPARE_FIELDS}
+
+
+def _history_material_key(item: dict[str, Any]) -> str:
+    record_id = str(item.get("record_id") or "").strip()
+    if record_id:
+        return f"record:{record_id}"
+    notice_id = str(item.get("notice_id") or "").strip()
+    if notice_id:
+        return f"notice:{notice_id}"
+    menu_code = str(item.get("menu_code") or "").strip()
+    articleid = str(item.get("articleid") or "").strip()
+    if menu_code and articleid:
+        return f"article:{menu_code}:{articleid}"
+    return ""
 
 
 def _safe_run_id(run_id: str) -> str:
@@ -2086,258 +3285,675 @@ def _analysis_run_path(run_id: str) -> Path:
     return _analysis_run_dir() / f"{_safe_run_id(run_id)}.json"
 
 
-def _analysis_run_store() -> WorkflowRunStore:
-    return WorkflowRunStore(_analysis_run_dir())
-
-
 def _make_analysis_run_id(pack_id: str) -> str:
     digest = hashlib.sha256(f"{pack_id}:{datetime.now().isoformat()}:{uuid.uuid4().hex}".encode("utf-8")).hexdigest()[:10]
     return f"run_{datetime.now().strftime('%Y%m%d')}_{digest}"
 
 
-def _selected_workflow_backend() -> WorkflowBackend:
-    value = (os.getenv("WORKFLOW_BACKEND") or WorkflowBackend.DIFY_LEGACY.value).strip().lower()
-    if value == WorkflowBackend.LOCAL_ENGINE.value:
-        return WorkflowBackend.LOCAL_ENGINE
-    if value and value != WorkflowBackend.DIFY_LEGACY.value:
-        logger.warning("unsupported_workflow_backend_configured value=%s fallback=%s", value, WorkflowBackend.DIFY_LEGACY.value)
-    return WorkflowBackend.DIFY_LEGACY
+RUN_STATE_MACHINE_STATUSES = {
+    "created",
+    "preparing",
+    "running",
+    "generating",
+    "generated",
+    "local_quality_checking",
+    "repairing",
+    "fallback_generating",
+    "export_checking",
+    "finished",
+    "needs_manual_review",
+    "failed",
+    "interrupted",
+}
+
+RUN_TERMINAL_STATUSES = {"finished", "needs_manual_review", "failed", "interrupted"}
+
+RUN_P0_FAILURE_CODES = {
+    "CONTROLLED_REPAIR_FAILED",
+    "VBP_RULE_CONFLICT",
+    "VBP_EVIDENCE_INDEX_INVALID",
+    "VBP_C_LEVEL_FACT_USED",
+    "VBP_FACT_SOURCE_REF_INVALID",
+    "VBP_UNSUPPORTED_CLAIM",
+    "VBP_REQUIRED_SECTION_MISSING",
+    "VBP_REQUIRED_TOPIC_MISSING",
+    "UNSUPPORTED_FACT",
+    "SUMMARY_ONLY_REPORT",
+    "REPORT_TOO_SHORT",
+    "REPORT_STRUCTURE_TOO_THIN",
+    "HTTP_ERROR",
+    "WORKFLOW_ID_MISSING",
+    "WORKFLOW_FAILED",
+    "OUTPUT_EMPTY",
+    "OUTPUT_TRUNCATED",
+    "OUTPUT_SCHEMA_INVALID",
+    "TIMEOUT",
+    "LOCAL_QUALITY_GATE_FAILED",
+    "MODEL_QA_BLOCKED",
+    "FALLBACK_REPORT_USED",
+    "FORBIDDEN_PHRASE_IN_REPORT",
+    "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+    "FORMAL_BODY_EMPTY",
+    "EXPORT_GATE_BLOCKED",
+    "AUTO_REPAIR_FAILED",
+    "AUTO_REPAIR_PARTIAL",
+}
+
+RUN_FAILURE_PRIORITY = [
+    "HTTP_ERROR",
+    "TIMEOUT",
+    "WORKFLOW_FAILED",
+    "WORKFLOW_ID_MISSING",
+    "OUTPUT_EMPTY",
+    "OUTPUT_TRUNCATED",
+    "OUTPUT_SCHEMA_INVALID",
+    "CONTROLLED_REPAIR_FAILED",
+    "VBP_RULE_CONFLICT",
+    "VBP_EVIDENCE_INDEX_INVALID",
+    "VBP_C_LEVEL_FACT_USED",
+    "VBP_FACT_SOURCE_REF_INVALID",
+    "VBP_UNSUPPORTED_CLAIM",
+    "VBP_REQUIRED_SECTION_MISSING",
+    "VBP_REQUIRED_TOPIC_MISSING",
+    "UNSUPPORTED_FACT",
+    "SUMMARY_ONLY_REPORT",
+    "REPORT_TOO_SHORT",
+    "REPORT_STRUCTURE_TOO_THIN",
+    "FORMAL_BODY_EMPTY",
+    "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+    "FORBIDDEN_PHRASE_IN_REPORT",
+    "LOCAL_QUALITY_GATE_FAILED",
+    "MODEL_QA_BLOCKED",
+    "FALLBACK_REPORT_USED",
+    "EXPORT_GATE_BLOCKED",
+    "AUTO_REPAIR_FAILED",
+    "AUTO_REPAIR_PARTIAL",
+]
+
+RUN_DEFAULT_TIMINGS = dict(DEFAULT_TIMINGS)
+
+RUN_QUALITY_BLOCKING_CODE_MAP = {
+    "CONTROLLED_REPAIR_FAILED": "CONTROLLED_REPAIR_FAILED",
+    "VBP_RULE_CONFLICT": "VBP_RULE_CONFLICT",
+    "VBP_EVIDENCE_INDEX_INVALID": "VBP_EVIDENCE_INDEX_INVALID",
+    "VBP_C_LEVEL_FACT_USED": "VBP_C_LEVEL_FACT_USED",
+    "VBP_FACT_SOURCE_REF_INVALID": "VBP_FACT_SOURCE_REF_INVALID",
+    "VBP_UNSUPPORTED_CLAIM": "VBP_UNSUPPORTED_CLAIM",
+    "VBP_REQUIRED_SECTION_MISSING": "VBP_REQUIRED_SECTION_MISSING",
+    "VBP_REQUIRED_TOPIC_MISSING": "VBP_REQUIRED_TOPIC_MISSING",
+    "UNSUPPORTED_FACT": "UNSUPPORTED_FACT",
+    "SUMMARY_ONLY_REPORT": "SUMMARY_ONLY_REPORT",
+    "REPORT_TOO_SHORT": "REPORT_TOO_SHORT",
+    "REPORT_TOO_SHORT_FOR_WEIGHTED_EVIDENCE": "REPORT_TOO_SHORT",
+    "REPORT_MISSING_CORE_COVERAGE": "REPORT_STRUCTURE_TOO_THIN",
+    "MISSING_CORE_COVERAGE": "REPORT_STRUCTURE_TOO_THIN",
+    "REPORT_STRUCTURE_TOO_THIN": "REPORT_STRUCTURE_TOO_THIN",
+    "TECHNICAL_NOTE_IN_REPORT_BODY": "FORBIDDEN_PHRASE_IN_REPORT",
+    "FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
+    "QUALITY_CHECK_BLOCKED": "LOCAL_QUALITY_GATE_FAILED",
+    "LOCAL_QUALITY_GATE_FAILED": "LOCAL_QUALITY_GATE_FAILED",
+}
+
+RUN_ISSUE_ID_CODE_MAP = {
+    "Q_LOCAL_QUALITY_GATE": "LOCAL_QUALITY_GATE_FAILED",
+    "Q_DIFY_CALL_FAILED_FALLBACK": "FALLBACK_REPORT_USED",
+    "Q_DIFY_FRAGMENTARY_REPORT": "OUTPUT_TRUNCATED",
+    "Q_FORBIDDEN_PHRASE": "FORBIDDEN_PHRASE_IN_REPORT",
+    "Q_FORBIDDEN_PHRASE_IN_REPORT": "FORBIDDEN_PHRASE_IN_REPORT",
+    "Q_FORBIDDEN_PHRASE_FORMAL_BODY": "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+    "Q_FORMAL_BODY_EMPTY": "FORMAL_BODY_EMPTY",
+    "Q_CONTROLLED_REPAIR_FAILED": "CONTROLLED_REPAIR_FAILED",
+    "Q_AUTO_REPAIR_FAILED": "AUTO_REPAIR_FAILED",
+    "Q_AUTO_REPAIR_PARTIAL": "AUTO_REPAIR_PARTIAL",
+}
+
+RUN_DIFY_ERROR_CODE_MAP = {
+    "DIFY_TIMEOUT": "TIMEOUT",
+    "DIFY_CALL_FAILED": "HTTP_ERROR",
+    "DIFY_HTTP_ERROR": "HTTP_ERROR",
+    "DIFY_REQUEST_FAILED": "HTTP_ERROR",
+    "DIFY_NOT_CONFIGURED": "HTTP_ERROR",
+    "DIFY_WORKFLOW_FAILED": "WORKFLOW_FAILED",
+    "DIFY_INVALID_RESPONSE": "OUTPUT_SCHEMA_INVALID",
+    "DIFY_OUTPUT_EMPTY": "OUTPUT_EMPTY",
+    "DIFY_FRAGMENTARY_REPORT": "OUTPUT_TRUNCATED",
+    "GENERATION_JSON_PARSE_FAILED": "OUTPUT_SCHEMA_INVALID",
+    "HTTP_ERROR": "HTTP_ERROR",
+    "WORKFLOW_ID_MISSING": "WORKFLOW_ID_MISSING",
+    "WORKFLOW_FAILED": "WORKFLOW_FAILED",
+    "OUTPUT_EMPTY": "OUTPUT_EMPTY",
+    "OUTPUT_TRUNCATED": "OUTPUT_TRUNCATED",
+    "OUTPUT_SCHEMA_INVALID": "OUTPUT_SCHEMA_INVALID",
+    "TIMEOUT": "TIMEOUT",
+}
+
+RUN_FAILURE_REASON_LABELS = {
+    "CONTROLLED_REPAIR_FAILED": "受控正文修复未通过发布校验。",
+    "VBP_RULE_CONFLICT": "VBP 事实规则存在冲突，专项门禁未通过。",
+    "VBP_EVIDENCE_INDEX_INVALID": "claim 与证据索引无效，专项门禁未通过。",
+    "VBP_C_LEVEL_FACT_USED": "正式 claim 使用了不可独立支持事实的辅助信息。",
+    "VBP_FACT_SOURCE_REF_INVALID": "正式 claim 的来源定位无效。",
+    "VBP_UNSUPPORTED_CLAIM": "正式 claim 未获得有效 A/B 证据支持。",
+    "VBP_REQUIRED_SECTION_MISSING": "VBP 报告缺少必需结构。",
+    "VBP_REQUIRED_TOPIC_MISSING": "VBP 报告缺少已有证据对应的必需主题。",
+    "UNSUPPORTED_FACT": "报告存在未被 evidence_pack 支撑的事实表述。",
+    "SUMMARY_ONLY_REPORT": "报告偏摘要化，分析深度未达到自动交付条件。",
+    "REPORT_TOO_SHORT": "报告正文过短，未达到自动交付条件。",
+    "REPORT_STRUCTURE_TOO_THIN": "报告结构或核心覆盖不足，未达到自动交付条件。",
+    "LOCAL_QUALITY_GATE_FAILED": "本地质量门禁未通过。",
+    "MODEL_QA_BLOCKED": "模型或工作流异常导致未达到自动交付条件。",
+    "FALLBACK_REPORT_USED": "已启用后端保守兜底报告。",
+    "FORBIDDEN_PHRASE_IN_REPORT": "正式报告命中禁止表达。",
+    "FORBIDDEN_PHRASE_IN_FORMAL_BODY": "正式报告正文命中禁止表达。",
+    "FORMAL_BODY_EMPTY": "正式报告正文为空。",
+    "EXPORT_GATE_BLOCKED": "导出门禁阻止最终 Word 交付。",
+    "AUTO_REPAIR_FAILED": "自动修复未成功。",
+    "AUTO_REPAIR_PARTIAL": "自动修复仅部分成功。",
+    "HTTP_ERROR": "Dify 服务调用失败。",
+    "WORKFLOW_ID_MISSING": "Dify 返回结果缺少工作流标识。",
+    "WORKFLOW_FAILED": "Dify 工作流执行失败。",
+    "OUTPUT_EMPTY": "生成链路未返回可用正文。",
+    "OUTPUT_TRUNCATED": "Dify 返回正文不完整。",
+    "OUTPUT_SCHEMA_INVALID": "Dify 返回结构无法解析。",
+    "TIMEOUT": "Dify 工作流调用超时。",
+    "UNCLASSIFIED": "当前 run 未达到自动交付条件。",
+}
 
 
-def _workflow_node_status_from_run_status(status: str) -> str:
-    if status in {"finished", "needs_manual_review"}:
-        return "finished"
-    if status == "failed":
-        return "failed"
-    if status == "cancelled":
-        return "cancelled"
-    if status == "running":
-        return "running"
-    return status or "pending"
+def _dedupe_strings(values: list[Any] | tuple[Any, ...] | set[Any] | None) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        result.append(text)
+    return result
 
 
-def _analysis_elapsed_ms(started_at: Any, finished_at: Any) -> int:
-    start = _parse_analysis_timestamp(started_at)
-    finish = _parse_analysis_timestamp(finished_at)
-    if not start or not finish:
-        return 0
-    return max(0, int((finish - start).total_seconds() * 1000))
+def _canonical_generation_failure_code(value: Any) -> str:
+    code = str(value or "").strip().upper()
+    if not code:
+        return ""
+    if code in RUN_P0_FAILURE_CODES:
+        return code
+    return canonical_provider_failure_code(code)
 
 
-def _ensure_workflow_run_metadata(record: dict[str, Any]) -> dict[str, Any]:
-    status = str(record.get("status") or "running")
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    backend = str(record.get("workflow_backend") or record.get("backend") or WorkflowBackend.DIFY_LEGACY.value)
-    record["backend"] = backend
-    record["workflow_backend"] = backend
-    record.setdefault("created_at", now)
-    record.setdefault("started_at", record.get("created_at") or now)
-    record.setdefault("finished_at", "")
-    if status in {"finished", "needs_manual_review", "failed", "cancelled"} and not record.get("finished_at"):
-        record["finished_at"] = str(record.get("updated_at") or now)
-    record["elapsed_ms"] = _analysis_elapsed_ms(record.get("started_at"), record.get("finished_at"))
-    record.setdefault("error", str(record.get("error_message") or record.get("error_detail") or ""))
-    record.setdefault(
-        "artifacts",
-        {
-            "report_markdown_path": "",
-            "report_ir_path": "",
-            "qa_result_path": "",
-        },
-    )
+def _safe_int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
+        return default
 
-    nodes = record.get("nodes") if isinstance(record.get("nodes"), list) else []
-    if backend == WorkflowBackend.LOCAL_ENGINE.value and nodes:
-        record["nodes"] = nodes
-        return record
-    node_status = _workflow_node_status_from_run_status(status)
-    node_error = str(record.get("error_message") or record.get("error_detail") or "") if node_status == "failed" else ""
-    node_started_at = str(record.get("started_at") or record.get("created_at") or now)
-    node_finished_at = str(record.get("finished_at") or "")
-    node_elapsed_ms = _analysis_elapsed_ms(node_started_at, node_finished_at)
-    node_name = "local_engine_workflow" if backend == WorkflowBackend.LOCAL_ENGINE.value else "dify_legacy_workflow"
-    legacy_node = make_workflow_node(
-        node_name,
-        status=node_status,
-        started_at=node_started_at,
-        finished_at=node_finished_at,
-        elapsed_ms=node_elapsed_ms,
-        error=node_error,
-    )
-    if nodes:
-        updated = False
-        for index, node in enumerate(nodes):
-            if isinstance(node, dict) and node.get("name") == node_name:
-                merged = dict(node)
-                merged.update(legacy_node)
-                nodes[index] = merged
-                updated = True
-                break
-        if not updated:
-            nodes.insert(0, legacy_node)
+
+def _normalize_run_timings(value: Any) -> dict[str, Any]:
+    return normalize_pipeline_timings(value)
+
+
+def _persist_run_timings_nonblocking(run_id: str, timings: Any) -> None:
+    try:
+        record = _read_analysis_run(run_id)
+        merged = PipelineTiming(record.get("timings"))
+        merged.merge(timings)
+        record["timings"] = merged.snapshot()
+        _write_analysis_run(record)
+        logger.info("analysis_run_timings_saved run_id=%s timings=%s", run_id, record["timings"])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_run_timings_save_failed run_id=%s error_type=%s",
+            run_id,
+            exc.__class__.__name__,
+        )
+
+
+def _extract_issue_codes(items: Any) -> list[str]:
+    codes: list[str] = []
+    if not isinstance(items, list):
+        return codes
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        issue_id = str(item.get("issue_id") or "").strip()
+        problem_type = str(item.get("problem_type") or "").strip()
+        code = str(item.get("code") or "").strip()
+        mapped = RUN_ISSUE_ID_CODE_MAP.get(issue_id) or RUN_DIFY_ERROR_CODE_MAP.get(problem_type) or RUN_QUALITY_BLOCKING_CODE_MAP.get(code)
+        if mapped:
+            codes.append(mapped)
+    return _dedupe_strings(codes)
+
+
+def _extract_quality_gate_codes(quality_gate: Any) -> list[str]:
+    if not isinstance(quality_gate, dict):
+        return []
+    codes: list[str] = []
+    raw_codes = quality_gate.get("blocking_issue_codes")
+    if isinstance(raw_codes, list):
+        codes.extend(str(item or "").strip() for item in raw_codes)
+    blocking_issues = quality_gate.get("blocking_issues")
+    if isinstance(blocking_issues, list):
+        for item in blocking_issues:
+            if isinstance(item, dict):
+                codes.append(str(item.get("code") or "").strip())
+    mapped = [RUN_QUALITY_BLOCKING_CODE_MAP.get(code, code) for code in codes if code]
+    if bool(quality_gate.get("summary_only_risk")):
+        mapped.append("SUMMARY_ONLY_REPORT")
+    if _safe_int_value(quality_gate.get("unsupported_fact_count"), 0) > 0:
+        mapped.append("UNSUPPORTED_FACT")
+    return _dedupe_strings(mapped)
+
+
+def _collect_failure_stages(
+    record: dict[str, Any],
+    *,
+    generation_failure_codes: list[str],
+    quality_failure_codes: list[str],
+) -> list[dict[str, Any]]:
+    stages: list[dict[str, Any]] = []
+    raw_stages = record.get("failure_stages")
+    if isinstance(raw_stages, list):
+        stages.extend(item for item in raw_stages if isinstance(item, dict))
     else:
-        nodes = [legacy_node]
-    record["nodes"] = nodes
-    return record
+        existing = record.get("failure_attribution")
+        if isinstance(existing, dict) and isinstance(existing.get("layers"), dict):
+            stages.extend(
+                item
+                for item in existing["layers"].values()
+                if isinstance(item, dict)
+            )
+    provider_stage = record.get("provider_stage")
+    if isinstance(provider_stage, dict):
+        stages = [
+            item
+            for item in stages
+            if str(item.get("layer") or "").strip() != "provider"
+        ]
+        stages.append(provider_stage)
+
+    provider_stage_present = any(
+        str(item.get("layer") or "").strip() == "provider"
+        and str(item.get("status") or "").strip() in {"ok", "blocked"}
+        for item in stages
+    )
+    blocked_layers = {
+        str(item.get("layer") or "").strip()
+        for item in stages
+        if isinstance(item, dict)
+        and str(item.get("status") or "").strip() == "blocked"
+    }
+    if not provider_stage_present:
+        provider_codes: list[str] = []
+        dify_error_code = str(record.get("dify_error_code") or "").strip()
+        if dify_error_code:
+            provider_codes.append(canonical_provider_failure_code(dify_error_code))
+        provider_codes.extend(
+            canonical_provider_failure_code(code)
+            for code in generation_failure_codes
+            if code not in {"FALLBACK_REPORT_USED", "AUTO_REPAIR_FAILED", "AUTO_REPAIR_PARTIAL"}
+        )
+        provider_codes = [code for code in _dedupe_strings(provider_codes) if code]
+        if provider_codes:
+            stages.append(
+                make_layer_result(
+                    "provider",
+                    status="blocked",
+                    code=provider_codes[0],
+                )
+            )
+
+    if "cleanup" not in blocked_layers and any(
+        code in {"AUTO_REPAIR_FAILED", "AUTO_REPAIR_PARTIAL"}
+        for code in generation_failure_codes
+    ):
+        stages.append(
+            make_layer_result(
+                "cleanup",
+                status="blocked",
+                code="CLEANUP_SCHEMA_INVALID",
+            )
+        )
+
+    if "quality_gate" not in blocked_layers and quality_failure_codes:
+        allowed = {
+            "CONTROLLED_REPAIR_FAILED",
+            "VBP_RULE_CONFLICT",
+            "VBP_EVIDENCE_INDEX_INVALID",
+            "VBP_C_LEVEL_FACT_USED",
+            "VBP_FACT_SOURCE_REF_INVALID",
+            "VBP_UNSUPPORTED_CLAIM",
+            "VBP_REQUIRED_SECTION_MISSING",
+            "VBP_REQUIRED_TOPIC_MISSING",
+            "UNSUPPORTED_FACT",
+            "SUMMARY_ONLY_REPORT",
+            "REPORT_TOO_SHORT",
+            "REPORT_STRUCTURE_TOO_THIN",
+            "FORBIDDEN_PHRASE_IN_REPORT",
+            "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+            "FORMAL_BODY_EMPTY",
+            "LOCAL_QUALITY_GATE_FAILED",
+            "MODEL_QA_BLOCKED",
+            "EXPORT_GATE_BLOCKED",
+        }
+        quality_priority = (
+            "CONTROLLED_REPAIR_FAILED",
+            "VBP_RULE_CONFLICT",
+            "VBP_EVIDENCE_INDEX_INVALID",
+            "VBP_C_LEVEL_FACT_USED",
+            "VBP_FACT_SOURCE_REF_INVALID",
+            "VBP_UNSUPPORTED_CLAIM",
+            "VBP_REQUIRED_SECTION_MISSING",
+            "VBP_REQUIRED_TOPIC_MISSING",
+            "UNSUPPORTED_FACT",
+            "SUMMARY_ONLY_REPORT",
+            "REPORT_TOO_SHORT",
+            "REPORT_STRUCTURE_TOO_THIN",
+            "FORMAL_BODY_EMPTY",
+            "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+            "FORBIDDEN_PHRASE_IN_REPORT",
+            "EXPORT_GATE_BLOCKED",
+            "MODEL_QA_BLOCKED",
+            "LOCAL_QUALITY_GATE_FAILED",
+        )
+        quality_code = next(
+            (
+                code
+                for code in quality_priority
+                if code in allowed and code in quality_failure_codes
+            ),
+            "UNCLASSIFIED",
+        )
+        stages.append(
+            make_layer_result(
+                "quality_gate",
+                status="blocked",
+                code=quality_code,
+            )
+        )
+    return stages
+
+
+def _is_explicitly_deliverable(record: dict[str, Any], run_status: str, has_formal_body: bool) -> bool:
+    quality_gate = record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {}
+    quality_check = record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {}
+    gate_status = str(quality_gate.get("deliverable_status") or "").strip()
+    if run_status != "finished" or not has_formal_body:
+        return False
+    if gate_status:
+        return gate_status == "deliverable"
+    return quality_check.get("passed") is True
+
+
+def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = upgrade_run_schema(record)
+    raw_status = str(normalized.get("status") or normalized.get("run_status") or "created").strip() or "created"
+    if raw_status not in RUN_STATE_MACHINE_STATUSES:
+        raw_status = "failed" if normalized.get("success") is False else "running"
+    normalized["run_status"] = raw_status
+    normalized["status"] = raw_status
+
+    report_markdown = str(normalized.get("report_markdown") or "").strip()
+    report_ir = normalized.get("report_ir") if isinstance(normalized.get("report_ir"), dict) else None
+    quality_check = normalized.get("quality_check") if isinstance(normalized.get("quality_check"), dict) else {"passed": None, "issues": []}
+    quality_gate = normalized.get("quality_gate") if isinstance(normalized.get("quality_gate"), dict) else {}
+    remaining_issues = normalized.get("remaining_issues") if isinstance(normalized.get("remaining_issues"), list) else []
+    quality_issues = quality_check.get("issues") if isinstance(quality_check.get("issues"), list) else []
+
+    repair_count_raw, repair_count_raw_invalid = parse_repair_count(
+        normalized.get("repair_count")
+    )
+    observed_value = (
+        normalized.get("repair_count_observed")
+        if "repair_count_observed" in normalized
+        else repair_count_raw
+    )
+    repair_count_observed, repair_count_observed_invalid = parse_repair_count(observed_value)
+    repair_count_observed = max(repair_count_raw, repair_count_observed)
+    repair_attempted = bool(normalized.get("repair_attempted")) or repair_count_observed > 0
+    repair_count_violation = bool(
+        normalized.get("repair_count_violation")
+        or repair_count_raw_invalid
+        or repair_count_observed_invalid
+        or repair_count_observed > 1
+    )
+    repair_attempted = repair_attempted or repair_count_violation
+    if repair_attempted and repair_count_observed == 0:
+        repair_count_observed = 1
+    repair_success = bool(normalized.get("repair_success")) and not repair_count_violation
+    repair_count = 1 if repair_attempted else 0
+    repair_failed = bool(repair_attempted and not repair_success)
+
+    quality_failure_codes = _dedupe_strings(
+        [
+            *list(normalized.get("quality_failure_codes") or []),
+            *_extract_quality_gate_codes(quality_gate),
+            *_extract_issue_codes(quality_issues),
+            *_extract_issue_codes(remaining_issues),
+        ]
+    )
+    if raw_status in RUN_TERMINAL_STATUSES and quality_check.get("passed") is False and not quality_failure_codes:
+        quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
+    if quality_gate.get("deliverable_status") == "needs_manual_review" and not quality_failure_codes:
+        quality_failure_codes.append("LOCAL_QUALITY_GATE_FAILED")
+    if repair_failed and "CONTROLLED_REPAIR_FAILED" not in quality_failure_codes:
+        quality_failure_codes.append("CONTROLLED_REPAIR_FAILED")
+
+    generation_failure_codes = _dedupe_strings(
+        [
+            _canonical_generation_failure_code(code)
+            for code in list(normalized.get("generation_failure_codes") or [])
+        ]
+    )
+    raw_dify_error_code = str(normalized.get("dify_error_code") or "").strip()
+    dify_error_code = canonical_provider_failure_code(raw_dify_error_code) if raw_dify_error_code else ""
+    if dify_error_code:
+        generation_failure_codes.append(dify_error_code)
+    generation_failure_codes.extend(
+        code
+        for code in _extract_issue_codes(remaining_issues)
+        if code
+        in {
+            "HTTP_ERROR",
+            "WORKFLOW_ID_MISSING",
+            "WORKFLOW_FAILED",
+            "OUTPUT_EMPTY",
+            "OUTPUT_TRUNCATED",
+            "OUTPUT_SCHEMA_INVALID",
+            "TIMEOUT",
+            "FALLBACK_REPORT_USED",
+        }
+    )
+    if raw_status in {"failed", "needs_manual_review"} and not report_markdown and not report_ir and "OUTPUT_EMPTY" not in generation_failure_codes:
+        generation_failure_codes.append("OUTPUT_EMPTY")
+    generation_failure_codes = _dedupe_strings(generation_failure_codes)
+
+    fallback_used = bool(normalized.get("fallback_used"))
+    if dify_error_code or "FALLBACK_REPORT_USED" in generation_failure_codes or "OUTPUT_TRUNCATED" in generation_failure_codes:
+        fallback_used = True
+    if any(isinstance(item, dict) and item.get("issue_id") in {"Q_DIFY_CALL_FAILED_FALLBACK", "Q_DIFY_FRAGMENTARY_REPORT"} for item in remaining_issues):
+        fallback_used = True
+
+    body_safety = scan_formal_body(
+        FormalBodyDocument(markdown=report_markdown, report_ir=report_ir)
+    )
+    deliverable = bool(
+        body_safety.safe
+        and not repair_failed
+        and _is_explicitly_deliverable(normalized, raw_status, body_safety.has_body)
+    )
+    needs_manual_review = bool(
+        raw_status == "needs_manual_review"
+        or quality_gate.get("deliverable_status") == "needs_manual_review"
+        or repair_failed
+        or (raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not deliverable)
+    )
+    word_export_available = bool(
+        body_safety.safe
+        and not repair_failed
+        and raw_status in {"finished", "needs_manual_review"}
+        and _word_export_enabled()
+    )
+    draft_word_export_available = word_export_available
+    final_word_export_available = bool(word_export_available and deliverable)
+    if raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not body_safety.safe:
+        safety_code = (
+            "FORMAL_BODY_EMPTY" if not body_safety.has_body else "FORBIDDEN_PHRASE_IN_FORMAL_BODY"
+        )
+        if safety_code not in quality_failure_codes:
+            quality_failure_codes.append(safety_code)
+
+    existing_blocking_codes = [
+        _canonical_generation_failure_code(code)
+        for code in list(normalized.get("blocking_issue_codes") or [])
+    ]
+    all_codes = _dedupe_strings([*generation_failure_codes, *quality_failure_codes, *existing_blocking_codes])
+    if fallback_used and "FALLBACK_REPORT_USED" not in all_codes:
+        all_codes.append("FALLBACK_REPORT_USED")
+
+    failure_stages = _collect_failure_stages(
+        normalized,
+        generation_failure_codes=generation_failure_codes,
+        quality_failure_codes=quality_failure_codes,
+    )
+    failure_attribution = build_failure_attribution(
+        run_status=raw_status,
+        deliverable=deliverable,
+        stages=failure_stages,
+    )
+    primary_failure_code = failure_attribution["primary_failure_code"]
+    secondary_failure_codes = list(failure_attribution["secondary_failure_codes"])
+
+    reason_summary = str(normalized.get("manual_review_reason_summary") or "").strip()
+    final_blocking_reason = str(normalized.get("final_blocking_reason") or "").strip()
+    if primary_failure_code and not reason_summary:
+        reason_summary = RUN_FAILURE_REASON_LABELS.get(primary_failure_code, "当前 run 未达到自动交付条件。")
+    if primary_failure_code and not final_blocking_reason:
+        final_blocking_reason = reason_summary
+    if not primary_failure_code:
+        reason_summary = ""
+        final_blocking_reason = ""
+
+    normalized.update(
+        {
+            "deliverable": deliverable,
+            "formal_body_present": body_safety.has_body,
+            "body_safety_passed": body_safety.safe,
+            "body_safety_failure_code": (
+                ""
+                if body_safety.safe
+                else ("FORMAL_BODY_EMPTY" if not body_safety.has_body else "FORBIDDEN_PHRASE_IN_FORMAL_BODY")
+            ),
+            "forbidden_phrase_hits": [
+                {"phrase": hit.phrase, "location": hit.location} for hit in body_safety.hits
+            ],
+            "draft_word_export_available": draft_word_export_available,
+            "final_word_export_available": final_word_export_available,
+            "word_export_available": word_export_available,
+            "needs_manual_review": needs_manual_review,
+            "failure_schema_version": FAILURE_SCHEMA_VERSION,
+            "failure_attribution": failure_attribution,
+            "failure_stages": list(failure_attribution["layers"].values()),
+            "primary_layer": failure_attribution["primary_layer"],
+            "primary_failure_code": primary_failure_code,
+            "secondary_failure_codes": secondary_failure_codes,
+            "quality_failure_codes": _dedupe_strings(quality_failure_codes),
+            "generation_failure_codes": _dedupe_strings(generation_failure_codes),
+            "blocking_issue_codes": _dedupe_strings(all_codes),
+            "fallback_used": fallback_used,
+            "fallback_reason": _canonical_generation_failure_code(
+                normalized.get("fallback_reason")
+                or dify_error_code
+                or ("OUTPUT_TRUNCATED" if "OUTPUT_TRUNCATED" in all_codes else "")
+            ),
+            "fallback_provider": str(normalized.get("fallback_provider") or ("backend_pack_fallback" if fallback_used else "")).strip(),
+            "repair_attempted": repair_attempted,
+            "repair_success": repair_success,
+            "repair_count": repair_count,
+            "repair_count_observed": repair_count_observed,
+            "repair_count_violation": repair_count_violation,
+            "repair_actions": list(normalized.get("repair_actions") or []),
+            "manual_review_reason_summary": reason_summary,
+            "final_blocking_reason": final_blocking_reason,
+            "provider": str(normalized.get("provider") or "dify").strip() or "dify",
+            "dify_error_code": dify_error_code,
+            "provider_run_id": str(normalized.get("provider_run_id") or normalized.get("workflow_run_id") or "").strip(),
+            "generator_version": str(normalized.get("generator_version") or "").strip(),
+            "prompt_version": str(normalized.get("prompt_version") or "").strip(),
+            "workflow_version": str(normalized.get("workflow_version") or "").strip(),
+            "compact_pack_chars": max(
+                0,
+                _safe_int_value(
+                    normalized.get("compact_pack_chars")
+                    or normalized.get("final_dify_input_chars")
+                    or normalized.get("dify_compact_pack_chars")
+                    or 0
+                ),
+            ),
+            "input_strategy": str(normalized.get("input_strategy") or "").strip(),
+            "timings": _normalize_run_timings(normalized.get("timings")),
+        }
+    )
+    if not word_export_available:
+        for field in WORD_EXPORT_LOCATOR_FIELDS:
+            if field in normalized:
+                normalized[field] = ""
+        for field in WORD_EXPORT_METADATA_FIELDS:
+            if field in normalized:
+                normalized[field] = ""
+        if "word_generated" in normalized:
+            normalized["word_generated"] = False
+    return normalized
 
 
 def _write_analysis_run(record: dict[str, Any]) -> None:
+    record = _normalize_analysis_run_schema(record)
     run_id = str(record.get("run_id") or "")
     path = _analysis_run_path(run_id)
-    record = _ensure_workflow_run_metadata(record)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        _analysis_run_store().write_run(record)
-    except WorkflowRunStoreError as exc:
-        logger.warning("analysis_run_write_failed run_id=%s code=%s", run_id, exc.code)
-        raise HTTPException(status_code=500, detail="analysis run write failed") from exc
-    logger.info(
-        "analysis_run_saved run_id=%s pack_id=%s status=%s path=%s",
-        run_id,
-        record.get("pack_id") or "",
-        record.get("status") or "",
-        path,
-    )
+        temp_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        _record_analysis_history(record)
+        os.replace(temp_path, path)
+        logger.info(
+            "analysis_run_saved run_id=%s pack_id=%s status=%s path=%s",
+            run_id,
+            record.get("pack_id") or "",
+            record.get("status") or "",
+            path,
+        )
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _read_analysis_run(run_id: str) -> dict[str, Any]:
+    path = _analysis_run_path(run_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="analysis run not found")
     try:
-        return _analysis_run_store().read_run(_safe_run_id(run_id))
-    except WorkflowRunStoreError as exc:
-        logger.warning("analysis_run_read_failed run_id=%s code=%s", run_id, exc.code)
-        if exc.code == "RUN_NOT_FOUND":
-            raise HTTPException(status_code=404, detail="analysis run not found") from exc
-        raise HTTPException(status_code=500, detail=f"analysis run read failed: {exc.code}") from exc
-
-
-def _list_analysis_runs() -> list[dict[str, Any]]:
-    try:
-        return _analysis_run_store().list_runs()
-    except WorkflowRunStoreError as exc:
-        logger.warning("analysis_run_list_failed code=%s", exc.code)
-        return []
-
-
-def _active_analysis_run_statuses() -> set[str]:
-    return {"created", "running"}
-
-
-def _analysis_run_input_hash(
-    *,
-    pack_id: str,
-    backend: str,
-    use_report_memory: bool,
-    memory_metadata: dict[str, Any],
-) -> str:
-    payload = {
-        "pack_id": pack_id,
-        "workflow_backend": backend,
-        "use_report_memory": bool(use_report_memory),
-        "report_memory_hash": str(memory_metadata.get("report_memory_hash") or ""),
-        "used_memory_ids": list(memory_metadata.get("used_memory_ids") or []),
-    }
-    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-
-
-def _find_active_analysis_run_by_input_hash(input_hash: str) -> dict[str, Any] | None:
-    if not input_hash:
-        return None
-    for record in _list_analysis_runs():
-        if str(record.get("input_hash") or "") != input_hash:
-            continue
-        if str(record.get("status") or "") in _active_analysis_run_statuses():
-            return record
-    return None
-
-
-def _mark_analysis_run_idempotency_reuse(record: dict[str, Any]) -> dict[str, Any]:
-    duplicate_count = int(record.get("idempotency_duplicate_count") or 0) + 1
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    record["idempotency_duplicate_count"] = duplicate_count
-    record["last_duplicate_at"] = now
-    record["updated_at"] = now
-    _append_analysis_run_control_event(
-        record,
-        _make_analysis_run_control_event(
-            "idempotency_reuse",
-            source_run_id=str(record.get("run_id") or ""),
-            target_run_id=str(record.get("run_id") or ""),
-            status_before=str(record.get("status") or ""),
-            status_after=str(record.get("status") or ""),
-        ),
-    )
-    _write_analysis_run(record)
-    reused = dict(record)
-    reused["idempotency_reused"] = True
-    return reused
-
-
-def _analysis_run_recovery_stale_seconds() -> float:
-    return max(0.0, _env_float("ANALYSIS_RUN_RECOVERY_STALE_SECONDS", 3600.0))
-
-
-def _pending_run_is_stale(record: dict[str, Any], stale_seconds: float, now: datetime | None = None) -> bool:
-    if str(record.get("status") or "") not in _active_analysis_run_statuses():
-        return False
-    if stale_seconds <= 0:
-        return False
-    started_at = _parse_analysis_timestamp(record.get("started_at") or record.get("created_at") or record.get("updated_at"))
-    if not started_at:
-        return False
-    return ((now or datetime.now()) - started_at).total_seconds() >= stale_seconds
-
-
-def _recover_stale_pending_analysis_runs(stale_seconds: float | None = None) -> dict[str, Any]:
-    threshold = _analysis_run_recovery_stale_seconds() if stale_seconds is None else max(0.0, float(stale_seconds))
-    records = _list_analysis_runs()
-    checked_count = 0
-    recovered_run_ids: list[str] = []
-    now_dt = datetime.now()
-    now = now_dt.isoformat(sep=" ", timespec="seconds")
-    for record in records:
-        if str(record.get("status") or "") not in _active_analysis_run_statuses():
-            continue
-        checked_count += 1
-        if not _pending_run_is_stale(record, threshold, now_dt):
-            continue
-        record.update(
-            {
-                "success": False,
-                "status": "failed",
-                "updated_at": now,
-                "finished_at": now,
-                "recovered_at": now,
-                "recovery_reason": "stale_pending_run",
-                "error_code": "RUN_RECOVERED_STALE_PENDING",
-                "error_message": "服务启动恢复：上次遗留的运行中任务已标记为失败，可重试",
-                "error_detail": f"pending run exceeded recovery threshold {threshold:.0f}s",
-            }
-        )
-        _append_analysis_run_control_event(
-            record,
-            _make_analysis_run_control_event(
-                "startup_recovery",
-                source_run_id=str(record.get("run_id") or ""),
-                status_before="running",
-                status_after="failed",
-            ),
-        )
-        _write_analysis_run(record)
-        recovered_run_ids.append(str(record.get("run_id") or ""))
-    return {
-        "checked_count": checked_count,
-        "recovered_count": len(recovered_run_ids),
-        "recovered_run_ids": recovered_run_ids,
-        "stale_seconds": threshold,
-    }
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return _normalize_analysis_run_schema(data if isinstance(data, dict) else {})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis_run_read_failed run_id=%s error_type=%s", run_id, exc.__class__.__name__)
+        raise HTTPException(status_code=500, detail="analysis run read failed") from exc
 
 
 class DifyWorkflowError(Exception):
-    def __init__(self, code: str, message: str, detail: str = "", status_code: int = 502):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        detail: str = "",
+        status_code: int = 502,
+        *,
+        provider_stage: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.detail = detail
         self.status_code = status_code
+        self.provider_stage = provider_stage
 
 
 def _dify_config() -> dict[str, Any]:
@@ -2353,7 +3969,19 @@ def _dify_config() -> dict[str, Any]:
     staged_max_attempts = max(1, _env_int("DIFY_STAGED_MAX_ATTEMPTS", 1))
     if not base_url or not api_key:
         logger.warning("dify_configuration_incomplete base_url_configured=%s api_key_configured=%s", bool(base_url), bool(api_key))
-        raise DifyWorkflowError("DIFY_NOT_CONFIGURED", "Dify API 配置不完整", status_code=500)
+        stage = make_layer_result(
+            "provider",
+            status="blocked",
+            code="HTTP_ERROR",
+            metrics={"configuration_complete": False},
+        )
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "Dify API 配置不完整",
+            "provider configuration incomplete",
+            status_code=500,
+            provider_stage=stage,
+        )
     return {
         "base_url": base_url,
         "api_key": api_key,
@@ -2493,37 +4121,24 @@ def _parse_json_list(value: Any) -> list[Any]:
     return [value]
 
 
-def _extract_dify_outputs(response_json: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
-    workflow_run_id = str(response_json.get("workflow_run_id") or "")
+def _extract_dify_outputs(
+    response_json: dict[str, Any],
+) -> tuple[str, dict[str, Any], str, dict[str, Any]]:
+    try:
+        workflow_run_id, output, provider_stage = extract_provider_output(response_json)
+    except ProviderResponseError as exc:
+        raise DifyWorkflowError(
+            exc.code,
+            "Dify provider response failed validation",
+            exc.code,
+            provider_stage=exc.stage,
+        ) from exc
     data = response_json.get("data") if isinstance(response_json.get("data"), dict) else {}
-    if not workflow_run_id:
-        workflow_run_id = str(data.get("id") or data.get("workflow_run_id") or "")
-    if str(data.get("status") or "").lower() in {"failed", "stopped"}:
-        raise DifyWorkflowError("DIFY_WORKFLOW_FAILED", "Dify 工作流执行失败", str(data.get("error") or data.get("status") or ""))
-    outputs = data.get("outputs") if isinstance(data.get("outputs"), dict) else response_json.get("outputs")
-    output_dict = _parse_json_object(outputs) or {}
-    candidates: list[dict[str, Any] | None] = [
-        output_dict,
-        _parse_json_object(output_dict.get("result")),
-        _parse_json_object(output_dict.get("output")),
-        _parse_json_object(output_dict.get("answer")),
-        _parse_json_object(output_dict.get("text")),
-        _parse_json_object(output_dict.get("report")),
-    ]
-    for value in output_dict.values():
-        parsed = _parse_json_object(value)
-        if parsed:
-            candidates.append(parsed)
-    for candidate in candidates:
-        if candidate and candidate.get("report_markdown"):
-            return workflow_run_id, candidate, str(data.get("status") or "")
-    if str(data.get("status") or "").lower() in {"succeeded", "finished", ""}:
-        return workflow_run_id, output_dict, str(data.get("status") or "")
-    raise DifyWorkflowError("DIFY_INVALID_RESPONSE", "Dify 返回内容缺少 report_markdown", "outputs did not contain report_markdown")
+    return workflow_run_id, output, str(data.get("status") or ""), provider_stage
 
 
 def _normalize_dify_result(response_json: dict[str, Any], pack_id: str) -> dict[str, Any]:
-    workflow_run_id, output, workflow_status = _extract_dify_outputs(response_json)
+    workflow_run_id, output, workflow_status, provider_stage = _extract_dify_outputs(response_json)
     quality_check = _parse_json_object(output.get("quality_check")) or {"passed": None, "issues": []}
     status = str(output.get("status") or "").strip() or "finished"
     if status not in {"finished", "needs_manual_review", "failed"}:
@@ -2540,6 +4155,8 @@ def _normalize_dify_result(response_json: dict[str, Any], pack_id: str) -> dict[
         "generation_warnings": warnings,
         "warnings": warnings,
         "remaining_issues": _parse_json_list(output.get("remaining_issues")),
+        "provider_stage": provider_stage,
+        "failure_stages": [provider_stage],
     }
 
 
@@ -2583,22 +4200,6 @@ def _fallback_text_snippet(text: str, limit: int = 380) -> str:
     if len(clean) <= limit:
         return clean
     return f"{clean[:limit].rstrip()}..."
-
-
-def _fallback_key_fact_text(item: Any) -> str:
-    if isinstance(item, dict):
-        name = _clean_inline_text(item.get("name") or item.get("label") or item.get("field") or "")
-        value = _clean_inline_text(
-            item.get("value")
-            or item.get("text")
-            or item.get("summary")
-            or item.get("content")
-            or ""
-        )
-        if name and value:
-            return f"{name}：{value}"
-        return value or name
-    return _clean_inline_text(str(item))
 
 
 def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str]]:
@@ -2667,14 +4268,10 @@ def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str
             if summary_text:
                 lines.append(f"- {filename}：{_fallback_text_snippet(summary_text, 900)}")
                 attachment_detail_added = True
-            key_facts = [
-                fact
-                for fact in (_fallback_key_fact_text(item) for item in attachment.get("key_facts") or [])
-                if fact
-            ]
+            key_facts = [str(item).strip() for item in attachment.get("key_facts") or [] if str(item).strip()]
             if key_facts:
                 lines.append("  其中可关注事实包括：")
-                lines.extend([f"  - {_fallback_text_snippet(fact, 260)}" for fact in key_facts[:10]])
+                lines.extend([f"  - {fact}" for fact in key_facts[:10]])
                 attachment_detail_added = True
             sections = [item for item in attachment.get("important_sections") or [] if isinstance(item, dict)]
             if sections:
@@ -2743,46 +4340,259 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
 
 
 def _apply_local_quality_gate_to_dify_result(result: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
-    gated = dict(result)
-    diagnostics = build_run_diagnostics(gated, pack, _compact_evidence_pack_for_dify(pack))
-    quality_gate = diagnostics.get("quality_gate") if isinstance(diagnostics.get("quality_gate"), dict) else {}
-    gated["quality_gate"] = quality_gate
-    if quality_gate.get("deliverable_status") != "needs_manual_review":
-        return gated
+    generation_result = ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify"))
+    repaired_result = ForbiddenPhraseRepairer().run(generation_result, pack)
+    return QualityGate().run(repaired_result, pack).to_legacy_result()
 
-    issue = {
-        "issue_id": "Q_LOCAL_QUALITY_GATE",
-        "severity": "high",
-        "problem_type": "local_quality_gate",
-        "report_text": "",
-        "source_basis": "evidence_pack",
-        "fix_instruction": "本地质量门禁发现原文遵循、核心覆盖或分析深度问题，报告需人工复核后再交付。",
-        "quality_gate": quality_gate,
-    }
-    quality_check = gated.get("quality_check") if isinstance(gated.get("quality_check"), dict) else {"passed": None, "issues": []}
-    issues = list(quality_check.get("issues") or []) if isinstance(quality_check.get("issues"), list) else []
-    if not any(isinstance(item, dict) and item.get("issue_id") == issue["issue_id"] for item in issues):
-        issues.append(issue)
-    quality_check = dict(quality_check)
-    quality_check["passed"] = False
-    quality_check["issues"] = issues
-    remaining_issues = list(gated.get("remaining_issues") or [])
-    if not any(isinstance(item, dict) and item.get("issue_id") == issue["issue_id"] for item in remaining_issues):
-        remaining_issues.append(issue)
-    warnings = list(gated.get("warnings") or gated.get("generation_warnings") or [])
-    warning = "报告未通过原文遵循或分析深度门禁，已标记为需人工复核。"
-    if warning not in warnings:
-        warnings.append(warning)
-    gated.update(
-        {
-            "status": "needs_manual_review",
-            "quality_check": quality_check,
-            "remaining_issues": remaining_issues,
-            "warnings": warnings,
-            "generation_warnings": warnings,
-        }
+
+def _set_failure_stage(result: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(result)
+    layer = str(stage.get("layer") or "")
+    stages = [
+        item
+        for item in list(updated.get("failure_stages") or [])
+        if isinstance(item, dict) and str(item.get("layer") or "") != layer
+    ]
+    stages.append(stage)
+    updated["failure_stages"] = stages
+    if layer == "provider":
+        updated["provider_stage"] = stage
+    return updated
+
+
+def _input_pipeline_stages(
+    pack: dict[str, Any],
+    timing: PipelineTiming | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    materials = [
+        item
+        for key in ("primary_materials", "auxiliary_materials")
+        for item in list(pack.get(key) or [])
+        if isinstance(item, dict)
+    ]
+    attachment_count = sum(
+        len([item for item in list(material.get("attachments") or []) if isinstance(item, dict)])
+        for material in materials
     )
-    return gated
+    pack_diagnostics = build_pack_diagnostics(pack)
+    unavailable = list(pack_diagnostics.get("core_attachment_unparsed_names") or [])
+    if unavailable:
+        attachment_stage = make_layer_result(
+            "attachment_parse",
+            status="blocked",
+            code="ATTACHMENT_REQUIRED_UNAVAILABLE",
+            input_value=pack,
+            output_value={"attachment_count": attachment_count, "unavailable_count": len(unavailable)},
+            metrics={"attachment_count": attachment_count, "unavailable_count": len(unavailable)},
+        )
+    elif attachment_count:
+        attachment_stage = make_layer_result(
+            "attachment_parse",
+            status="ok",
+            input_value=pack,
+            output_value={"attachment_count": attachment_count},
+            metrics={"attachment_count": attachment_count},
+        )
+    else:
+        attachment_stage = make_layer_result(
+            "attachment_parse",
+            status="skipped",
+            input_value={"pack_id": str(pack.get("pack_id") or "")},
+            output_value={"attachment_count": 0},
+            metrics={"attachment_count": 0},
+        )
+
+    compact: dict[str, Any] | None = None
+    try:
+        stage_timing = timing or PipelineTiming()
+        with stage_timing.measure("compact_ms"):
+            compact = _compact_evidence_pack_for_dify(pack)
+        compact_chars = _safe_int_value(
+            compact.get("compact_pack_chars") or compact.get("final_dify_input_chars") or 0
+        )
+        hard_limit = _safe_int_value(compact.get("hard_limit_chars") or 80_000, 80_000)
+        provenance_preserved = True
+        retention: dict[str, Any] | None = None
+        if pack.get("evidence_schema_version") == 2 and pack.get("source_evidence_schema_version") != 1:
+            if _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False) and compact.get("secondary_compression"):
+                validate_evidence_pack(compact)
+                retention = mandatory_evidence_retention(pack, compact)
+                provenance_preserved = retention.get("rate") is None or float(retention["rate"]) >= 0.9
+            else:
+                provenance_preserved = compact.get("evidence_items") == pack.get("evidence_items")
+        if not provenance_preserved:
+            compact_stage = make_layer_result(
+                "compact",
+                status="blocked",
+                code="COMPACT_PROVENANCE_LOST",
+                input_value=pack,
+                output_value=compact,
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit, "retention": retention},
+            )
+        elif compact_chars > hard_limit:
+            compact_stage = make_layer_result(
+                "compact",
+                status="blocked",
+                code="COMPACT_LIMIT_EXCEEDED",
+                input_value=pack,
+                output_value=compact,
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
+            )
+        else:
+            compact_stage = make_layer_result(
+                "compact",
+                status="ok",
+                input_value=pack,
+                output_value=compact,
+                metrics={"compact_chars": compact_chars, "hard_limit": hard_limit},
+            )
+    except CompactPolicyError as exc:
+        compact_stage = make_layer_result(
+            "compact",
+            status="blocked",
+            code=exc.code,
+            input_value=pack,
+            metrics=exc.metrics,
+        )
+    except Exception as exc:  # noqa: BLE001
+        compact_stage = make_layer_result(
+            "compact",
+            status="blocked",
+            code="UNCLASSIFIED",
+            input_value=pack,
+            metrics={"error_type": exc.__class__.__name__},
+        )
+    return [attachment_stage, compact_stage], compact
+
+
+def _formal_body_stage_value(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "report_markdown": str(result.get("report_markdown") or ""),
+        "report_ir": result.get("report_ir") if isinstance(result.get("report_ir"), dict) else None,
+    }
+
+
+def _cleanup_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    before_body = _formal_body_stage_value(before)
+    after_body = _formal_body_stage_value(after)
+    before_has_body = bool(before_body["report_markdown"].strip() or before_body["report_ir"])
+    after_has_body = bool(after_body["report_markdown"].strip() or after_body["report_ir"])
+    if before_has_body and not after_has_body:
+        status, code = "blocked", "CLEANUP_OUTPUT_EMPTY"
+    else:
+        status, code = "ok", ""
+    return make_layer_result(
+        "cleanup",
+        status=status,
+        code=code,
+        input_value=before_body,
+        output_value=after_body,
+    )
+
+
+def _quality_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    quality_gate = after.get("quality_gate") if isinstance(after.get("quality_gate"), dict) else {}
+    quality_check = after.get("quality_check") if isinstance(after.get("quality_check"), dict) else {}
+    blocked = (
+        str(quality_gate.get("deliverable_status") or "") in {"needs_manual_review", "failed"}
+        or quality_check.get("passed") is False
+    )
+    priority = (
+        "CONTROLLED_REPAIR_FAILED",
+        "VBP_RULE_CONFLICT",
+        "VBP_EVIDENCE_INDEX_INVALID",
+        "VBP_C_LEVEL_FACT_USED",
+        "VBP_FACT_SOURCE_REF_INVALID",
+        "VBP_UNSUPPORTED_CLAIM",
+        "VBP_REQUIRED_SECTION_MISSING",
+        "VBP_REQUIRED_TOPIC_MISSING",
+        "UNSUPPORTED_FACT",
+        "SUMMARY_ONLY_REPORT",
+        "REPORT_TOO_SHORT",
+        "REPORT_STRUCTURE_TOO_THIN",
+        "FORMAL_BODY_EMPTY",
+        "FORBIDDEN_PHRASE_IN_FORMAL_BODY",
+        "FORBIDDEN_PHRASE_IN_REPORT",
+        "EXPORT_GATE_BLOCKED",
+        "MODEL_QA_BLOCKED",
+        "LOCAL_QUALITY_GATE_FAILED",
+    )
+    codes = _extract_quality_gate_codes(quality_gate)
+    code = next((item for item in priority if item in codes), "LOCAL_QUALITY_GATE_FAILED") if blocked else ""
+    return make_layer_result(
+        "quality_gate",
+        status="blocked" if blocked else "ok",
+        code=code,
+        input_value=_formal_body_stage_value(before),
+        output_value={"quality_gate": quality_gate, "quality_check": quality_check},
+    )
+
+
+def _postprocess_generation_with_stages(
+    result: dict[str, Any],
+    pack: dict[str, Any],
+    input_stages: list[dict[str, Any]] | None = None,
+    compact: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+    checkpoint_callback=None,
+    resume_after: str = "",
+) -> dict[str, Any]:
+    if input_stages is None:
+        input_stages, compact = _input_pipeline_stages(pack, timing)
+    staged = dict(result)
+    for stage in input_stages:
+        staged = _set_failure_stage(staged, stage)
+    provider_stage = staged.get("provider_stage") if isinstance(staged.get("provider_stage"), dict) else None
+    if provider_stage is None:
+        provider_stage = make_layer_result(
+            "provider",
+            status="ok",
+            input_value=compact or {"pack_id": str(pack.get("pack_id") or "")},
+            output_value={
+                "provider_run_id": str(staged.get("provider_run_id") or staged.get("workflow_run_id") or ""),
+                **_formal_body_stage_value(staged),
+            },
+        )
+    elif provider_stage.get("input_artifact") is None:
+        provider_stage = dict(provider_stage)
+        provider_stage["input_artifact"] = make_layer_result(
+            "provider",
+            status=str(provider_stage.get("status") or "ok"),
+            code=str(provider_stage.get("code") or ""),
+            input_value=compact or {"pack_id": str(pack.get("pack_id") or "")},
+        )["input_artifact"]
+    staged = _set_failure_stage(staged, provider_stage)
+
+    stage_timing = timing or PipelineTiming()
+    if resume_after != "repair":
+        before_cleanup = dict(staged)
+        if checkpoint_callback is not None:
+            checkpoint_callback("repair", "started", before_cleanup, None)
+        with stage_timing.measure("repair_ms"):
+            repaired_result = RepairPipeline(
+                repairers=[
+                    StructureRepairer(_repair_unusable_dify_result),
+                    UnsupportedFactRepairer(),
+                    ForbiddenPhraseRepairer(),
+                ]
+            ).run(
+                ReportGenerationResult.from_legacy_result(staged, provider=str(staged.get("provider") or "dify")),
+                pack,
+            )
+        staged = repaired_result.to_legacy_result()
+        staged = _set_failure_stage(staged, _cleanup_pipeline_stage(before_cleanup, staged))
+        if checkpoint_callback is not None:
+            checkpoint_callback("repair", "completed", before_cleanup, staged)
+
+    before_quality = dict(staged)
+    if checkpoint_callback is not None:
+        checkpoint_callback("quality_gate", "started", before_quality, None)
+    with stage_timing.measure("quality_gate_ms"):
+        staged = _apply_local_quality_gate_to_dify_result(staged, pack)
+    staged = _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
+    if checkpoint_callback is not None:
+        checkpoint_callback("quality_gate", "completed", before_quality, staged)
+    return staged
 
 
 def _fallback_result_from_dify_error(
@@ -2791,12 +4601,20 @@ def _fallback_result_from_dify_error(
     pack_id: str,
     *,
     apply_quality_gate: bool = True,
+    timing: PipelineTiming | None = None,
 ) -> dict[str, Any]:
+    provider_code = canonical_provider_failure_code(exc.code)
+    provider_stage = exc.provider_stage or make_layer_result(
+        "provider",
+        status="blocked",
+        code=provider_code,
+        metrics={"error_type": exc.__class__.__name__},
+    )
     title, markdown, fallback_warnings = _fallback_report_from_pack(pack)
     issue = {
         "issue_id": "Q_DIFY_CALL_FAILED_FALLBACK",
         "severity": "high",
-        "problem_type": exc.code,
+        "problem_type": provider_code,
         "report_text": "",
         "source_basis": "evidence_pack",
         "fix_instruction": "Dify 调用失败后已基于 evidence_pack 生成保守报告；该报告需人工复核，不得直接交付。",
@@ -2817,15 +4635,42 @@ def _fallback_result_from_dify_error(
         "generation_warnings": warnings,
         "warnings": warnings,
         "remaining_issues": [issue],
-        "dify_error_code": exc.code,
+        "dify_error_code": provider_code,
         "dify_error_message": exc.message,
         "dify_error_detail": exc.detail,
+        "provider": "dify",
+        "fallback_used": True,
+        "fallback_reason": provider_code,
+        "fallback_provider": "backend_pack_fallback",
+        "provider_stage": provider_stage,
+        "failure_stages": [provider_stage],
     }
     if apply_quality_gate:
-        return _apply_local_quality_gate_to_dify_result(result, pack)
+        return _postprocess_generation_with_stages(result, pack, timing=timing)
+    input_stages, _ = _input_pipeline_stages(pack, timing)
+    for stage in input_stages:
+        result = _set_failure_stage(result, stage)
+    result = _set_failure_stage(
+        result,
+        make_layer_result(
+            "cleanup",
+            status="ok",
+            input_value={"provider_error_code": canonical_provider_failure_code(exc.code)},
+            output_value=_formal_body_stage_value(result),
+        ),
+    )
+    result = _set_failure_stage(
+        result,
+        make_layer_result(
+            "quality_gate",
+            status="skipped",
+            input_value=_formal_body_stage_value(result),
+            output_value={"reason": "watchdog fallback persisted before quality gate"},
+        ),
+    )
     result["quality_gate"] = {
         "deliverable_status": "needs_manual_review",
-        "blocking_issue_codes": ["DIFY_TIMEOUT"],
+        "blocking_issue_codes": [provider_code],
         "summary_only_risk": False,
         "source_fidelity_score": 0,
         "analysis_depth_score": 0,
@@ -2936,32 +4781,74 @@ def _call_dify_workflow(
                 if backoff:
                     time.sleep(backoff * attempt)
                 continue
-            raise DifyWorkflowError("DIFY_TIMEOUT", "Dify 工作流调用超时", str(exc), status_code=504) from exc
+            raise DifyWorkflowError(
+                "TIMEOUT",
+                "Dify 工作流调用超时",
+                "TIMEOUT",
+                status_code=504,
+                provider_stage=provider_stage_from_exception(exc),
+            ) from exc
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
-            detail = f"HTTP {status}: {_truncate(exc.response.text, 300)}"
+            detail = f"HTTP {status}"
             if status in {429, 502, 503, 504} and attempt < attempts:
                 logger.warning("dify_workflow_retry_status run_id=%s pack_id=%s status=%s attempt=%s/%s", run_id, pack_id, status, attempt, attempts)
                 if backoff:
                     time.sleep(backoff * attempt)
                 continue
-            if status in {429, 503}:
-                raise DifyWorkflowError("DIFY_MODEL_BUSY", "Dify 上游模型服务繁忙", detail, status_code=502) from exc
-            raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 工作流失败", detail) from exc
+            raise DifyWorkflowError(
+                "HTTP_ERROR",
+                "调用 Dify 工作流失败",
+                detail,
+                provider_stage=provider_stage_from_exception(exc),
+            ) from exc
         except httpx.HTTPError as exc:
             if attempt < attempts:
                 logger.warning("dify_workflow_retry_http_error run_id=%s pack_id=%s attempt=%s/%s", run_id, pack_id, attempt, attempts)
                 if backoff:
                     time.sleep(backoff * attempt)
                 continue
-            raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 工作流失败", str(exc)) from exc
+            raise DifyWorkflowError(
+                "HTTP_ERROR",
+                "调用 Dify 工作流失败",
+                "HTTP_ERROR",
+                provider_stage=provider_stage_from_exception(exc),
+            ) from exc
         except json.JSONDecodeError as exc:
-            raise DifyWorkflowError("DIFY_INVALID_RESPONSE", "Dify 返回内容不是合法 JSON", str(exc)) from exc
+            stage = make_layer_result(
+                "provider",
+                status="blocked",
+                code="OUTPUT_SCHEMA_INVALID",
+                metrics={"error_type": exc.__class__.__name__},
+            )
+            raise DifyWorkflowError(
+                "OUTPUT_SCHEMA_INVALID",
+                "Dify 返回内容不是合法 JSON",
+                "OUTPUT_SCHEMA_INVALID",
+                provider_stage=stage,
+            ) from exc
     if response_json is None:
-        raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 工作流失败", "empty response")
+        stage = make_layer_result("provider", status="blocked", code="OUTPUT_EMPTY")
+        raise DifyWorkflowError(
+            "OUTPUT_EMPTY",
+            "调用 Dify 工作流失败",
+            "OUTPUT_EMPTY",
+            provider_stage=stage,
+        )
 
     elapsed_ms = int((time.perf_counter() - started) * 1000)
     result = _normalize_dify_result(response_json, pack_id)
+    result["provider"] = "dify"
+    result["input_strategy"] = str(policy.get("input_strategy") or "")
+    generation_timing = PipelineTiming(result.get("timings"))
+    generation_timing.observe("generation_ms", elapsed_ms)
+    result["timings"] = generation_timing.snapshot()
+    if pack is not None:
+        try:
+            compact = _compact_evidence_pack_for_dify(pack)
+            result["compact_pack_chars"] = _safe_int_value(compact.get("compact_pack_chars") or compact.get("final_dify_input_chars") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("dify_compact_observability_failed run_id=%s pack_id=%s error_type=%s", run_id, pack_id, exc.__class__.__name__)
     logger.info(
         "dify_workflow_call_finished run_id=%s pack_id=%s workflow_run_id=%s status=%s elapsed_ms=%s",
         run_id,
@@ -2971,6 +4858,39 @@ def _call_dify_workflow(
         elapsed_ms,
     )
     return result
+
+
+def _configured_report_generator() -> ReportGenerator:
+    provider = (os.getenv("REPORT_GENERATOR") or "dify").strip().lower() or "dify"
+    native_shadow = _env_bool("NATIVE_GENERATOR_SHADOW", False)
+    dify_fallback = _env_bool("DIFY_GENERATOR_FALLBACK", False)
+    if provider != "dify":
+        logger.error(
+            "report_generator_provider_not_supported provider=%s native_shadow=%s dify_fallback=%s",
+            provider,
+            native_shadow,
+            dify_fallback,
+        )
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "Report generator provider is not enabled in P0.2",
+            "report generator provider is not enabled",
+            status_code=500,
+            provider_stage=make_layer_result(
+                "provider",
+                status="blocked",
+                code="HTTP_ERROR",
+                metrics={"configuration_complete": False},
+            ),
+        )
+    if native_shadow or dify_fallback:
+        logger.info(
+            "report_generator_flags_observed_but_inactive provider=%s native_shadow=%s dify_fallback=%s",
+            provider,
+            native_shadow,
+            dify_fallback,
+        )
+    return DifyReportGenerator(_call_dify_workflow)
 
 
 def _make_revision_id(run_id: str) -> str:
@@ -3033,14 +4953,41 @@ def _call_dify_revision_workflow(
             response.raise_for_status()
             response_json = response.json()
     except httpx.TimeoutException as exc:
-        raise DifyWorkflowError("DIFY_TIMEOUT", "Dify 修订工作流调用超时", str(exc), status_code=504) from exc
+        raise DifyWorkflowError(
+            "TIMEOUT",
+            "Dify 修订工作流调用超时",
+            "TIMEOUT",
+            status_code=504,
+            provider_stage=provider_stage_from_exception(exc),
+        ) from exc
     except httpx.HTTPStatusError as exc:
-        detail = f"HTTP {exc.response.status_code}: {_truncate(exc.response.text, 300)}"
-        raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 修订工作流失败", detail) from exc
+        detail = f"HTTP {exc.response.status_code}"
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "调用 Dify 修订工作流失败",
+            detail,
+            provider_stage=provider_stage_from_exception(exc),
+        ) from exc
     except httpx.HTTPError as exc:
-        raise DifyWorkflowError("DIFY_CALL_FAILED", "调用 Dify 修订工作流失败", str(exc)) from exc
+        raise DifyWorkflowError(
+            "HTTP_ERROR",
+            "调用 Dify 修订工作流失败",
+            "HTTP_ERROR",
+            provider_stage=provider_stage_from_exception(exc),
+        ) from exc
     except json.JSONDecodeError as exc:
-        raise DifyWorkflowError("DIFY_INVALID_RESPONSE", "Dify 修订返回内容不是合法 JSON", str(exc)) from exc
+        stage = make_layer_result(
+            "provider",
+            status="blocked",
+            code="OUTPUT_SCHEMA_INVALID",
+            metrics={"error_type": exc.__class__.__name__},
+        )
+        raise DifyWorkflowError(
+            "OUTPUT_SCHEMA_INVALID",
+            "Dify 修订返回内容不是合法 JSON",
+            "OUTPUT_SCHEMA_INVALID",
+            provider_stage=stage,
+        ) from exc
     result = _normalize_dify_result(response_json, pack_id)
     logger.info(
         "dify_revision_call_finished run_id=%s pack_id=%s status=%s elapsed_ms=%s",
@@ -3131,74 +5078,6 @@ def _attachment_request_options(req: SelectionPreviewRequest) -> dict[str, Any]:
     }
 
 
-def _material_cache_repository() -> MaterialCompressionCacheRepository:
-    return MaterialCompressionCacheRepository(material_cache_db_path())
-
-
-def _material_cache_signature(row: dict[str, Any], attachments: list[dict[str, Any]], attachment_options: dict[str, Any], view_type: str) -> MaterialCacheSignature:
-    source_hash = material_source_hash(row)
-    attachment_hash = material_attachment_hash(attachments)
-    options_hash = attachment_options_hash(attachment_options)
-    cache_key = make_material_cache_key(
-        menu_code=str(row.get("menu_code") or ""),
-        articleid=str(row.get("articleid") or ""),
-        view_type=view_type,
-        source_hash=source_hash,
-        attachment_hash=attachment_hash,
-        attachment_options_hash=options_hash,
-    )
-    return MaterialCacheSignature(
-        cache_key=cache_key,
-        menu_code=str(row.get("menu_code") or ""),
-        articleid=str(row.get("articleid") or ""),
-        view_type=view_type,
-        source_hash=source_hash,
-        attachment_hash=attachment_hash,
-        attachment_options_hash=options_hash,
-    )
-
-
-def _empty_material_cache_stats(enabled: bool) -> dict[str, Any]:
-    return {
-        "enabled": enabled,
-        "hit_count": 0,
-        "miss_count": 0,
-        "stale_count": 0,
-        "corrupt_count": 0,
-        "failed_count": 0,
-        "building_count": 0,
-        "building_timeout_count": 0,
-        "force_refresh_count": 0,
-        "dynamic_count": 0,
-        "built_count": 0,
-        "disabled_count": 0,
-    }
-
-
-def _record_material_cache_status(stats: dict[str, Any], status: str, *, dynamic: bool = False, built: bool = False) -> None:
-    key = f"{status}_count"
-    if key in stats:
-        stats[key] = int(stats.get(key) or 0) + 1
-    if dynamic:
-        stats["dynamic_count"] = int(stats.get("dynamic_count") or 0) + 1
-    if built:
-        stats["built_count"] = int(stats.get("built_count") or 0) + 1
-
-
-def _material_cache_meta(signature: MaterialCacheSignature | None, status: str, *, dynamic: bool = False, build_source: str = "") -> dict[str, Any]:
-    return {
-        "enabled": material_cache_enabled(),
-        "status": status,
-        "cache_key": signature.cache_key if signature else "",
-        "view_type": signature.view_type if signature else "material/full",
-        "source_hash": signature.source_hash if signature else "",
-        "attachment_hash": signature.attachment_hash if signature else "",
-        "attachment_options_hash": signature.attachment_options_hash if signature else "",
-        "dynamic_fallback": bool(dynamic),
-        "build_source": build_source,
-    }
-
-
 CORE_ATTACHMENT_KEYWORDS = [
     ("医疗服务价格项目", "医疗服务价格项目"),
     ("服务价格项目", "医疗服务价格项目"),
@@ -3238,7 +5117,89 @@ def _attachment_unavailable_for_report(status: str) -> bool:
     return status in {"metadata_only", "network_unreachable", "download_failed", "unsupported", "parse_failed"}
 
 
-def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[str, Any] | None = None) -> dict[str, Any]:
+def _pdf_table_cell_evidence_item(context: dict[str, Any], cell: dict[str, Any]) -> dict[str, Any]:
+    engine = str(cell.get("engine") or "pdfplumber").strip() or "pdfplumber"
+    if engine != "pdfplumber":
+        raise EvidenceValidationError("only digital PDF table cells are authorized in S1b")
+    source_ref = {
+        "menu_code": str(context.get("menu_code") or ""),
+        "articleid": str(context.get("articleid") or ""),
+        "attachment_id": str(context.get("attachment_id") or context.get("articleattid") or ""),
+        "filename": str(context.get("filename") or ""),
+        "page_no": cell.get("page_no"),
+        "sheet_name": None,
+        "table_index": cell.get("table_index"),
+        "row": cell.get("row"),
+        "column": cell.get("column"),
+        "cell_range": cell.get("cell_range"),
+        "quote": str(cell.get("quote") or cell.get("value") or "")[:500],
+        "source_hash": str(cell.get("source_hash") or ""),
+        "region": cell.get("region"),
+        "bbox": None,
+    }
+    return create_evidence_item(
+        level="A",
+        kind="table_cell",
+        value=cell.get("value"),
+        source_ref=source_ref,
+        extractor_version=f"{engine}:{pdf_table_rule_version()}",
+        mandatory=False,
+    )
+
+
+def _spread_indices(indices: list[int], count: int) -> list[int]:
+    if count <= 0 or not indices:
+        return []
+    if len(indices) <= count:
+        return list(indices)
+    if count == 1:
+        return [indices[0]]
+    positions = {
+        round(offset * (len(indices) - 1) / (count - 1))
+        for offset in range(count)
+    }
+    return [indices[position] for position in sorted(positions)]
+
+
+def _select_pdf_table_evidence_cells(cells: list[dict[str, Any]], *, limit: int) -> list[dict[str, Any]]:
+    materialized = [cell for cell in cells if isinstance(cell, dict)]
+    budget = max(1, int(limit))
+    if len(materialized) <= budget:
+        return copy.deepcopy(materialized)
+
+    table_anchors: list[int] = []
+    seen_tables: set[tuple[int, int]] = set()
+    for index, cell in enumerate(materialized):
+        identity = (int(cell.get("page_no") or 0), int(cell.get("table_index") or 0))
+        if identity not in seen_tables:
+            seen_tables.add(identity)
+            table_anchors.append(index)
+    anchor_indices = sorted({0, len(materialized) - 1, *table_anchors})
+    selected = set(_spread_indices(anchor_indices, min(budget, len(anchor_indices))))
+
+    remaining_budget = budget - len(selected)
+    if remaining_budget > 0:
+        business_keywords = ("采购", "产品", "企业", "编码", "价格", "报价", "数量", "中选", "分组", "周期")
+        priority = [
+            index
+            for index, cell in enumerate(materialized)
+            if index not in selected
+            and (
+                int(cell.get("row") or 0) == 1
+                or any(keyword in str(cell.get("value") or "") for keyword in business_keywords)
+            )
+        ]
+        priority_budget = min(remaining_budget, len(priority))
+        selected.update(_spread_indices(priority, priority_budget))
+
+    remaining_budget = budget - len(selected)
+    if remaining_budget > 0:
+        remaining = [index for index in range(len(materialized)) if index not in selected]
+        selected.update(_spread_indices(remaining, remaining_budget))
+    return [copy.deepcopy(materialized[index]) for index in sorted(selected)]
+
+
+def _database_attachment_base_metadata(row: dict[str, Any]) -> dict[str, Any]:
     articleattid = str(row.get("articleattid") or "")
     filename = str(row.get("filename") or "")
     core_attachment, business_type = _attachment_core_metadata(filename)
@@ -3247,7 +5208,7 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         warnings.append(f"附件存在异常标记: {row.get('fileerrortype')}")
     if not articleattid:
         warnings.append("附件缺少 articleattid，后续无法通过内网下载接口定位")
-    metadata = {
+    return {
         "articleattid": articleattid,
         "filename": filename,
         "filepath": row.get("filepath") or "",
@@ -3275,7 +5236,50 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         "table_summaries": [],
         "warnings": warnings,
     }
+
+
+class AttachmentTaskTimeout(TimeoutError):
+    pass
+
+
+def _attachment_task_checkpoint(options: dict[str, Any]) -> float | None:
+    cancel_event = options.get("_cancel_event")
+    if isinstance(cancel_event, threading.Event) and cancel_event.is_set():
+        raise AttachmentTaskTimeout("attachment task cancelled")
+    deadline = options.get("_deadline_monotonic")
+    if deadline is None:
+        return None
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        if isinstance(cancel_event, threading.Event):
+            cancel_event.set()
+        raise AttachmentTaskTimeout("attachment task deadline exceeded")
+    return remaining
+
+
+def _store_database_attachment_result(
+    metadata: dict[str, Any],
+    options: dict[str, Any],
+) -> None:
+    _attachment_task_checkpoint(options)
+    if bool(options.get("_defer_cache_write")):
+        metadata["_cache_write_pending"] = True
+        return
+    store_cached_result(metadata, metadata)
+
+
+def _database_attachment_metadata(
+    row: dict[str, Any],
+    attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+) -> dict[str, Any]:
+    metadata = _database_attachment_base_metadata(row)
+    articleattid = str(metadata["articleattid"])
+    filename = str(metadata["filename"])
+    core_attachment = bool(metadata["core_attachment"])
+    business_type = str(metadata["business_type"])
     options = attachment_options or {}
+    _attachment_task_checkpoint(options)
     enable_download = bool(options.get("enable_download", _env_bool("ENABLE_ATTACHMENT_DOWNLOAD", True)))
     force_refresh = bool(options.get("force_refresh"))
     if not enable_download:
@@ -3283,7 +5287,15 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         metadata["core_attachment_unavailable"] = bool(core_attachment)
         return metadata
 
-    cached, cache_status = load_cached_result(metadata, force_refresh=force_refresh)
+    structured_pdf_enabled = (
+        str(metadata.get("fileext") or "").lower() == ".pdf"
+        and _env_bool("ENABLE_STRUCTURED_PDF_TABLES", False)
+    )
+    cached, cache_status = (
+        (None, "content_hash_pending")
+        if structured_pdf_enabled
+        else load_cached_result(metadata, force_refresh=force_refresh)
+    )
     metadata["cache_status"] = cache_status
     if cached:
         metadata.update(cached)
@@ -3292,30 +5304,53 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
         metadata["stored_original_file"] = False
         metadata["temporary_file_used"] = bool(metadata.get("temporary_file_used", False))
         metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata.get("parse_status") or "")))
+        _attachment_task_checkpoint(options)
         return metadata
 
-    download = fetch_attachment_bytes(
-        metadata,
-        enable_download=enable_download,
-        user_cookie=str(options.get("user_cookie") or ""),
-        user_headers=options.get("user_headers") if isinstance(options.get("user_headers"), dict) else None,
-    )
+    attachment_timing = timing or PipelineTiming()
+    remaining_seconds = _attachment_task_checkpoint(options)
+    with attachment_timing.measure("attachment_download_ms"):
+        download = fetch_attachment_bytes(
+            metadata,
+            enable_download=enable_download,
+            user_cookie=str(options.get("user_cookie") or ""),
+            user_headers=options.get("user_headers") if isinstance(options.get("user_headers"), dict) else None,
+            timeout_seconds=remaining_seconds,
+        )
+    _attachment_task_checkpoint(options)
     metadata["download_status"] = download.download_status
     metadata["download_auth_mode"] = download.auth_mode
     metadata["warnings"].extend(download.warnings or [])
     if download.download_status != "downloaded" or not download.content:
         metadata["parse_status"] = download.download_status
         metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
-        store_cached_result(metadata, metadata)
+        _store_database_attachment_result(metadata, options)
         return metadata
+    if structured_pdf_enabled:
+        metadata["content_sha256"] = hashlib.sha256(download.content).hexdigest()
+        cached, cache_status = load_cached_result(metadata, force_refresh=force_refresh)
+        metadata["cache_status"] = cache_status
+        if cached:
+            metadata.update(cached)
+            metadata["core_attachment"] = core_attachment
+            metadata["business_type"] = business_type
+            metadata["stored_original_file"] = False
+            metadata["core_attachment_unavailable"] = bool(
+                core_attachment and _attachment_unavailable_for_report(str(metadata.get("parse_status") or ""))
+            )
+            _attachment_task_checkpoint(options)
+            return metadata
     if not _env_bool("ENABLE_ATTACHMENT_PARSE", True):
         metadata["parse_status"] = "stream_parsed"
         metadata["warnings"].append("附件解析未启用，未提取摘要")
         metadata["core_attachment_unavailable"] = bool(core_attachment)
-        store_cached_result(metadata, metadata)
+        _store_database_attachment_result(metadata, options)
         return metadata
 
-    parsed = parse_attachment_bytes(download.content, str(metadata["filename"]), str(metadata["fileext"]), metadata["filesize"])
+    _attachment_task_checkpoint(options)
+    with attachment_timing.measure("attachment_parse_ms"):
+        parsed = parse_attachment_bytes(download.content, str(metadata["filename"]), str(metadata["fileext"]), metadata["filesize"])
+    _attachment_task_checkpoint(options)
     statuses = list(parsed.get("parse_statuses") or [])
     metadata["parse_statuses"] = statuses
     metadata["parse_status"] = statuses[-1] if statuses else "parse_failed"
@@ -3325,11 +5360,220 @@ def _database_attachment_metadata(row: dict[str, Any], attachment_options: dict[
     metadata["important_sections"] = list(parsed.get("important_sections") or [])
     metadata["table_summaries"] = list(parsed.get("table_summaries") or [])
     metadata["warnings"].extend(parsed.get("warnings") or [])
+    if "pdf_table_cells" in parsed:
+        context = {
+            "menu_code": str(row.get("menu_code") or ""),
+            "articleid": str(row.get("articleid") or ""),
+            "attachment_id": articleattid,
+            "filename": filename,
+        }
+        source_cells = [cell for cell in list(parsed.get("pdf_table_cells") or []) if isinstance(cell, dict)]
+        if _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False):
+            evidence_limit = max(1, _env_int("ATTACHMENT_PDF_EVIDENCE_MAX_CELLS", 1000))
+            selected_cells = _select_pdf_table_evidence_cells(source_cells, limit=evidence_limit)
+            omitted_cell_count = max(0, len(source_cells) - len(selected_cells))
+            metadata["pdf_table_evidence_total_cell_count"] = len(source_cells)
+            metadata["pdf_table_evidence_cell_count"] = len(selected_cells)
+            metadata["pdf_table_evidence_omitted_count"] = omitted_cell_count
+            metadata["pdf_table_evidence_limit"] = evidence_limit
+            metadata["pdf_table_evidence_selection_version"] = "8099.pdf-table-evidence-budget/v1"
+            if omitted_cell_count:
+                metadata["warnings"].append("PDF_TABLE_EVIDENCE_CELL_LIMIT_REACHED")
+        else:
+            selected_cells = copy.deepcopy(source_cells)
+        metadata["evidence_items"] = []
+        for cell in selected_cells:
+            try:
+                metadata["evidence_items"].append(_pdf_table_cell_evidence_item(context, cell))
+            except EvidenceValidationError:
+                metadata["warnings"].append("PDF_TABLE_EVIDENCE_INVALID")
+        metadata["pdf_table_pages"] = list(parsed.get("pdf_table_pages") or [])
+        metadata["pdf_table_diagnostics"] = list(parsed.get("pdf_table_diagnostics") or [])
+        metadata["pdf_table_rule_version"] = str(parsed.get("pdf_table_rule_version") or "")
     if metadata["parse_status"] not in {"unsupported", "parse_failed"}:
         metadata["download_status"] = "stream_parsed"
     metadata["core_attachment_unavailable"] = bool(core_attachment and _attachment_unavailable_for_report(str(metadata["parse_status"])))
-    store_cached_result(metadata, metadata)
+    _store_database_attachment_result(metadata, options)
     return metadata
+
+
+def _failed_database_attachment_metadata(row: dict[str, Any], exc: Exception) -> dict[str, Any]:
+    metadata = _database_attachment_base_metadata(row)
+    metadata["parse_status"] = "parse_failed"
+    metadata["download_status"] = "download_failed"
+    metadata["core_attachment_unavailable"] = bool(metadata.get("core_attachment"))
+    metadata["warnings"].append(f"ATTACHMENT_PROCESSING_FAILED:{exc.__class__.__name__}")
+    return metadata
+
+
+def _database_attachment_metadata_process_worker(
+    row: dict[str, Any],
+    options: dict[str, Any],
+) -> dict[str, Any]:
+    timing = PipelineTiming()
+    result = _database_attachment_metadata(row, options, timing)
+    return {"result": result, "timings": timing.snapshot()}
+
+
+def _timed_out_database_attachment_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    metadata = _database_attachment_base_metadata(row)
+    metadata["parse_status"] = "parse_failed"
+    metadata["download_status"] = "download_failed"
+    metadata["task_status"] = "timed_out"
+    metadata["core_attachment_unavailable"] = bool(metadata.get("core_attachment"))
+    metadata["warnings"].append("ATTACHMENT_PROCESSING_TIMEOUT")
+    return metadata
+
+
+@dataclass
+class _AttachmentTaskState:
+    index: int
+    row: dict[str, Any]
+    submitted_ns: int
+    cancel_event: threading.Event
+    started_at: float | None = None
+    deadline: float | None = None
+    timed_out: bool = False
+
+
+def _parse_database_attachments_bounded(
+    attachments: list[dict[str, Any]],
+    attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+) -> list[dict[str, Any]]:
+    rows = list(attachments or [])
+    if not rows:
+        return []
+    stage_timing = timing or PipelineTiming()
+    options = dict(attachment_options or {})
+    timeout_seconds = max(0.01, _env_float("ATTACHMENT_TASK_TIMEOUT_SECONDS", 180.0))
+
+    def process(state: _AttachmentTaskState) -> dict[str, Any]:
+        row = state.row
+        state.started_at = time.monotonic()
+        state.deadline = state.started_at + timeout_seconds
+        task_options = {
+            **options,
+            "_cancel_event": state.cancel_event,
+            "_deadline_monotonic": state.deadline,
+            "_defer_cache_write": True,
+        }
+        stage_timing.add_elapsed("attachment_queue_ms", state.submitted_ns)
+        try:
+            if _env_bool("ENABLE_ATTACHMENT_TASK_PROCESS_ISOLATION", True):
+                child_options = {
+                    key: value
+                    for key, value in task_options.items()
+                    if key not in {"_cancel_event", "_deadline_monotonic"}
+                }
+                child_options["_deadline_monotonic"] = state.deadline
+                payload = run_attachment_task_isolated(
+                    row,
+                    child_options,
+                    worker_path="app.main:_database_attachment_metadata_process_worker",
+                    timeout_seconds=max(0.01, float(state.deadline) - time.monotonic()),
+                    cancel_event=state.cancel_event,
+                )
+                if not isinstance(payload, dict) or not isinstance(payload.get("result"), dict):
+                    raise AttachmentTaskProcessError("attachment worker result is invalid")
+                result = dict(payload["result"])
+                child_timings = payload.get("timings")
+                if isinstance(child_timings, dict):
+                    statuses = child_timings.get("observation_status")
+                    statuses = statuses if isinstance(statuses, dict) else {}
+                    for field in ("attachment_download_ms", "attachment_parse_ms"):
+                        if statuses.get(field) == "observed":
+                            stage_timing.add_ms(field, child_timings.get(field))
+            else:
+                result = _database_attachment_metadata(row, task_options, stage_timing)
+            _attachment_task_checkpoint(task_options)
+            return result
+        except AttachmentTaskProcessTimeout:
+            state.timed_out = True
+            return _timed_out_database_attachment_metadata(row)
+        except AttachmentTaskTimeout:
+            state.timed_out = True
+            return _timed_out_database_attachment_metadata(row)
+        except TimeoutError as exc:
+            if state.cancel_event.is_set() or time.monotonic() >= float(state.deadline):
+                state.timed_out = True
+                return _timed_out_database_attachment_metadata(row)
+            logger.warning(
+                "database_attachment_processing_failed attachment_id=%s error_type=%s",
+                str(row.get("articleattid") or "")[:80],
+                exc.__class__.__name__,
+            )
+            return _failed_database_attachment_metadata(row, exc)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "database_attachment_processing_failed attachment_id=%s error_type=%s",
+                str(row.get("articleattid") or "")[:80],
+                exc.__class__.__name__,
+            )
+            return _failed_database_attachment_metadata(row, exc)
+
+    enabled = _env_bool("ENABLE_CONCURRENT_ATTACHMENT_PARSE", False)
+    configured_workers = max(1, _env_int("ATTACHMENT_PARSE_CONCURRENCY", 3))
+    worker_count = min(3, configured_workers, len(rows)) if enabled else 1
+    states = [
+        _AttachmentTaskState(
+            index=index,
+            row=row,
+            submitted_ns=time.monotonic_ns(),
+            cancel_event=threading.Event(),
+        )
+        for index, row in enumerate(rows)
+    ]
+    results: list[dict[str, Any] | None] = [None] * len(states)
+    executor = ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="attachment-parse",
+    )
+    future_states = {executor.submit(process, state): state for state in states}
+    pending = set(future_states)
+    try:
+        while pending:
+            done, _ = wait(pending, timeout=0.005, return_when=FIRST_COMPLETED)
+            now = time.monotonic()
+            for future in pending - done:
+                state = future_states[future]
+                if state.deadline is not None and now >= state.deadline:
+                    state.timed_out = True
+                    state.cancel_event.set()
+                    future.cancel()
+            for future in done:
+                state = future_states[future]
+                result = future.result()
+                if state.timed_out and result.get("task_status") != "timed_out":
+                    result = _timed_out_database_attachment_metadata(state.row)
+                cache_pending = bool(result.pop("_cache_write_pending", False))
+                if cache_pending and result.get("task_status") != "timed_out":
+                    try:
+                        store_cached_result(result, result)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "database_attachment_cache_write_failed attachment_id=%s error_type=%s",
+                            str(result.get("articleattid") or "")[:80],
+                            exc.__class__.__name__,
+                        )
+                results[state.index] = result
+                pending.remove(future)
+    finally:
+        for future in pending:
+            future_states[future].cancel_event.set()
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+    logger.info(
+        "database_attachment_batch_completed count=%s concurrency=%s queue_ms=%s parse_ms=%s",
+        len(rows),
+        worker_count,
+        stage_timing.snapshot().get("attachment_queue_ms", 0),
+        stage_timing.snapshot().get("attachment_parse_ms", 0),
+    )
+    return [
+        result if isinstance(result, dict) else _failed_database_attachment_metadata(states[index].row, RuntimeError())
+        for index, result in enumerate(results)
+    ]
 
 
 def _material_key_facts(row: dict[str, Any]) -> list[dict[str, str]]:
@@ -3508,6 +5752,7 @@ def _build_database_material(
     attachments: list[dict[str, Any]],
     warnings: list[str],
     attachment_options: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
 ) -> dict[str, Any]:
     content_html = str(row.get("content") or "")
     content_text = _article_text_from_html(content_html)
@@ -3536,7 +5781,7 @@ def _build_database_material(
         "summary": row.get("summary") or "",
         "content_text": content_text,
         "content_summary": _content_summary(str(row.get("summary") or ""), content_text),
-        "attachments": [_database_attachment_metadata(item, attachment_options) for item in attachments],
+        "attachments": _parse_database_attachments_bounded(attachments, attachment_options, timing),
     }
     if role == "primary":
         base.update(
@@ -3557,147 +5802,10 @@ def _build_database_material(
     return base
 
 
-_PRIMARY_CONTEXT_FIELDS = [
-    "important_passages",
-    "policy_rules",
-    "price_rules",
-    "time_requirements",
-    "product_scope",
-    "enterprise_requirements",
-    "execution_requirements",
-]
-_AUXILIARY_CONTEXT_FIELDS = ["relation_to_primary", "relevance_score", "relevant_snippets", "usable_points"]
-
-
-def _apply_material_role_context(material: dict[str, Any], *, role: str, row: dict[str, Any], primary_keywords: list[str]) -> dict[str, Any]:
-    material["material_role"] = role
-    material["menu_code"] = row.get("menu_code") or material.get("menu_code") or ""
-    material["articleid"] = row.get("articleid") or material.get("articleid") or ""
-    material["title"] = row.get("title") or material.get("title") or ""
-    material["audittime"] = row.get("audittime") or material.get("audittime") or ""
-    material["menu_name"] = row.get("menu_name") or material.get("menu_name") or ""
-    material["source"] = row.get("source") or material.get("source") or ""
-    material["sourceurl"] = row.get("sourceurl") or material.get("sourceurl") or ""
-    material["areaname"] = row.get("areaname") or material.get("areaname") or ""
-    material["publicorg"] = row.get("publicorg") or material.get("publicorg") or ""
-    material["projectphase"] = row.get("projectphase") or material.get("projectphase") or ""
-    material["projecttype"] = row.get("projecttype") or material.get("projecttype") or ""
-    material["category"] = row.get("category") or material.get("category") or ""
-    material["summary"] = row.get("summary") or material.get("summary") or ""
-    content_text = str(material.get("content_text") or "")
-    if role == "primary":
-        for field in _AUXILIARY_CONTEXT_FIELDS:
-            material.pop(field, None)
-        material.update(
-            {
-                "updatetime": row.get("updatetime") or "",
-                "dl_project_type": row.get("dl_project_type") or "",
-                "referencenumber": row.get("referencenumber") or "",
-                "policytype": row.get("policytype") or "",
-                "belongproject": row.get("belongproject") or "",
-                "projectabbreviation": row.get("projectabbreviation") or "",
-                "content_html_length": len(str(row.get("content") or "")),
-                "content_text_length": len(content_text),
-                "key_facts": _material_key_facts(row),
-            }
-        )
-    else:
-        for field in _PRIMARY_CONTEXT_FIELDS:
-            material.pop(field, None)
-        material["usable_points"] = _material_key_facts(row)
-    _enhance_material_for_stage4(material, primary_keywords)
-    return material
-
-
-def _build_database_material_for_prepare(
-    *,
-    role: str,
-    row: dict[str, Any],
-    attachments: list[dict[str, Any]],
-    warnings: list[str],
-    attachment_options: dict[str, Any],
-    primary_keywords: list[str],
-    material_cache_stats: dict[str, Any],
-) -> dict[str, Any]:
-    cache_enabled = material_cache_enabled()
-    signature: MaterialCacheSignature | None = None
-    read_status = "disabled"
-    if cache_enabled:
-        signature = _material_cache_signature(row, attachments, attachment_options, "material/full")
-        read_result = _material_cache_repository().read_payload(signature, force_refresh=bool(attachment_options.get("force_refresh")))
-        read_status = read_result.status
-        if read_result.status == "hit" and read_result.payload:
-            material = copy.deepcopy(read_result.payload)
-            _apply_material_role_context(material, role=role, row=row, primary_keywords=primary_keywords)
-            material["material_cache"] = _material_cache_meta(signature, "hit")
-            _record_material_cache_status(material_cache_stats, "hit")
-            return material
-    material = _build_database_material(
-        role=role,
-        row=row,
-        attachments=attachments,
-        warnings=warnings,
-        attachment_options=attachment_options,
-    )
-    _apply_material_role_context(material, role=role, row=row, primary_keywords=primary_keywords)
-    if cache_enabled:
-        material["material_cache"] = _material_cache_meta(signature, read_status, dynamic=True)
-        _record_material_cache_status(material_cache_stats, read_status, dynamic=True)
-    else:
-        _record_material_cache_status(material_cache_stats, "disabled", dynamic=True)
-    return material
-
-
-def _build_and_store_material_cache_views(
-    *,
-    row: dict[str, Any],
-    attachments: list[dict[str, Any]],
-    attachment_options: dict[str, Any],
-    levels: list[str],
-    role: str,
-    primary_keywords: list[str],
-    force_refresh: bool = False,
-    build_source: str = "api",
-) -> tuple[int, list[dict[str, Any]]]:
-    repo = _material_cache_repository()
-    warnings: list[str] = []
-    material = _build_database_material(
-        role=role,
-        row=row,
-        attachments=attachments,
-        warnings=warnings,
-        attachment_options=attachment_options,
-    )
-    _apply_material_role_context(material, role=role, row=row, primary_keywords=primary_keywords)
-    built_count = 0
-    results: list[dict[str, Any]] = []
-    for view_type in levels:
-        if view_type not in SUPPORTED_MATERIAL_VIEW_TYPES:
-            results.append({"view_type": view_type, "status": "invalid_view_type"})
-            continue
-        signature = _material_cache_signature(row, attachments, attachment_options, view_type)
-        read = repo.read_payload(signature, force_refresh=force_refresh)
-        if read.status == "hit" and not force_refresh:
-            results.append({"view_type": view_type, "status": "hit", "cache_key": signature.cache_key})
-            continue
-        try:
-            repo.mark_building(signature, build_source=build_source)
-            payload = build_material_compression_view(material, view_type)
-            repo.write_ready(
-                signature,
-                payload,
-                diagnostics={"warnings": warnings, "payload_chars": len(json.dumps(payload, ensure_ascii=False))},
-                build_source=build_source,
-            )
-            built_count += 1
-            results.append({"view_type": view_type, "status": "built", "cache_key": signature.cache_key})
-        except Exception as exc:  # noqa: BLE001
-            repo.mark_failed(signature, exc.__class__.__name__, str(exc), build_source=build_source)
-            results.append({"view_type": view_type, "status": "failed", "cache_key": signature.cache_key, "error": exc.__class__.__name__})
-    return built_count, results
-
-
-def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
+def _build_database_evidence_pack_impl(
+    req: SelectionPreviewRequest,
+    timing: PipelineTiming,
+) -> dict[str, Any] | JSONResponse:
     primary_keys, auxiliary_keys, error = _validate_material_selection(req)
     if error is not None:
         return error
@@ -3720,32 +5828,34 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
     attachments_by_key = _fetch_database_attachments(all_keys)
     attachment_options = _attachment_request_options(req)
     warnings: list[str] = []
-    primary_keywords = _primary_topic_keywords([rows_by_key[key] for key in primary_keys])
-    material_cache_stats = _empty_material_cache_stats(material_cache_enabled())
     primary_materials = [
-        _build_database_material_for_prepare(
+        _build_database_material(
             role="primary",
             row=rows_by_key[key],
             attachments=attachments_by_key.get(key, []),
             warnings=warnings,
             attachment_options=attachment_options,
-            primary_keywords=primary_keywords,
-            material_cache_stats=material_cache_stats,
+            timing=timing,
         )
         for key in primary_keys
     ]
     auxiliary_materials = [
-        _build_database_material_for_prepare(
+        _build_database_material(
             role="auxiliary",
             row=rows_by_key[key],
             attachments=attachments_by_key.get(key, []),
             warnings=warnings,
             attachment_options=attachment_options,
-            primary_keywords=primary_keywords,
-            material_cache_stats=material_cache_stats,
+            timing=timing,
         )
         for key in auxiliary_keys
     ]
+    evidence_started_ns = time.monotonic_ns()
+    primary_keywords = _primary_topic_keywords([rows_by_key[key] for key in primary_keys])
+    for material in primary_materials:
+        _enhance_material_for_stage4(material, primary_keywords)
+    for material in auxiliary_materials:
+        _enhance_material_for_stage4(material, primary_keywords)
     attachment_count = sum(len(item.get("attachments") or []) for item in [*primary_materials, *auxiliary_materials])
     combined_key_facts: list[dict[str, str]] = []
     for material in primary_materials:
@@ -3767,13 +5877,37 @@ def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any
         "combined_key_facts": combined_key_facts,
         "report_focus": _unique(report_focus)[:20],
         "warnings": warnings,
-        "material_cache_stats": material_cache_stats,
     }
     pack.update(_build_stage4_pack_fields(primary_materials, auxiliary_materials, combined_key_facts, pack["report_focus"]))
-    pack = annotate_evidence_pack_v3_lite(pack)
+    pack = read_evidence_pack(pack)
+    pdf_table_items = [
+        item
+        for material in [*primary_materials, *auxiliary_materials]
+        for attachment in list(material.get("attachments") or [])
+        for item in list(attachment.get("evidence_items") or [])
+        if isinstance(item, dict)
+    ]
+    if pdf_table_items:
+        pack["evidence_items"] = [*list(pack.get("evidence_items") or []), *copy.deepcopy(pdf_table_items)]
+        pack = validate_evidence_pack(pack)
+    if vbp_fact_extraction_enabled():
+        pack = enrich_vbp_facts(pack)
+    pack.pop("source_evidence_schema_version", None)
+    timing.add_elapsed("evidence_build_ms", evidence_started_ns)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
-    _write_database_evidence_pack(pack)
     return pack
+
+
+def _build_database_evidence_pack(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
+    timing = PipelineTiming()
+    with timing.measure("prepare_ms"):
+        result = _build_database_evidence_pack_impl(req, timing)
+    if isinstance(result, dict):
+        result["timings"] = timing.snapshot(finish=True)
+        _write_database_evidence_pack(result)
+    else:
+        logger.info("analysis_prepare_failed timings=%s", timing.snapshot(finish=True))
+    return result
 
 
 @app.get("/records-ui")
@@ -3781,6 +5915,16 @@ def records_ui():
     path = Path(__file__).resolve().parent / "static" / "records.html"
     if not path.exists():
         raise HTTPException(status_code=404, detail="records UI not found")
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
+@app.get("/analysis-history-ui")
+def analysis_history_ui():
+    if not _analysis_history_ui_enabled():
+        raise HTTPException(status_code=404, detail="analysis history UI not found")
+    path = Path(__file__).resolve().parent / "static" / "analysis_history.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="analysis history UI not found")
     return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
@@ -3798,14 +5942,6 @@ def memory_ui():
     path = Path(__file__).resolve().parent / "static" / "memory.html"
     if not path.exists():
         raise HTTPException(status_code=404, detail="memory UI not found")
-    return FileResponse(path, media_type="text/html; charset=utf-8")
-
-
-@app.get("/ops-diagnostics-ui")
-def ops_diagnostics_ui():
-    path = Path(__file__).resolve().parent / "static" / "ops_diagnostics.html"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="ops diagnostics UI not found")
     return FileResponse(path, media_type="text/html; charset=utf-8")
 
 
@@ -3928,6 +6064,7 @@ def list_records(
     projecttype: str = "",
     start_date: str = "",
     end_date: str = "",
+    sort: str = "",
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
 ) -> RecordListResponse:
@@ -3943,6 +6080,7 @@ def list_records(
     total_row = _db_fetch_one(f"SELECT COUNT(*) AS total FROM sample_article_wide a WHERE {where_sql}", params)
     total = int((total_row or {}).get("total") or 0)
     offset = (page - 1) * page_size
+    order_by = _records_order_by(sort)
     selected_fields = ", ".join(f"a.{field}" for field in ARTICLE_LIST_FIELDS)
     group_fields = ", ".join(f"a.{field}" for field in ARTICLE_LIST_FIELDS)
     list_sql = f"""
@@ -3952,7 +6090,7 @@ def list_records(
           ON a.menu_code = att.menu_code AND a.articleid = att.articleid
         WHERE {where_sql}
         GROUP BY {group_fields}
-        ORDER BY a.audittime DESC
+        {order_by}
         LIMIT %s OFFSET %s
     """
     rows = _db_fetch_all(list_sql, [*params, page_size, offset])
@@ -4045,101 +6183,19 @@ def prepare_analysis(req: SelectionPreviewRequest):
     )
 
 
-def _material_cache_summary(items: list[dict[str, Any]]) -> dict[str, int]:
-    summary = {f"{status}_count": 0 for status in ["hit", "miss", "stale", "corrupt", "failed", "building", "building_timeout", "force_refresh", "built", "invalid_view_type"]}
-    for item in items:
-        status = str(item.get("status") or "")
-        key = f"{status}_count"
-        if key in summary:
-            summary[key] += 1
-    summary["item_count"] = len(items)
-    return summary
-
-
-def _load_selected_material_rows_for_cache(req: SelectionPreviewRequest) -> tuple[list[tuple[str, tuple[str, str], dict[str, Any], list[dict[str, Any]], str]], dict[str, Any], JSONResponse | None]:
-    primary_keys, auxiliary_keys, error = _validate_material_selection(req)
-    if error is not None:
-        return [], {}, error
-    all_keys = list(dict.fromkeys([*primary_keys, *auxiliary_keys]))
-    rows_by_key = _fetch_database_material_rows(all_keys)
-    missing = [key for key in all_keys if key not in rows_by_key]
-    if missing:
-        missing_text = ", ".join(f"{menu_code}/{articleid}" for menu_code, articleid in missing)
-        return [], {}, _selection_error(422, "MATERIAL_NOT_FOUND", f"所选文章不存在或状态不可用: {missing_text}")
-    attachments_by_key = _fetch_database_attachments(all_keys)
-    attachment_options = _attachment_request_options(req)
-    selected: list[tuple[str, tuple[str, str], dict[str, Any], list[dict[str, Any]], str]] = []
-    for key in primary_keys:
-        selected.append(("primary", key, rows_by_key[key], attachments_by_key.get(key, []), "primary"))
-    for key in auxiliary_keys:
-        selected.append(("auxiliary", key, rows_by_key[key], attachments_by_key.get(key, []), "auxiliary"))
-    return selected, attachment_options, None
-
-
-@app.post("/analysis/material-cache/check", response_model=None)
-def check_material_cache(req: SelectionPreviewRequest) -> dict[str, Any] | JSONResponse:
-    selected, attachment_options, error = _load_selected_material_rows_for_cache(req)
-    if error is not None:
-        return error
-    enabled = material_cache_enabled()
-    repo = _material_cache_repository() if enabled else None
-    items: list[dict[str, Any]] = []
-    for role, key, row, attachments, _context_role in selected:
-        for view_type in SUPPORTED_MATERIAL_VIEW_TYPES:
-            signature = _material_cache_signature(row, attachments, attachment_options, view_type)
-            status = repo.read_payload(signature).status if repo else "disabled"
-            items.append(
-                {
-                    "menu_code": key[0],
-                    "articleid": key[1],
-                    "role": role,
-                    "view_type": view_type,
-                    "status": status,
-                    "cache_key": signature.cache_key,
-                }
-            )
-    return {"success": True, "enabled": enabled, "summary": _material_cache_summary(items), "items": items}
-
-
-@app.post("/analysis/material-cache/build", response_model=None)
-def build_selected_material_cache(req: MaterialCacheBuildRequest) -> dict[str, Any] | JSONResponse:
-    selected, attachment_options, error = _load_selected_material_rows_for_cache(req)
-    if error is not None:
-        return error
-    if not material_cache_enabled():
-        return {"success": True, "enabled": False, "summary": {"item_count": 0, "built_count": 0, "disabled_count": len(selected)}, "items": []}
-    levels = [level for level in req.levels if level in SUPPORTED_MATERIAL_VIEW_TYPES]
-    if not levels:
-        return _analysis_error(422, "MATERIAL_CACHE_INVALID_LEVELS", "缓存视图类型无效")
-    primary_rows = [row for role, _key, row, _attachments, _context_role in selected if role == "primary"]
-    primary_keywords = _primary_topic_keywords(primary_rows or [row for _role, _key, row, _attachments, _context_role in selected])
-    items: list[dict[str, Any]] = []
-    built_count = 0
-    for role, key, row, attachments, context_role in selected:
-        built, results = _build_and_store_material_cache_views(
-            row=row,
-            attachments=attachments,
-            attachment_options=attachment_options,
-            levels=levels,
-            role=context_role,
-            primary_keywords=primary_keywords,
-            force_refresh=bool(req.force_refresh_cache),
-            build_source="selected_api",
-        )
-        built_count += built
-        for item in results:
-            items.append({"menu_code": key[0], "articleid": key[1], "role": role, **item})
-    summary = _material_cache_summary(items)
-    summary["built_count"] = built_count
-    return {"success": True, "enabled": True, "summary": summary, "items": items}
-
-
 @app.get("/analysis/packs/{pack_id}")
 def get_analysis_pack(pack_id: str, full: bool = False) -> dict[str, Any]:
     pack = _read_database_evidence_pack(pack_id)
     if full:
         return pack
-    compact = _compact_evidence_pack_for_dify(pack)
+    try:
+        compact = _compact_evidence_pack_for_dify(pack)
+    except CompactPolicyError as exc:
+        logger.warning("analysis_pack_compaction_blocked pack_id=%s code=%s", pack_id, exc.code)
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "metrics": copy.deepcopy(exc.metrics)},
+        ) from exc
     logger.info(
         "analysis_pack_compacted_for_dify pack_id=%s full_chars=%s compact_chars=%s",
         pack_id,
@@ -4171,7 +6227,14 @@ def get_analysis_pack_summary(pack_id: str) -> dict[str, Any]:
 @app.get("/analysis/packs/{pack_id}/diagnostics")
 def get_analysis_pack_diagnostics(pack_id: str) -> dict[str, Any]:
     pack = _read_database_evidence_pack(pack_id)
-    dify_pack = _compact_evidence_pack_for_dify(pack)
+    try:
+        dify_pack = _compact_evidence_pack_for_dify(pack)
+    except CompactPolicyError as exc:
+        logger.warning("analysis_pack_diagnostics_compaction_blocked pack_id=%s code=%s", pack_id, exc.code)
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "metrics": copy.deepcopy(exc.metrics)},
+        ) from exc
     return {
         "success": True,
         "pack_id": pack.get("pack_id") or pack_id,
@@ -4194,18 +6257,21 @@ def cleanup_analysis_cache() -> dict[str, Any]:
     return {"success": True, **result}
 
 
+_ANALYSIS_WATCHDOG_ACTIVE_STATUSES = frozenset({"running", "generating"})
+
+
 def _save_analysis_timeout_fallback_if_running(pack_id: str, run_id: str, pack: dict[str, Any] | None, timeout_seconds: float) -> None:
     try:
         current = _read_analysis_run(run_id)
     except HTTPException as exc:
         logger.warning("analysis_run_watchdog_missing run_id=%s pack_id=%s detail=%s", run_id, pack_id, exc.detail)
         return
-    if current.get("status") != "running":
+    if current.get("status") not in _ANALYSIS_WATCHDOG_ACTIVE_STATUSES:
         return
     try:
         evidence_pack = pack or _read_database_evidence_pack(pack_id)
         exc = DifyWorkflowError(
-            "DIFY_TIMEOUT",
+            "TIMEOUT",
             "Dify 工作流调用超时",
             f"watchdog timeout after {timeout_seconds:.1f}s",
             status_code=504,
@@ -4254,7 +6320,7 @@ def _parse_analysis_timestamp(value: Any) -> datetime | None:
 
 
 def _maybe_finalize_timed_out_analysis_run(record: dict[str, Any]) -> dict[str, Any]:
-    if record.get("status") != "running":
+    if record.get("status") not in _ANALYSIS_WATCHDOG_ACTIVE_STATUSES:
         return record
     run_id = str(record.get("run_id") or "")
     pack_id = str(record.get("pack_id") or "")
@@ -4293,53 +6359,15 @@ def _execute_analysis_run_background(
         return
 
     logger.info("analysis_run_background_started run_id=%s pack_id=%s", run_id, pack_id)
-    backend = str(record.get("workflow_backend") or record.get("backend") or WorkflowBackend.DIFY_LEGACY.value)
     pack_for_policy: dict[str, Any] | None = None
     try:
         pack_for_policy = _read_database_evidence_pack(pack_id)
     except Exception as exc:  # noqa: BLE001
         logger.warning("analysis_run_pack_preread_failed run_id=%s pack_id=%s error_type=%s", run_id, pack_id, exc.__class__.__name__)
-    if backend == WorkflowBackend.LOCAL_ENGINE.value:
-        try:
-            pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            result = run_local_workflow(pack, run_id)
-            try:
-                current_record = _read_analysis_run(run_id)
-                if current_record.get("status") != "running":
-                    logger.warning(
-                        "analysis_run_late_local_result_ignored run_id=%s pack_id=%s current_status=%s",
-                        run_id,
-                        pack_id,
-                        current_record.get("status") or "",
-                    )
-                    return
-                record = current_record
-            except HTTPException:
-                pass
-            record.update(result)
-            record["success"] = True
-            record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
-            _write_analysis_run(record)
-            logger.info(
-                "analysis_run_local_finished run_id=%s pack_id=%s workflow_run_id=%s status=%s",
-                run_id,
-                pack_id,
-                record.get("workflow_run_id") or "",
-                record.get("status") or "",
-            )
-        except Exception as exc:  # noqa: BLE001
-            record.update(
-                {
-                    "success": False,
-                    "status": "failed",
-                    "updated_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
-                    "error_message": "本地工作流生成失败",
-                    "error_detail": exc.__class__.__name__,
-                }
-            )
-            _write_analysis_run(record)
-            logger.exception("analysis_run_local_failed run_id=%s pack_id=%s", run_id, pack_id)
-        return
+    run_timing = PipelineTiming((pack_for_policy or {}).get("timings"))
+    input_stages: list[dict[str, Any]] | None = None
+    compact: dict[str, Any] | None = None
+    provider_input: Any = {"pack_id": pack_id}
     watchdog: threading.Timer | None = None
     watchdog_timeout = _analysis_watchdog_timeout_seconds(pack_for_policy)
     if watchdog_timeout > 0:
@@ -4347,38 +6375,137 @@ def _execute_analysis_run_background(
         watchdog.daemon = True
         watchdog.start()
     try:
-        try:
-            result = _call_dify_workflow(
+        if _analysis_checkpoints_enabled():
+            pack = pack_for_policy or _read_database_evidence_pack(pack_id)
+            _record_stage_checkpoint(run_id, "compact", "started", pack)
+            input_stages, compact = _input_pipeline_stages(pack, run_timing)
+            _record_stage_checkpoint(
+                run_id,
+                "compact",
+                "completed",
+                pack,
+                compact or {"compact_unavailable": True},
+            )
+            provider_input = compact or {"pack_id": pack_id}
+            record.update(
+                {
+                    "status": "generating",
+                    "provider_invocation_state": "started",
+                    "provider_started_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            _record_stage_checkpoint(
+                run_id,
+                "provider",
+                "started",
+                provider_input,
+            )
+        generator = _configured_report_generator()
+        with run_timing.measure("dify_ms"):
+            generation_result = generator.generate(
                 pack_id,
                 run_id,
                 pack_for_policy,
                 report_memory_snapshot,
                 use_report_memory=use_report_memory,
             )
-        except TypeError as exc:
-            if "positional" not in str(exc) and "argument" not in str(exc):
-                raise
-            result = _call_dify_workflow(pack_id, run_id, pack_for_policy)
+        result = generation_result.to_legacy_result()
+        run_timing.merge(result.get("timings"))
+        inherited_warnings = [str(item) for item in list(record.get("warnings") or []) if str(item).strip()]
+        generated_warnings = [
+            str(item)
+            for item in list(result.get("generation_warnings") or result.get("warnings") or [])
+            if str(item).strip()
+        ]
+        merged_warnings = _dedupe_strings([*inherited_warnings, *generated_warnings])
+        result["generation_warnings"] = merged_warnings
+        result["warnings"] = merged_warnings
+        if _analysis_checkpoints_enabled():
+            record.update(
+                {
+                    "status": "generated",
+                    "provider_invocation_state": "completed",
+                    "provider_completed_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                    "provider_result": dict(result),
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            _record_stage_checkpoint(
+                run_id,
+                "provider",
+                "completed",
+                provider_input,
+                result,
+            )
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            result = _repair_unusable_dify_result(result, pack)
-            result = _apply_local_quality_gate_to_dify_result(result, pack)
-        except Exception as repair_exc:  # noqa: BLE001
-            logger.warning(
-                "analysis_run_repair_skipped run_id=%s pack_id=%s error_type=%s",
-                run_id,
-                pack_id,
-                repair_exc.__class__.__name__,
+            if input_stages is None:
+                input_stages, compact = _input_pipeline_stages(pack, run_timing)
+            result = _postprocess_generation_with_stages(
+                result,
+                pack,
+                input_stages,
+                compact,
+                run_timing,
+                checkpoint_callback=(
+                    _analysis_stage_checkpoint_callback(run_id)
+                    if _analysis_checkpoints_enabled()
+                    else None
+                ),
             )
+        except Exception as repair_exc:  # noqa: BLE001
+            if strict_delivery_gate_enabled():
+                failed = fail_closed_controlled_repair(
+                    ReportGenerationResult.from_legacy_result(
+                        result,
+                        provider=str(result.get("provider") or "dify"),
+                    ),
+                    "CONTROLLED_REPAIR_POSTPROCESS_FAILED",
+                    error_type=repair_exc.__class__.__name__,
+                )
+                result = failed.to_legacy_result()
+                logger.error(
+                    "analysis_run_postprocess_failed_closed run_id=%s pack_id=%s error_type=%s",
+                    run_id,
+                    pack_id,
+                    repair_exc.__class__.__name__,
+                )
+            else:
+                logger.warning(
+                    "analysis_run_repair_skipped run_id=%s pack_id=%s error_type=%s",
+                    run_id,
+                    pack_id,
+                    repair_exc.__class__.__name__,
+                )
     except DifyWorkflowError as exc:
+        if _analysis_checkpoints_enabled():
+            _record_stage_checkpoint(
+                run_id,
+                "provider",
+                "failed",
+                provider_input,
+                error_code=canonical_provider_failure_code(exc.code),
+            )
+            record["provider_invocation_state"] = "failed"
         warnings = list(record.get("warnings") or [])
         error_message = exc.message
-        if exc.code == "DIFY_TIMEOUT":
+        if exc.code in {"DIFY_TIMEOUT", "TIMEOUT"}:
             error_message = "Dify 工作流调用超时：证据包较大或生成/质检耗时过长"
             warnings.append("证据包较大时可能导致 Dify 超时，可减少辅助材料、缩短辅助附件摘要或稍后重试。")
         try:
             pack = pack_for_policy or _read_database_evidence_pack(pack_id)
-            fallback = _fallback_result_from_dify_error(exc, pack, pack_id)
+            fallback = _fallback_result_from_dify_error(exc, pack, pack_id, timing=run_timing)
             merged_warnings = [*warnings, *list(fallback.get("warnings") or fallback.get("generation_warnings") or [])]
             record.update(fallback)
             record.update(
@@ -4438,10 +6565,12 @@ def _execute_analysis_run_background(
     finally:
         if watchdog:
             watchdog.cancel()
+        _persist_run_timings_nonblocking(run_id, run_timing.snapshot(finish=True))
 
+    result["timings"] = run_timing.snapshot(finish=True)
     try:
         current_record = _read_analysis_run(run_id)
-        if current_record.get("status") != "running":
+        if current_record.get("status") in RUN_TERMINAL_STATUSES:
             logger.warning(
                 "analysis_run_late_dify_result_ignored run_id=%s pack_id=%s current_status=%s",
                 run_id,
@@ -4450,9 +6579,10 @@ def _execute_analysis_run_background(
             )
             return
     except HTTPException:
-        current_record = record
-    record = current_record
+        pass
     record.update(result)
+    record.pop("provider_result", None)
+    record.pop("resume_stage_result", None)
     record["success"] = True
     record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
     _write_analysis_run(record)
@@ -4465,125 +6595,173 @@ def _execute_analysis_run_background(
     )
 
 
-def _analysis_run_response_from_record(record: dict[str, Any]) -> AnalysisRunResponse:
-    quality_check = record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {}
-    return AnalysisRunResponse(
-        success=bool(record.get("success", True)),
-        run_id=str(record.get("run_id") or ""),
-        pack_id=str(record.get("pack_id") or ""),
-        status=str(record.get("status") or ""),
-        workflow_run_id=str(record.get("workflow_run_id") or ""),
-        report_title=str(record.get("report_title") or ""),
-        quality_passed=quality_check.get("passed"),
-        version=int(record.get("version") or 1),
-        warnings=list(record.get("warnings") or record.get("generation_warnings") or []),
-        input_hash=str(record.get("input_hash") or ""),
-        idempotency_reused=bool(record.get("idempotency_reused")),
-    )
-
-
-def _make_analysis_run_control_event(
-    action: str,
-    *,
-    source_run_id: str,
-    target_run_id: str = "",
-    status_before: str = "",
-    status_after: str = "",
-) -> dict[str, Any]:
-    return {
-        "action": action,
-        "source_run_id": source_run_id,
-        "target_run_id": target_run_id,
-        "status_before": status_before,
-        "status_after": status_after,
-        "created_at": datetime.now().isoformat(sep=" ", timespec="seconds"),
-    }
-
-
-def _append_analysis_run_control_event(record: dict[str, Any], event: dict[str, Any]) -> None:
-    events = list(record.get("control_events") or [])
-    events.append(event)
-    record["control_events"] = events[-20:]
-
-
-def _start_analysis_run_record(
-    pack_id: str,
-    *,
-    use_report_memory: bool = False,
-    control_action: str = "",
-    source_run_id: str = "",
-    source_status: str = "",
-) -> dict[str, Any]:
-    pack_id = pack_id.strip()
-    pack_for_memory = _read_database_evidence_pack(pack_id)
-    report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(use_report_memory, pack_for_memory)
-    backend = _selected_workflow_backend()
-    input_hash = _analysis_run_input_hash(
-        pack_id=pack_id,
-        backend=backend.value,
-        use_report_memory=bool(use_report_memory),
-        memory_metadata=memory_metadata,
-    )
-    if not control_action:
-        with _ANALYSIS_RUN_CREATE_LOCK:
-            _recover_stale_pending_analysis_runs()
-            existing_record = _find_active_analysis_run_by_input_hash(input_hash)
-            if existing_record:
-                logger.info(
-                    "analysis_run_idempotency_reused run_id=%s pack_id=%s input_hash=%s",
-                    existing_record.get("run_id") or "",
-                    pack_id,
-                    input_hash,
-                )
-                return _mark_analysis_run_idempotency_reuse(existing_record)
-            return _create_analysis_run_record(
-                pack_id=pack_id,
-                backend=backend,
-                report_memory_snapshot=report_memory_snapshot,
-                memory_metadata=memory_metadata,
-                memory_warnings=memory_warnings,
-                input_hash=input_hash,
-                use_report_memory=use_report_memory,
-                control_action=control_action,
-                source_run_id=source_run_id,
-                source_status=source_status,
+def _resume_analysis_run_background(run_id: str, recovery_id: str) -> None:
+    try:
+        record = _read_analysis_run(run_id)
+        recovery = _recover_analysis_result(record)
+        if recovery.get("blocked"):
+            logger.warning(
+                "analysis_run_recovery_blocked run_id=%s recovery_id=%s code=%s",
+                run_id,
+                recovery_id,
+                recovery.get("error_code") or "",
             )
-    return _create_analysis_run_record(
-        pack_id=pack_id,
-        backend=backend,
-        report_memory_snapshot=report_memory_snapshot,
-        memory_metadata=memory_metadata,
-        memory_warnings=memory_warnings,
-        input_hash=input_hash,
-        use_report_memory=use_report_memory,
-        control_action=control_action,
-        source_run_id=source_run_id,
-        source_status=source_status,
-    )
+            return
+        pack_id = str(record.get("pack_id") or "")
+        provider_result = recovery.get("provider_result")
+        if not isinstance(provider_result, dict):
+            if str(record.get("provider_invocation_state") or "") == "started":
+                logger.warning(
+                    "analysis_run_recovery_provider_unknown run_id=%s recovery_id=%s",
+                    run_id,
+                    recovery_id,
+                )
+                return
+            if bool(record.get("use_report_memory")):
+                raise CheckpointError("report memory snapshot is unavailable for recovery")
+            record.update(
+                {
+                    "status": "running",
+                    "active_recovery_id": recovery_id,
+                    "recovery_status": "running",
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            _execute_analysis_run_background(pack_id, run_id)
+            return
+
+        pack = _read_database_evidence_pack(pack_id)
+        run_timing = PipelineTiming(record.get("timings"))
+        input_stages, compact = _input_pipeline_stages(pack, run_timing)
+        store = _analysis_checkpoint_store()
+        plan = store.resume_plan(run_id)
+        result = dict(provider_result)
+        store.assert_completed_hashes(
+            run_id,
+            "provider",
+            input_value=compact or {"pack_id": pack_id},
+            output_value=provider_result,
+        )
+        resume_after = ""
+        resume_stage_result = record.get("resume_stage_result")
+        if "quality_gate" in list(plan.get("skipped_steps") or []):
+            if not isinstance(resume_stage_result, dict):
+                raise CheckpointCorruptionError(
+                    "completed quality checkpoint has no persisted result"
+                )
+            result = dict(resume_stage_result)
+            store.assert_completed_hashes(
+                run_id,
+                "quality_gate",
+                output_value=result,
+            )
+        else:
+            if "repair" in list(plan.get("skipped_steps") or []):
+                if not isinstance(resume_stage_result, dict) or str(
+                    record.get("resume_stage") or ""
+                ) != "repair":
+                    raise CheckpointCorruptionError(
+                        "completed repair checkpoint has no persisted result"
+                    )
+                result = dict(resume_stage_result)
+                store.assert_completed_hashes(
+                    run_id,
+                    "repair",
+                    output_value=result,
+                )
+                resume_after = "repair"
+            result = _postprocess_generation_with_stages(
+                result,
+                pack,
+                input_stages,
+                compact,
+                run_timing,
+                checkpoint_callback=_analysis_stage_checkpoint_callback(
+                    run_id, recovery_id
+                ),
+                resume_after=resume_after,
+            )
+
+        result["timings"] = run_timing.snapshot(finish=True)
+        current = _read_analysis_run(run_id)
+        current.update(result)
+        current.update(
+            {
+                "success": bool(result.get("success", True)),
+                "active_recovery_id": recovery_id,
+                "last_recovery_id": recovery_id,
+                "recovery_status": "completed",
+                "recovered_from_step": str(plan.get("resumed_from") or ""),
+                "updated_at": datetime.now().isoformat(
+                    sep=" ", timespec="seconds"
+                ),
+            }
+        )
+        current.pop("provider_result", None)
+        current.pop("resume_stage_result", None)
+        _write_analysis_run(current)
+        logger.info(
+            "analysis_run_recovery_finished run_id=%s recovery_id=%s resumed_from=%s",
+            run_id,
+            recovery_id,
+            plan.get("resumed_from") or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        try:
+            failed = _read_analysis_run(run_id)
+            failed.update(
+                {
+                    "status": "interrupted",
+                    "success": False,
+                    "recovery_status": "failed",
+                    "last_recovery_id": recovery_id,
+                    "recovery_error_code": (
+                        "RECOVERY_CHECKPOINT_CORRUPT"
+                        if isinstance(exc, CheckpointCorruptionError)
+                        else "RECOVERY_FAILED"
+                    ),
+                    "error_detail": exc.__class__.__name__,
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(failed)
+        except Exception as save_exc:  # noqa: BLE001
+            logger.warning(
+                "analysis_run_recovery_failure_save_failed run_id=%s error_type=%s",
+                run_id,
+                save_exc.__class__.__name__,
+            )
+        logger.exception(
+            "analysis_run_recovery_failed run_id=%s recovery_id=%s",
+            run_id,
+            recovery_id,
+        )
 
 
-def _create_analysis_run_record(
-    *,
-    pack_id: str,
-    backend: WorkflowBackend,
-    report_memory_snapshot: str,
-    memory_metadata: dict[str, Any],
-    memory_warnings: list[str],
-    input_hash: str,
-    use_report_memory: bool = False,
-    control_action: str = "",
-    source_run_id: str = "",
-    source_status: str = "",
-) -> dict[str, Any]:
+@app.post("/analysis/run")
+def run_analysis(req: AnalysisRunRequest):
+    pack_id = req.pack_id.strip()
+    try:
+        pack_for_memory = _read_database_evidence_pack(pack_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
+        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
+
+    report_memory_snapshot, memory_metadata, memory_warnings = _resolve_report_memory_snapshot(req.use_report_memory, pack_for_memory)
     run_id = _make_analysis_run_id(pack_id)
     now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    material_metadata = enrich_record_with_pack_identity({}, pack_for_memory)
     record: dict[str, Any] = {
         "success": True,
         "run_id": run_id,
         "pack_id": pack_id,
         "status": "running",
-        "backend": backend.value,
-        "workflow_backend": backend.value,
         "workflow_run_id": "",
         "report_title": "",
         "report_markdown": "",
@@ -4591,28 +6769,17 @@ def _create_analysis_run_record(
         "generation_warnings": [],
         "warnings": memory_warnings,
         "remaining_issues": [],
+        "timings": _normalize_run_timings(pack_for_memory.get("timings")),
         "version": 1,
         "created_at": now,
         "updated_at": now,
         "error_message": "",
-        "input_hash": input_hash,
-        "idempotency_reused": False,
-        "idempotency_duplicate_count": 0,
+        **material_metadata,
         **memory_metadata,
     }
-    if control_action and source_run_id:
-        record[f"{control_action}_of"] = source_run_id
-        _append_analysis_run_control_event(
-            record,
-            _make_analysis_run_control_event(
-                control_action,
-                source_run_id=source_run_id,
-                target_run_id=run_id,
-                status_before=source_status,
-                status_after="running",
-            ),
-        )
+    record = _normalize_analysis_run_schema(record)
     _write_analysis_run(record)
+    _bootstrap_analysis_checkpoints(run_id, pack_for_memory)
     logger.info(
         "analysis_run_started run_id=%s pack_id=%s use_report_memory=%s report_memory_applied=%s report_memory_chars=%s memory_read_failed=%s",
         run_id,
@@ -4625,198 +6792,275 @@ def _create_analysis_run_record(
 
     threading.Thread(
         target=_execute_analysis_run_background,
-        args=(pack_id, run_id, report_memory_snapshot, bool(use_report_memory)),
+        args=(pack_id, run_id, report_memory_snapshot, bool(req.use_report_memory)),
         daemon=True,
     ).start()
-    return record
-
-
-def _run_operation_not_allowed(action: str, status: str, allowed_statuses: set[str]) -> JSONResponse:
-    allowed = ", ".join(sorted(allowed_statuses))
-    return _analysis_error(
-        409,
-        "RUN_OPERATION_NOT_ALLOWED",
-        f"当前 analysis run 状态不允许执行 {action}",
-        f"status={status or 'unknown'} allowed={allowed}",
+    return AnalysisRunResponse(
+        success=True,
+        run_id=run_id,
+        pack_id=pack_id,
+        status="running",
+        run_status=str(record.get("run_status") or "running"),
+        workflow_run_id=str(record.get("workflow_run_id") or ""),
+        provider_run_id=str(record.get("provider_run_id") or ""),
+        report_title=str(record.get("report_title") or ""),
+        quality_passed=(record.get("quality_check") or {}).get("passed") if isinstance(record.get("quality_check"), dict) else None,
+        version=int(record.get("version") or 1),
+        warnings=list(record.get("warnings") or record.get("generation_warnings") or []),
+        deliverable=bool(record.get("deliverable")),
+        draft_word_export_available=bool(record.get("draft_word_export_available")),
+        final_word_export_available=bool(record.get("final_word_export_available")),
+        word_export_available=bool(record.get("word_export_available")),
+        needs_manual_review=bool(record.get("needs_manual_review")),
+        failure_schema_version=str(record.get("failure_schema_version") or ""),
+        primary_layer=str(record.get("primary_layer") or ""),
+        primary_failure_code=str(record.get("primary_failure_code") or ""),
+        secondary_failure_codes=list(record.get("secondary_failure_codes") or []),
+        quality_failure_codes=list(record.get("quality_failure_codes") or []),
+        generation_failure_codes=list(record.get("generation_failure_codes") or []),
+        blocking_issue_codes=list(record.get("blocking_issue_codes") or []),
+        fallback_used=bool(record.get("fallback_used")),
+        fallback_reason=str(record.get("fallback_reason") or ""),
+        fallback_provider=str(record.get("fallback_provider") or ""),
+        repair_attempted=bool(record.get("repair_attempted")),
+        repair_success=bool(record.get("repair_success")),
+        repair_count=min(1, max(0, _safe_int_value(record.get("repair_count"), 0))),
+        repair_actions=list(record.get("repair_actions") or []),
+        manual_review_reason_summary=str(record.get("manual_review_reason_summary") or ""),
+        final_blocking_reason=str(record.get("final_blocking_reason") or ""),
+        provider=str(record.get("provider") or "dify"),
+        generator_version=str(record.get("generator_version") or ""),
+        prompt_version=str(record.get("prompt_version") or ""),
+        workflow_version=str(record.get("workflow_version") or ""),
+        compact_pack_chars=int(record.get("compact_pack_chars") or 0),
+        input_strategy=str(record.get("input_strategy") or ""),
+        timings=record.get("timings") if isinstance(record.get("timings"), dict) else {},
     )
 
 
-@app.post("/analysis/run")
-def run_analysis(req: AnalysisRunRequest):
-    try:
-        record = _start_analysis_run_record(req.pack_id, use_report_memory=bool(req.use_report_memory))
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
-    return _analysis_run_response_from_record(record)
-
-
-@app.post("/analysis/runs/{run_id}/cancel", response_model=AnalysisRunControlResponse)
-def cancel_analysis_run(run_id: str) -> AnalysisRunControlResponse | JSONResponse:
+@app.post("/analysis/runs/{run_id}/recover")
+def recover_analysis_run(run_id: str, req: AnalysisRecoveryRequest):
+    if not _analysis_recovery_enabled() or not _analysis_checkpoints_enabled():
+        return _analysis_error(404, "RUN_RECOVERY_DISABLED", "analysis run 恢复未启用")
     try:
         record = _read_analysis_run(run_id)
     except HTTPException as exc:
         if exc.status_code == 404:
-            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
-    record = _maybe_finalize_timed_out_analysis_run(record)
-    current_status = str(record.get("status") or "")
-    allowed = {"created", "running"}
-    if current_status not in allowed:
-        return _run_operation_not_allowed("cancel", current_status, allowed)
+            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在")
+        return _analysis_error(500, "RUN_READ_FAILED", "读取 analysis run 失败")
 
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    record.update(
-        {
-            "success": False,
-            "status": "cancelled",
-            "cancel_requested": True,
-            "cancelled_at": now,
-            "updated_at": now,
-            "finished_at": now,
-            "error_message": "报告生成已取消",
-            "error_detail": "",
+    recovery_id = req.recovery_id.strip()
+    try:
+        with _ANALYSIS_RECOVERY_LOCK:
+            record = _read_analysis_run(run_id)
+            store = _analysis_checkpoint_store()
+            status = str(record.get("status") or "")
+            if status in {"finished", "needs_manual_review"}:
+                store.record_recovery_request(run_id, recovery_id)
+                return {
+                    "success": True,
+                    "run_id": run_id,
+                    "recovery_id": recovery_id,
+                    "status": status,
+                    "already_terminal": True,
+                    "resumed_from": "",
+                    "skipped_steps": [],
+                }
+            if str(record.get("recovery_status") or "") == "running":
+                if str(record.get("active_recovery_id") or "") != recovery_id:
+                    return _analysis_error(
+                        409,
+                        "RUN_RECOVERY_IN_PROGRESS",
+                        "另一个 analysis run 恢复请求正在执行",
+                    )
+                store.record_recovery_request(run_id, recovery_id)
+                return {
+                    "success": True,
+                    "run_id": run_id,
+                    "recovery_id": recovery_id,
+                    "status": status,
+                    "already_terminal": False,
+                    "resumed_from": str(record.get("recovered_from_step") or ""),
+                    "skipped_steps": [],
+                }
+            store.record_recovery_request(run_id, recovery_id)
+            plan = _recover_analysis_result(record)
+            if plan.get("blocked"):
+                return _analysis_error(
+                    409,
+                    str(plan.get("error_code") or "RUN_RECOVERY_BLOCKED"),
+                    "analysis run 无法安全自动恢复",
+                )
+            record.update(
+                {
+                    "active_recovery_id": recovery_id,
+                    "recovery_status": "running",
+                    "updated_at": datetime.now().isoformat(
+                        sep=" ", timespec="seconds"
+                    ),
+                }
+            )
+            _write_analysis_run(record)
+            threading.Thread(
+                target=_resume_analysis_run_background,
+                args=(run_id, recovery_id),
+                daemon=True,
+            ).start()
+            return {
+                "success": True,
+                "run_id": run_id,
+                "recovery_id": recovery_id,
+                "status": str(record.get("status") or ""),
+                "already_terminal": False,
+                "resumed_from": str(plan.get("resumed_from") or ""),
+                "skipped_steps": list(plan.get("skipped_steps") or []),
+            }
+    except CheckpointCorruptionError:
+        return _analysis_error(
+            409,
+            "RECOVERY_CHECKPOINT_CORRUPT",
+            "analysis run checkpoint 损坏，已阻止自动恢复",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_run_recovery_request_failed run_id=%s error_type=%s",
+            run_id,
+            exc.__class__.__name__,
+        )
+        return _analysis_error(500, "RUN_RECOVERY_FAILED", "analysis run 恢复请求失败")
+
+
+@app.get("/analysis/history", response_model=None)
+def list_analysis_history(
+    articleid: str = "",
+    record_id: str = "",
+    notice_id: str = "",
+    menu_code: str = "",
+    pack_id: str = "",
+    status: str = "",
+    provider: str = "",
+    q: str = "",
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any] | JSONResponse:
+    if not _analysis_history_enabled():
+        return {
+            "success": True,
+            "enabled": False,
+            "total": 0,
+            "items": [],
+            "page": page,
+            "page_size": page_size,
+            "total_pages": 0,
         }
-    )
-    _append_analysis_run_control_event(
-        record,
-        _make_analysis_run_control_event(
-            "cancel",
-            source_run_id=str(record.get("run_id") or run_id),
-            status_before=current_status,
-            status_after="cancelled",
-        ),
-    )
-    _write_analysis_run(record)
-    logger.info("analysis_run_cancelled run_id=%s pack_id=%s", run_id, record.get("pack_id") or "")
-    return AnalysisRunControlResponse(
-        success=True,
-        action="cancel",
-        run_id=str(record.get("run_id") or run_id),
-        pack_id=str(record.get("pack_id") or ""),
-        status="cancelled",
-        workflow_run_id=str(record.get("workflow_run_id") or ""),
-        warnings=list(record.get("warnings") or record.get("generation_warnings") or []),
-    )
-
-
-@app.post("/analysis/runs/{run_id}/retry", response_model=AnalysisRunControlResponse)
-def retry_analysis_run(run_id: str) -> AnalysisRunControlResponse | JSONResponse:
     try:
-        source_record = _read_analysis_run(run_id)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
-    source_record = _maybe_finalize_timed_out_analysis_run(source_record)
-    source_status = str(source_record.get("status") or "")
-    allowed = {"failed"}
-    if source_status not in allowed:
-        return _run_operation_not_allowed("retry", source_status, allowed)
+        items, total = _analysis_history_store().list_runs(
+            articleid=articleid,
+            record_id=record_id,
+            notice_id=notice_id,
+            menu_code=menu_code,
+            pack_id=pack_id,
+            status=status,
+            provider=provider,
+            query=q,
+            page=page,
+            page_size=page_size,
+        )
+    except HistoryTopologyError:
+        return _analysis_error(
+            503,
+            "ANALYSIS_HISTORY_SINGLE_WORKER_REQUIRED",
+            "分析历史仅支持单 worker 写入拓扑",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis_history_list_failed error_type=%s", exc.__class__.__name__)
+        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
+    return {
+        "success": True,
+        "enabled": True,
+        "total": total,
+        "items": [_history_list_item_for_response(item) for item in items],
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
 
-    pack_id = str(source_record.get("pack_id") or "")
+
+@app.get("/analysis/history/compare", response_model=None)
+def compare_analysis_history(
+    left_run_id: str,
+    right_run_id: str,
+) -> dict[str, Any] | JSONResponse:
+    if not _analysis_history_enabled():
+        return _analysis_error(404, "ANALYSIS_HISTORY_DISABLED", "分析历史功能未启用")
     try:
-        new_record = _start_analysis_run_record(
-            pack_id,
-            use_report_memory=bool(source_record.get("use_report_memory")),
-            control_action="retry",
-            source_run_id=str(source_record.get("run_id") or run_id),
-            source_status=source_status,
+        left_id = _safe_run_id(left_run_id)
+        right_id = _safe_run_id(right_run_id)
+        store = _analysis_history_store()
+        left_item = store.get_run(left_id)
+        right_item = store.get_run(right_id)
+    except HistoryTopologyError:
+        return _analysis_error(
+            503,
+            "ANALYSIS_HISTORY_SINGLE_WORKER_REQUIRED",
+            "分析历史仅支持单 worker 写入拓扑",
+        )
+    except HTTPException:
+        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("analysis_history_compare_failed error_type=%s", exc.__class__.__name__)
+        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
+    if left_item is None or right_item is None:
+        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    left_material = _history_material_key(left_item)
+    right_material = _history_material_key(right_item)
+    if not left_material or left_material != right_material:
+        return _analysis_error(
+            409,
+            "ANALYSIS_HISTORY_MATERIAL_MISMATCH",
+            "只能对比同一材料的分析记录",
+        )
+    left = _history_compare_item(left_item)
+    right = _history_compare_item(right_item)
+    changes = {
+        field: {"left": left[field], "right": right[field]}
+        for field in HISTORY_COMPARE_FIELDS
+        if left[field] != right[field]
+    }
+    return {
+        "success": True,
+        "left_run_id": left_id,
+        "right_run_id": right_id,
+        "left": left,
+        "right": right,
+        "changes": changes,
+    }
+
+
+@app.get("/analysis/history/{run_id}", response_model=None)
+def get_analysis_history(run_id: str) -> dict[str, Any] | JSONResponse:
+    if not _analysis_history_enabled():
+        return _analysis_error(404, "ANALYSIS_HISTORY_DISABLED", "分析历史功能未启用")
+    try:
+        item = _analysis_history_store().get_run(_safe_run_id(run_id))
+    except HistoryTopologyError:
+        return _analysis_error(
+            503,
+            "ANALYSIS_HISTORY_SINGLE_WORKER_REQUIRED",
+            "分析历史仅支持单 worker 写入拓扑",
         )
     except HTTPException as exc:
-        if exc.status_code == 404:
-            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
-
-    source_record["retried_by"] = str(new_record.get("run_id") or "")
-    source_record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
-    _append_analysis_run_control_event(
-        source_record,
-        _make_analysis_run_control_event(
-            "retry",
-            source_run_id=str(source_record.get("run_id") or run_id),
-            target_run_id=str(new_record.get("run_id") or ""),
-            status_before=source_status,
-            status_after=str(new_record.get("status") or "running"),
-        ),
-    )
-    _write_analysis_run(source_record)
-    logger.info(
-        "analysis_run_retry_started source_run_id=%s new_run_id=%s pack_id=%s",
-        run_id,
-        new_record.get("run_id") or "",
-        pack_id,
-    )
-    return AnalysisRunControlResponse(
-        success=True,
-        action="retry",
-        run_id=str(source_record.get("run_id") or run_id),
-        new_run_id=str(new_record.get("run_id") or ""),
-        pack_id=pack_id,
-        status=str(new_record.get("status") or "running"),
-        workflow_run_id=str(new_record.get("workflow_run_id") or ""),
-        warnings=list(new_record.get("warnings") or new_record.get("generation_warnings") or []),
-    )
-
-
-@app.post("/analysis/runs/{run_id}/resume", response_model=AnalysisRunControlResponse)
-def resume_analysis_run(run_id: str) -> AnalysisRunControlResponse | JSONResponse:
-    try:
-        source_record = _read_analysis_run(run_id)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
-    source_record = _maybe_finalize_timed_out_analysis_run(source_record)
-    source_status = str(source_record.get("status") or "")
-    allowed = {"cancelled"}
-    if source_status not in allowed:
-        return _run_operation_not_allowed("resume", source_status, allowed)
-
-    pack_id = str(source_record.get("pack_id") or "")
-    try:
-        new_record = _start_analysis_run_record(
-            pack_id,
-            use_report_memory=bool(source_record.get("use_report_memory")),
-            control_action="resume",
-            source_run_id=str(source_record.get("run_id") or run_id),
-            source_status=source_status,
+        return _analysis_error(exc.status_code, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "analysis_history_detail_failed run_id=%s error_type=%s",
+            run_id,
+            exc.__class__.__name__,
         )
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            return _analysis_error(404, "PACK_NOT_FOUND", "evidence_pack 不存在", str(exc.detail))
-        return _analysis_error(exc.status_code, "PACK_READ_FAILED", "读取 evidence_pack 失败", str(exc.detail))
-
-    source_record["resumed_by"] = str(new_record.get("run_id") or "")
-    source_record["updated_at"] = datetime.now().isoformat(sep=" ", timespec="seconds")
-    _append_analysis_run_control_event(
-        source_record,
-        _make_analysis_run_control_event(
-            "resume",
-            source_run_id=str(source_record.get("run_id") or run_id),
-            target_run_id=str(new_record.get("run_id") or ""),
-            status_before=source_status,
-            status_after=str(new_record.get("status") or "running"),
-        ),
-    )
-    _write_analysis_run(source_record)
-    logger.info(
-        "analysis_run_resume_started source_run_id=%s new_run_id=%s pack_id=%s",
-        run_id,
-        new_record.get("run_id") or "",
-        pack_id,
-    )
-    return AnalysisRunControlResponse(
-        success=True,
-        action="resume",
-        run_id=str(source_record.get("run_id") or run_id),
-        new_run_id=str(new_record.get("run_id") or ""),
-        pack_id=pack_id,
-        status=str(new_record.get("status") or "running"),
-        workflow_run_id=str(new_record.get("workflow_run_id") or ""),
-        warnings=list(new_record.get("warnings") or new_record.get("generation_warnings") or []),
-    )
+        return _analysis_error(500, "ANALYSIS_HISTORY_READ_FAILED", "读取分析历史失败")
+    if item is None:
+        return _analysis_error(404, "ANALYSIS_HISTORY_NOT_FOUND", "分析历史不存在")
+    return {"success": True, "enabled": True, "item": _history_item_for_response(item)}
 
 
 @app.get("/analysis/runs/{run_id}")
@@ -4853,12 +7097,18 @@ def get_analysis_run_diagnostics(run_id: str) -> dict[str, Any]:
         except HTTPException as exc:
             logger.warning("analysis_run_diagnostics_pack_missing run_id=%s pack_id=%s detail=%s", run_id, pack_id, exc.detail)
 
+    try:
+        dify_pack = _compact_evidence_pack_for_dify(pack) if pack else None
+    except CompactPolicyError as exc:
+        logger.warning("analysis_run_diagnostics_compaction_blocked run_id=%s pack_id=%s code=%s", run_id, pack_id, exc.code)
+        return _analysis_error(422, exc.code, "evidence pack compact failed")
+
     return {
         "success": True,
         "run_id": str(record.get("run_id") or run_id),
         "pack_id": pack_id,
         "status": str(record.get("status") or ""),
-        "diagnostics": build_run_diagnostics(record, pack, _compact_evidence_pack_for_dify(pack) if pack else None),
+        "diagnostics": build_run_diagnostics(record, pack, dify_pack),
     }
 
 
@@ -4871,14 +7121,28 @@ def get_analysis_run_report(run_id: str) -> AnalysisRunReportResponse | JSONResp
             return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
         return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
     record = _maybe_finalize_timed_out_analysis_run(record)
-    if not record.get("report_markdown"):
+    report_markdown = str(record.get("report_markdown") or "").strip()
+    report_ir_payload = record.get("report_ir") if isinstance(record.get("report_ir"), dict) else None
+    if not report_markdown and not report_ir_payload:
         return _analysis_error(409, "REPORT_NOT_READY", "报告尚未生成完成")
+    try:
+        if report_markdown:
+            safe_report_markdown = _safe_markdown_formal_body(report_markdown)
+        else:
+            report_ir = _prepare_report_for_export(
+                ExportReportRequest(report_ir=ReportIR.model_validate(report_ir_payload), strict_quality=False)
+            )
+            safe_report_markdown = _report_ir_to_markdown(report_ir)
+    except (ValueError, FormalBodySafetyError) as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/report", str(exc)
+        )
     return AnalysisRunReportResponse(
         success=bool(record.get("success", True)),
         run_id=str(record.get("run_id") or run_id),
         pack_id=str(record.get("pack_id") or ""),
         report_title=str(record.get("report_title") or ""),
-        report_markdown=_clean_model_output(str(record.get("report_markdown") or "")),
+        report_markdown=_clean_model_output(safe_report_markdown),
         quality_check=record.get("quality_check") if isinstance(record.get("quality_check"), dict) else {"passed": None, "issues": []},
         quality_gate=record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {},
         version=int(record.get("version") or 1),
@@ -4940,6 +7204,12 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
     )
     report_title = str(result.get("report_title") or record.get("report_title") or "")
     report_markdown = _clean_model_output(str(result.get("report_markdown") or current_report))
+    try:
+        report_markdown = _safe_markdown_formal_body(report_markdown)
+    except FormalBodySafetyError as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/revise", str(exc)
+        )
     quality_check = result.get("quality_check") if isinstance(result.get("quality_check"), dict) else {"passed": None, "issues": []}
     warnings = [*revision_memory_warnings, *list(result.get("warnings") or result.get("generation_warnings") or [])]
     if revision_memory_hash_changed:
@@ -4978,10 +7248,6 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
             "quality_check": quality_check,
             "warnings": warnings,
             "generation_warnings": warnings,
-            "used_memory_ids": list(revision_memory_metadata.get("used_memory_ids") or []),
-            "memory_item_count": int(revision_memory_metadata.get("memory_item_count") or 0),
-            "memory_item_chars": int(revision_memory_metadata.get("memory_item_chars") or 0),
-            "memory_items_read_failed": bool(revision_memory_metadata.get("memory_items_read_failed")),
             "user_feedback_modified": True,
             "last_revision": revision_record,
             "updated_at": revision_record["created_at"],
@@ -5004,6 +7270,8 @@ def revise_analysis_run(run_id: str, req: AnalysisRunReviseRequest) -> AnalysisR
 
 @app.get("/analysis/runs/{run_id}/download")
 def download_analysis_run_report(run_id: str):
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/analysis/runs/{run_id}/download")
     try:
         record = _read_analysis_run(run_id)
     except HTTPException as exc:
@@ -5012,36 +7280,104 @@ def download_analysis_run_report(run_id: str):
         return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
 
     report_markdown = str(record.get("report_markdown") or "").strip()
-    if not report_markdown:
+    report_ir_payload = record.get("report_ir") if isinstance(record.get("report_ir"), dict) else None
+    if not report_markdown and not report_ir_payload:
         return _analysis_error(409, "REPORT_NOT_READY", "报告尚未生成完成")
-
-    precheck = _analysis_run_export_precheck(record)
-    if not precheck.get("allowed"):
-        logger.warning(
-            "analysis_run_report_download_blocked run_id=%s code=%s blocking_issues=%s",
-            run_id,
-            precheck.get("code"),
-            len(precheck.get("blocking_issues") or []),
+    if not bool(record.get("word_export_available")):
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/download",
+            str(record.get("body_safety_failure_code") or "formal body unavailable"),
         )
-        return _analysis_error(
-            409,
-            str(precheck.get("code") or "QUALITY_GATE_BLOCKED"),
-            str(precheck.get("message") or "报告未通过质量门禁，暂不可下载 Word"),
-            str(precheck.get("detail") or ""),
+
+    report_ir: ReportIR | None = None
+    try:
+        if report_markdown:
+            report_markdown = _safe_markdown_formal_body(report_markdown)
+            report_source = report_markdown
+        else:
+            report_ir = _prepare_report_for_export(
+                ExportReportRequest(report_ir=ReportIR.model_validate(report_ir_payload), strict_quality=False)
+            )
+            report_source = json.dumps(report_ir.model_dump(), ensure_ascii=False, sort_keys=True)
+    except (ValueError, FormalBodySafetyError) as exc:
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/download", str(exc)
         )
 
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
     title = str(record.get("report_title") or "分析报告").strip() or "分析报告"
     version = str(record.get("version") or 1)
-    report_hash = hashlib.sha256(report_markdown.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    report_hash = hashlib.sha256(report_source.encode("utf-8", errors="ignore")).hexdigest()[:12]
     filename = f"{_safe_filename(title)}_{_safe_filename(run_id)}_v{_safe_filename(version)}_{report_hash}.docx"
     path = REPORT_DIR / filename
-    if not path.exists():
-        _markdown_to_docx(report_markdown, path, title)
-        logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
-    else:
-        logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
+    word_timing = PipelineTiming(record.get("timings"))
+
+    def render_word(target: Path) -> None:
+        if report_ir is not None:
+            _publish_report_ir_docx(report_ir, target, title, word_timing)
+        else:
+            _publish_markdown_docx(report_markdown, target, title, word_timing)
+
+    def validate_word(target: Path) -> bool:
+        with word_timing.measure("word_scan_ms"):
+            return not bool(scan_docx(target))
+
+    def publish_without_checkpoint() -> bool:
+        if not path.exists():
+            render_word(path)
+            return False
+        if not validate_word(path):
+            raise FormalBodySafetyError("缓存 DOCX 正文安全扫描未通过")
+        return True
+
+    try:
+        reused = False
+        if _analysis_checkpoints_enabled():
+            try:
+                publish_result = publish_file_once(
+                    _analysis_checkpoint_store(),
+                    run_id,
+                    {
+                        "report_sha256": hashlib.sha256(
+                            report_source.encode("utf-8", errors="ignore")
+                        ).hexdigest(),
+                        "version": version,
+                        "title_sha256": hash_checkpoint_value(title),
+                    },
+                    path,
+                    render_word,
+                    validate=validate_word,
+                )
+                reused = bool(publish_result.get("reused"))
+            except CheckpointCorruptionError as exc:
+                raise FormalBodySafetyError(
+                    "Word checkpoint 或已发布文件校验失败"
+                ) from exc
+            except (OSError, CheckpointError) as exc:
+                logger.warning(
+                    "analysis_word_checkpoint_bypassed run_id=%s error_type=%s",
+                    run_id,
+                    exc.__class__.__name__,
+                )
+                reused = publish_without_checkpoint()
+        else:
+            reused = publish_without_checkpoint()
+        if not reused:
+            logger.info("analysis_run_report_download_created run_id=%s filename=%s", run_id, filename)
+        else:
+            logger.info("analysis_run_report_download_cache_hit run_id=%s filename=%s", run_id, filename)
+    except FormalBodySafetyError as exc:
+        _persist_run_timings_nonblocking(run_id, word_timing.snapshot(finish=True))
+        return _word_body_safety_failed_response(
+            "/analysis/runs/{run_id}/download", str(exc)
+        )
+    _persist_run_timings_nonblocking(run_id, word_timing.snapshot(finish=True))
+    _record_analysis_word_download(
+        record,
+        f"/analysis/runs/{run_id}/download",
+        filename,
+    )
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -5049,24 +7385,11 @@ def download_analysis_run_report(run_id: str):
     )
 
 
-def _analysis_run_export_precheck(record: dict[str, Any]) -> dict[str, Any]:
-    pack_id = str(record.get("pack_id") or "")
-    quality_gate = record.get("quality_gate") if isinstance(record.get("quality_gate"), dict) else {}
-    if pack_id:
-        try:
-            pack = _read_database_evidence_pack(pack_id)
-            diagnostics = build_run_diagnostics(record, pack, _compact_evidence_pack_for_dify(pack))
-            diagnostic_gate = diagnostics.get("quality_gate") if isinstance(diagnostics.get("quality_gate"), dict) else {}
-            if diagnostic_gate:
-                quality_gate = diagnostic_gate
-        except HTTPException as exc:
-            logger.info("analysis_run_export_precheck_pack_unavailable pack_id=%s detail=%s", pack_id, exc.detail)
-    return analysis_run_export_precheck(record, quality_gate)
-
-
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
     original_url = str(req.url)
+    if not _url_analyze_enabled():
+        return _url_analyze_disabled_response("/analyze", original_url)
     url, url_warnings = _normalize_notice_url(original_url)
     _validate_url(url)
     started = time.perf_counter()
@@ -5225,6 +7548,8 @@ async def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
 @app.post("/analyze_v2", response_model=AnalyzeV2Response)
 async def analyze_v2(req: AnalyzeV2Request) -> AnalyzeV2Response:
     original_url = str(req.url)
+    if not _url_analyze_enabled():
+        return _url_analyze_disabled_response("/analyze_v2", original_url)
     url, url_warnings = _normalize_notice_url(original_url)
     _validate_url(url)
 
@@ -5412,22 +7737,34 @@ async def analyze_v2(req: AnalyzeV2Request) -> AnalyzeV2Response:
 
 
 @app.post("/report/export", response_model=ExportReportResponse)
-async def export_report(req: ExportReportRequest) -> ExportReportResponse:
+async def export_report(req: ExportReportRequest) -> ExportReportResponse | JSONResponse:
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/report/export")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
+    word_timing = PipelineTiming()
     try:
         report = _prepare_report_for_export(req)
+        _require_export_evidence(report, req.evidence_text)
         quality_issues = _quality_check_report(report)
         if req.strict_quality and quality_issues:
             raise ValueError("报告质量检查未通过：" + "；".join(quality_issues))
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _report_ir_to_docx(report, path, req.title)
-        logger.info("report_export_completed filename=%s", filename)
-    except ValueError as exc:
-        logger.warning("report_export_failed error=%s", str(exc)[:500])
+        _publish_report_ir_docx(report, path, req.title, word_timing)
+        logger.info("report_export_completed filename=%s timings=%s", filename, word_timing.snapshot(finish=True))
+    except (ValueError, FormalBodySafetyError) as exc:
+        logger.warning(
+            "report_export_failed error_type=%s timings=%s",
+            type(exc).__name__,
+            word_timing.snapshot(finish=True),
+        )
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    return ExportReportResponse(filename=filename, download_url=_download_url(filename))
+    return ExportReportResponse(
+        filename=filename,
+        download_url=_download_url(filename),
+        timings=word_timing.snapshot(finish=True),
+    )
 
 
 @app.post("/report/render", response_model=RenderReportResponse)
@@ -5468,10 +7805,15 @@ def render_report_v2(req: RenderReportRequest) -> RenderReportResponse:
 
 
 @app.post("/report/export_checked", response_model=CheckedExportReportResponse)
-def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportReportResponse:
+def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportReportResponse | JSONResponse:
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/report/export_checked")
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     _cleanup_old_reports(REPORT_DIR)
+    word_timing = PipelineTiming()
     try:
+        if not str(req.evidence_text or "").strip():
+            raise ValueError("Word 发布缺少 evidence context")
         qa = _qa_from_checked_export_request(req)
         report_for_local_qa = _prepare_report_for_export(req)
         local_qa = _quality_check_report_against_evidence(report_for_local_qa, req.evidence_text, req.history_text)
@@ -5500,11 +7842,17 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
                 blocked=True,
                 qa_summary=qa_summary,
                 report_markdown=report_markdown,
+                timings=word_timing.snapshot(finish=True),
             )
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _report_ir_to_docx(report, path, req.title)
-        logger.info("report_export_checked_completed filename=%s qa_status=%s", filename, _workflow_qa_status(qa))
+        _publish_report_ir_docx(report, path, req.title, word_timing)
+        logger.info(
+            "report_export_checked_completed filename=%s qa_status=%s timings=%s",
+            filename,
+            _workflow_qa_status(qa),
+            word_timing.snapshot(finish=True),
+        )
         return CheckedExportReportResponse(
             success=True,
             filename=filename,
@@ -5512,6 +7860,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
             blocked=False,
             qa_summary=qa_summary,
             report_markdown=report_markdown,
+            timings=word_timing.snapshot(finish=True),
         )
         if req.qa_output:
             try:
@@ -5544,9 +7893,13 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         qa_summary = _format_qa_summary(qa)
         filename = _unique_report_filename(_build_report_filename(report), REPORT_DIR)
         path = REPORT_DIR / filename
-        _report_ir_to_docx(report, path, req.title)
-    except ValueError as exc:
-        logger.warning("report_export_checked_failed error=%s", str(exc)[:500])
+        _publish_report_ir_docx(report, path, req.title, word_timing)
+    except (ValueError, FormalBodySafetyError) as exc:
+        logger.warning(
+            "report_export_checked_failed error_type=%s timings=%s",
+            type(exc).__name__,
+            word_timing.snapshot(finish=True),
+        )
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return CheckedExportReportResponse(
         success=True,
@@ -5555,6 +7908,7 @@ def export_report_checked(req: CheckedExportReportRequest) -> CheckedExportRepor
         blocked=False,
         qa_summary=qa_summary,
         report_markdown=report_markdown,
+        timings=word_timing.snapshot(finish=True),
     )
 
 
@@ -5639,10 +7993,18 @@ def _download_url(filename: str) -> str:
 def download_report(filename: str):
     from fastapi.responses import FileResponse
 
+    if not _word_export_enabled():
+        return _word_export_disabled_response("/download/{filename}")
     safe = Path(filename).name
     path = REPORT_DIR / safe
     if not path.exists():
         raise HTTPException(status_code=404, detail="report file not found")
+    try:
+        hits = scan_docx(path)
+        if hits:
+            raise FormalBodySafetyError("DOCX 正文安全扫描未通过")
+    except FormalBodySafetyError as exc:
+        return _word_body_safety_failed_response("/download/{filename}", str(exc))
     return FileResponse(
         path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -6687,7 +9049,73 @@ def _prepare_report_for_export(req: ExportReportRequest) -> ReportIR:
     else:
         report = _parse_model_output_to_report_ir(req.markdown)
     report = _normalize_report_ir(report, fallback_title=req.title)
-    return report
+    safety = sanitize_formal_body(
+        FormalBodyDocument(report_ir=report.model_dump())
+    )
+    if not safety.safe or not isinstance(safety.document.report_ir, dict):
+        if safety.hits:
+            reason = "正式正文仍包含禁用表达"
+        else:
+            reason = "正式正文为空"
+        raise ValueError(reason)
+    return ReportIR.model_validate(safety.document.report_ir)
+
+
+def _require_export_evidence(report: ReportIR, evidence_text: str) -> None:
+    if not str(evidence_text or "").strip():
+        raise ValueError("Word 发布缺少 evidence context")
+    qa = _quality_check_report_against_evidence(report, evidence_text)
+    if qa.unsupported_claims or qa.history_leakage:
+        raise ValueError("Word 发布未通过 evidence constraint")
+
+
+def _safe_markdown_formal_body(markdown: str) -> str:
+    safety = sanitize_formal_body(FormalBodyDocument(markdown=markdown))
+    if not safety.safe:
+        if safety.hits:
+            raise FormalBodySafetyError("Markdown 正文仍包含禁用表达")
+        raise FormalBodySafetyError("Markdown 正文为空")
+    return safety.document.markdown
+
+
+def _publish_report_ir_docx(
+    report: ReportIR,
+    path: Path,
+    fallback_title: str,
+    timing: PipelineTiming | None = None,
+) -> None:
+    def render(staging_path: Path) -> None:
+        if timing is None:
+            _report_ir_to_docx(report, staging_path, fallback_title)
+            return
+        with timing.measure("word_render_ms"):
+            _report_ir_to_docx(report, staging_path, fallback_title)
+
+    publish_docx_atomically(
+        path,
+        render,
+        timing_observer=timing.observe if timing is not None else None,
+    )
+
+
+def _publish_markdown_docx(
+    markdown: str,
+    path: Path,
+    title: str,
+    timing: PipelineTiming | None = None,
+) -> None:
+    def render(staging_path: Path) -> None:
+        if timing is None:
+            _markdown_to_docx(markdown, staging_path, title)
+            return
+        with timing.measure("word_render_ms"):
+            _markdown_to_docx(markdown, staging_path, title)
+
+    publish_docx_atomically(
+        path,
+        render,
+        timing_observer=timing.observe if timing is not None else None,
+    )
 
 
 def _parse_model_output_to_report_ir(raw_text: str) -> ReportIR:
@@ -6750,7 +9178,7 @@ def _report_ir_from_json(text: str) -> ReportIR:
         raise ValueError("ReportIR JSON 顶层必须是对象")
     blocked_keys = {"reasoning", "analysis", "scratchpad", "thought", "debug", "raw_response", "chain_of_thought"}
     data = {key: value for key, value in data.items() if key not in blocked_keys}
-    data = _coerce_report_ir_payload(data)
+    data = upgrade_report_ir_schema(_coerce_report_ir_payload(data))
     try:
         return ReportIR.model_validate(data)
     except Exception as exc:  # noqa: BLE001
