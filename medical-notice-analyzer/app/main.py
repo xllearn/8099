@@ -51,6 +51,7 @@ from app.attachment_task_process import (
 from app.pdf_table_parser import rule_version as pdf_table_rule_version
 from app.compact_pack import (
     CompactPolicyError,
+    DEFAULT_HARD_LIMIT as VBP_COMPACT_HARD_LIMIT,
     annotate_secondary_compression,
     mandatory_evidence_retention,
     protected_evidence_items,
@@ -136,6 +137,34 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 )
+
+
+class DifyEvidencePackLimitError(ValueError):
+    def __init__(self, chars: int, bytes_size: int, char_limit: int, byte_limit: int) -> None:
+        self.chars = int(chars)
+        self.bytes_size = int(bytes_size)
+        self.char_limit = int(char_limit)
+        self.byte_limit = int(byte_limit)
+        super().__init__(
+            "dify evidence pack limit exceeded "
+            f"chars={self.chars} bytes={self.bytes_size} "
+            f"char_limit={self.char_limit} byte_limit={self.byte_limit}"
+        )
+
+
+def _dify_limit_http_exception(exc: DifyEvidencePackLimitError) -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail={
+            "code": "dify_evidence_pack_limit_exceeded",
+            "chars": exc.chars,
+            "bytes": exc.bytes_size,
+            "char_limit": exc.char_limit,
+            "byte_limit": exc.byte_limit,
+        },
+    )
+
+
 ATTACHMENT_EXTENSIONS = {
     ".pdf",
     ".doc",
@@ -616,7 +645,7 @@ logger = logging.getLogger("medical_notice_analyzer")
 app = FastAPI(title="Medical Notice Analyzer", version="0.1.0")
 REPORT_DIR = Path(os.getenv("REPORT_DIR", "/tmp/medical-notice-reports"))
 SITE_CACHE_DIR = Path(os.getenv("SITE_CACHE_DIR", "/app/site-cache"))
-DEFAULT_PUBLIC_BASE_URL = "http://192.168.34.88:8099"
+DEFAULT_PUBLIC_BASE_URL = "http://192.168.34.87:8099"
 URL_ANALYZE_DISABLED_CODE = "URL_ANALYZE_DISABLED"
 URL_ANALYZE_DISABLED_MESSAGE = "URL 输入分析已下线，请从数据库选材页面选择材料生成 pack_id。"
 _ANALYSIS_RECOVERY_LOCK = threading.RLock()
@@ -1118,14 +1147,79 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _dify_input_thresholds() -> dict[str, int]:
-    hard_limit = max(10_000, _env_int("DIFY_VARIABLE_HARD_MAX_CHARS", 80_000))
-    full_input = min(hard_limit, max(1000, _env_int("DIFY_FULL_INPUT_MAX_CHARS", 65_000)))
-    safe_compact = min(hard_limit, max(full_input, _env_int("DIFY_SAFE_COMPACT_MAX_CHARS", 75_000)))
+    platform_limit = max(10_000, _env_int("DIFY_PLATFORM_STRING_MAX_CHARS", 400_000))
+    legacy_hard = _env_int("DIFY_VARIABLE_HARD_MAX_CHARS", 240_000)
+    hard_limit = min(
+        platform_limit,
+        max(10_000, _env_int("DIFY_EVIDENCE_PACK_HARD_MAX_CHARS", legacy_hard)),
+    )
+    full_input = min(hard_limit, max(1000, _env_int("DIFY_FULL_INPUT_MAX_CHARS", 160_000)))
+    safe_compact = min(hard_limit, max(full_input, _env_int("DIFY_SAFE_COMPACT_MAX_CHARS", 220_000)))
+    hard_limit_bytes = max(16_384, _env_int("DIFY_EVIDENCE_PACK_HARD_MAX_BYTES", 870_400))
     return {
+        "platform_limit": platform_limit,
         "hard_limit": hard_limit,
+        "hard_limit_bytes": hard_limit_bytes,
         "full_input": full_input,
         "safe_compact": safe_compact,
         "light_compact": safe_compact,
+    }
+
+
+def _dify_quality_target_chars(
+    *,
+    dify_relevant_input_chars: int,
+    target_max_chars: int,
+    thresholds: dict[str, int],
+) -> int:
+    hard_limit = int(thresholds["hard_limit"])
+    requested_limit = min(hard_limit, max(1, int(target_max_chars)))
+    tier_limit = (
+        int(thresholds["full_input"])
+        if int(dify_relevant_input_chars) <= int(thresholds["full_input"])
+        else int(thresholds["safe_compact"])
+    )
+    return min(requested_limit, tier_limit)
+
+
+def _dify_quality_budget(*, target_chars: int, primary_count: int, auxiliary_count: int) -> dict[str, Any]:
+    target = max(0, int(target_chars))
+    primary_body_chars = target * 35 // 100
+    primary_attachment_base_chars = target * 45 // 100
+    primary_core_attachment_chars = primary_attachment_base_chars
+    auxiliary_share = target * 8 // 100
+    metadata_reserve_chars = target - primary_body_chars - primary_core_attachment_chars - auxiliary_share
+    auxiliary_chars = auxiliary_share if auxiliary_count > 0 else 0
+    if auxiliary_count <= 0 and auxiliary_share:
+        primary_core_attachment_chars += auxiliary_share
+    allocated_keys = [
+        "primary_body_chars",
+        "primary_core_attachment_chars",
+        "auxiliary_chars",
+        "metadata_reserve_chars",
+    ]
+    return {
+        "target_chars": target,
+        "primary_count": max(0, int(primary_count)),
+        "auxiliary_count": max(0, int(auxiliary_count)),
+        "primary_body_chars": primary_body_chars,
+        "primary_core_attachment_chars": primary_core_attachment_chars,
+        "primary_attachment_base_chars": primary_attachment_base_chars,
+        "no_auxiliary_reflow_chars": auxiliary_share if auxiliary_count <= 0 else 0,
+        "auxiliary_chars": auxiliary_chars,
+        "metadata_reserve_chars": metadata_reserve_chars,
+        "metadata_reserve_policy": "reserved_not_reflowed",
+        "core_attachment_regular_chars": 24_000,
+        "core_attachment_max_chars": 36_000,
+        "ordinary_attachment_regular_chars": 12_000,
+        "ordinary_attachment_max_chars": 18_000,
+        "allocated_keys": allocated_keys,
+        "initial_allocation_pct": {
+            "primary_body": 35,
+            "primary_core_attachment": 45,
+            "auxiliary": 8,
+            "metadata_reserve": 12,
+        },
     }
 
 
@@ -1243,7 +1337,11 @@ def _evidence_value_score_material(material: dict[str, Any], *, role: str) -> in
     return max(0, score)
 
 
-def _dify_relevant_input_chars(pack: dict[str, Any], primary_source: list[dict[str, Any]], auxiliary_source: list[dict[str, Any]]) -> int:
+def _dify_relevant_input_sizes(
+    pack: dict[str, Any],
+    primary_source: list[dict[str, Any]],
+    auxiliary_source: list[dict[str, Any]],
+) -> tuple[int, int]:
     primary_payload = []
     for material in primary_source:
         primary_payload.append(
@@ -1298,7 +1396,16 @@ def _dify_relevant_input_chars(pack: dict[str, Any], primary_source: list[dict[s
         "warnings": pack.get("warnings"),
         "generation_guidance": pack.get("generation_guidance"),
     }
-    return len(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return len(serialized), len(serialized.encode("utf-8"))
+
+
+def _dify_relevant_input_chars(
+    pack: dict[str, Any],
+    primary_source: list[dict[str, Any]],
+    auxiliary_source: list[dict[str, Any]],
+) -> int:
+    return _dify_relevant_input_sizes(pack, primary_source, auxiliary_source)[0]
 
 
 def _attachment_count(materials: list[dict[str, Any]]) -> int:
@@ -1309,12 +1416,16 @@ def _dify_input_strategy(
     *,
     original_pack_chars: int,
     dify_relevant_input_chars: int | None = None,
+    dify_relevant_input_bytes: int | None = None,
     primary_source: list[dict[str, Any]],
     auxiliary_source: list[dict[str, Any]],
 ) -> str:
     thresholds = _dify_input_thresholds()
     relevant_chars = dify_relevant_input_chars if dify_relevant_input_chars is not None else original_pack_chars
-    if len(primary_source) >= 2:
+    if relevant_chars > thresholds["hard_limit"] or (
+        dify_relevant_input_bytes is not None
+        and int(dify_relevant_input_bytes) > thresholds["hard_limit_bytes"]
+    ):
         return "staged_generation"
     if any(_is_attachment_led_primary_material(material) for material in primary_source):
         return "attachment_led"
@@ -1368,9 +1479,14 @@ def _dify_input_strategy_description(input_strategy: str) -> str:
     }.get(input_strategy, "Dify 自适应输入策略。")
 
 
-def _dify_input_strategy_basis(input_strategy: str, *, relevant_chars: int, thresholds: dict[str, int], primary_source: list[dict[str, Any]]) -> str:
-    if input_strategy == "staged_generation" and len(primary_source) >= 2:
-        return "multi_primary_materials"
+def _dify_input_strategy_basis(
+    input_strategy: str,
+    *,
+    relevant_chars: int,
+    relevant_bytes: int | None = None,
+    thresholds: dict[str, int],
+    primary_source: list[dict[str, Any]],
+) -> str:
     if input_strategy == "attachment_led":
         return "short_primary_body_with_usable_core_attachment"
     if input_strategy == "table_heavy":
@@ -1382,6 +1498,8 @@ def _dify_input_strategy_basis(input_strategy: str, *, relevant_chars: int, thre
     if input_strategy == "safe_compact":
         return "near_hard_limit"
     if input_strategy == "staged_generation":
+        if relevant_bytes is not None and relevant_bytes > thresholds["hard_limit_bytes"]:
+            return "dify_relevant_input_bytes_exceeds_hard_limit"
         return "dify_relevant_input_chars_exceeds_hard_limit"
     return "adaptive_input_strategy_default"
 
@@ -1410,23 +1528,23 @@ def _omitted_content_entry(
     return entry
 
 
-def _refresh_dify_char_fields(compact: dict[str, Any]) -> int:
-    previous = -1
-    current = len(json.dumps(compact, ensure_ascii=False, sort_keys=True))
-    for _ in range(6):
-        compact["compact_pack_chars"] = current
-        compact["final_dify_input_chars"] = current
-        next_size = len(json.dumps(compact, ensure_ascii=False, sort_keys=True))
-        if next_size == current or next_size == previous:
-            current = next_size
-            compact["compact_pack_chars"] = current
-            compact["final_dify_input_chars"] = current
-            return current
+def _refresh_dify_size_fields(compact: dict[str, Any]) -> int:
+    previous: tuple[int, int] | None = None
+    for _ in range(8):
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        current = (len(serialized), len(serialized.encode("utf-8")))
+        compact["compact_pack_chars"] = current[0]
+        compact["final_dify_input_chars"] = current[0]
+        compact["compact_pack_bytes"] = current[1]
+        compact["final_dify_input_bytes"] = current[1]
+        if current == previous:
+            return current[0]
         previous = current
-        current = next_size
-    compact["compact_pack_chars"] = current
-    compact["final_dify_input_chars"] = current
-    return current
+    return int(compact["final_dify_input_chars"])
+
+
+def _refresh_dify_char_fields(compact: dict[str, Any]) -> int:
+    return _refresh_dify_size_fields(compact)
 
 
 def _target_report_length_guidance(primary_source: list[dict[str, Any]], auxiliary_source: list[dict[str, Any]]) -> str:
@@ -1441,6 +1559,31 @@ def _target_report_length_guidance(primary_source: list[dict[str, Any]], auxilia
     if primary_count >= 2 or auxiliary_count >= 2:
         return "3000-5000字；多主材料或2+n场景按主材料分段、辅助材料作背景，并允许更多表格。"
     return "1800-3000字；按公告要点、规则、附件细节、企业影响和建议补齐。"
+
+
+def _set_full_input_detail_guidance(
+    generation_guidance: dict[str, Any],
+    *,
+    auxiliary_compacted: bool,
+) -> None:
+    generation_guidance["detail_policy"] = (
+        "full_input_primary_preserved_auxiliary_compact"
+        if auxiliary_compacted
+        else "small_input_no_compression"
+    )
+    generation_guidance["generation_mode"] = "single_pass_full_evidence"
+    if auxiliary_compacted:
+        generation_guidance["detail_instruction"] = (
+            "输入证据量未超过完整输入阈值，主材料正文和主附件解析结果已优先完整保留；"
+            "辅助材料已按背景证据预算压缩，仅用于补充上下文，不能覆盖主材料结论；"
+            "报告篇幅应来自事实覆盖和证据支撑型分析，不得无依据扩写。"
+        )
+    else:
+        generation_guidance["detail_instruction"] = (
+            "输入证据量未超过安全阈值，主材料正文和主附件解析结果已尽量完整保留；"
+            "不要因为 evidence_pack 有 compact 标记就写得过短；"
+            "报告篇幅应来自事实覆盖和证据支撑型分析，不得无依据扩写。"
+        )
 
 
 def _evidence_budget_for_strategy(input_strategy: str, *, primary_count: int, auxiliary_count: int) -> dict[str, Any]:
@@ -1643,6 +1786,534 @@ def _compact_material_for_dify(
             }
         )
     return compact
+
+
+def _balanced_text_limits(lengths: list[int], pool_chars: int) -> list[int]:
+    limits = [0 for _ in lengths]
+    remaining = max(0, int(pool_chars))
+    active = {index for index, length in enumerate(lengths) if length > 0}
+    while active and remaining > 0:
+        share = remaining // len(active)
+        if share <= 0:
+            for index in sorted(active)[:remaining]:
+                limits[index] += 1
+            break
+        satisfied = [
+            index
+            for index in sorted(active)
+            if lengths[index] - limits[index] <= share
+        ]
+        if satisfied:
+            for index in satisfied:
+                granted = lengths[index] - limits[index]
+                limits[index] += granted
+                remaining -= granted
+                active.remove(index)
+            continue
+        for index in sorted(active):
+            limits[index] += share
+            remaining -= share
+        for index in sorted(active)[:remaining]:
+            limits[index] += 1
+        break
+    return limits
+
+
+def _append_dify_text_refs(
+    refs: list[tuple[Any, Any, int]],
+    container: Any,
+    key: Any,
+    *,
+    floor_chars: int = 0,
+) -> None:
+    value = container[key]
+    if isinstance(value, str):
+        refs.append((container, key, max(0, int(floor_chars))))
+        return
+    if isinstance(value, dict):
+        for child_key in list(value):
+            _append_dify_text_refs(refs, value, child_key, floor_chars=floor_chars)
+        return
+    if isinstance(value, list):
+        for index in range(len(value)):
+            _append_dify_text_refs(refs, value, index, floor_chars=floor_chars)
+
+
+def _dify_text_refs_for_keys(
+    payload: dict[str, Any],
+    keys: list[str],
+    *,
+    floor_chars: int = 0,
+) -> list[tuple[Any, Any, int]]:
+    refs: list[tuple[Any, Any, int]] = []
+    for key in keys:
+        if key in payload:
+            _append_dify_text_refs(refs, payload, key, floor_chars=floor_chars)
+    return refs
+
+
+def _dify_attachment_text_refs(
+    attachment: dict[str, Any],
+    *,
+    include_table_descriptions: bool = True,
+    floor_chars: int = 0,
+) -> list[tuple[Any, Any, int]]:
+    refs = _dify_text_refs_for_keys(
+        attachment,
+        ["summary", "key_facts", "important_sections"],
+        floor_chars=floor_chars,
+    )
+    if include_table_descriptions:
+        for table in attachment.get("table_summaries") or []:
+            if isinstance(table, dict):
+                refs.extend(
+                    _dify_text_refs_for_keys(
+                        table,
+                        ["summary", "business_value", "recommended_report_usage", "data_completeness_hint"],
+                        floor_chars=floor_chars,
+                    )
+                )
+    return refs
+
+
+def _dify_primary_body_text_refs(
+    material: dict[str, Any],
+    *,
+    floor_chars: int = 0,
+) -> list[tuple[Any, Any, int]]:
+    return _dify_text_refs_for_keys(
+        material,
+        [
+            "content_text",
+            "summary",
+            "content_summary",
+            "key_facts",
+            "important_passages",
+            "policy_rules",
+            "price_rules",
+            "time_requirements",
+            "product_scope",
+            "enterprise_requirements",
+            "execution_requirements",
+        ],
+        floor_chars=floor_chars,
+    )
+
+
+def _dify_auxiliary_text_refs(
+    material: dict[str, Any],
+    *,
+    floor_chars: int = 0,
+) -> list[tuple[Any, Any, int]]:
+    refs = _dify_text_refs_for_keys(
+        material,
+        [
+            "content_text",
+            "summary",
+            "content_summary",
+            "key_facts",
+            "usable_points",
+            "relevant_snippets",
+            "attachment_summaries",
+        ],
+        floor_chars=floor_chars,
+    )
+    for attachment in material.get("attachments") or []:
+        if isinstance(attachment, dict):
+            refs.extend(
+                _dify_attachment_text_refs(
+                    attachment,
+                    include_table_descriptions=True,
+                    floor_chars=floor_chars,
+                )
+            )
+    return refs
+
+
+def _dify_text_ref_chars(refs: list[tuple[Any, Any, int]]) -> int:
+    return sum(len(str(container[key] or "")) for container, key, _floor in refs)
+
+
+def _truncate_dify_text(text: str, limit: int) -> str:
+    limit = max(0, int(limit))
+    if len(text) <= limit:
+        return text
+    if limit == 0:
+        return ""
+    if limit == 1:
+        return "…"
+    return f"{text[: limit - 1]}…"
+
+
+def _fit_dify_text_refs_to_budget(refs: list[tuple[Any, Any, int]], budget_chars: int) -> bool:
+    if not refs:
+        return False
+    texts = [str(container[key] or "") for container, key, _floor in refs]
+    lengths = [len(text) for text in texts]
+    budget = max(0, int(budget_chars))
+    if sum(lengths) <= budget:
+        return False
+    floors = [min(length, floor) for length, (_container, _key, floor) in zip(lengths, refs)]
+    if sum(floors) > budget:
+        limits = _balanced_text_limits(lengths, budget)
+    else:
+        extras = [length - floor for length, floor in zip(lengths, floors)]
+        extra_limits = _balanced_text_limits(extras, budget - sum(floors))
+        limits = [floor + extra for floor, extra in zip(floors, extra_limits)]
+    changed = False
+    for (container, key, _floor), text, limit in zip(refs, texts, limits):
+        if len(text) > limit:
+            container[key] = _truncate_dify_text(text, limit)
+            changed = True
+    return changed
+
+
+def _allocate_dify_attachment_limits(
+    attachment_entries: list[tuple[dict[str, Any], list[tuple[Any, Any, int]]]],
+    attachment_demands: list[int],
+    *,
+    pool_chars: int,
+    budget: dict[str, Any],
+    initial_limits: list[int] | None = None,
+    core_only: bool = False,
+) -> tuple[list[int], int]:
+    limits = list(initial_limits or [0 for _ in attachment_entries])
+    remaining = max(0, int(pool_chars))
+    core_indices = [
+        index
+        for index, (attachment, _refs) in enumerate(attachment_entries)
+        if bool(attachment.get("core_attachment"))
+    ]
+    ordinary_indices = [
+        index
+        for index, (attachment, _refs) in enumerate(attachment_entries)
+        if not bool(attachment.get("core_attachment"))
+    ]
+
+    def grant(indices: list[int], per_attachment_cap: int) -> None:
+        nonlocal remaining
+        ordered = sorted(
+            indices,
+            key=lambda index: (
+                -int(attachment_entries[index][0].get("evidence_value_score") or 0),
+                str(attachment_entries[index][0].get("articleattid") or ""),
+                str(attachment_entries[index][0].get("filename") or ""),
+            ),
+        )
+        for index in ordered:
+            if remaining <= 0:
+                return
+            desired = min(attachment_demands[index], max(0, int(per_attachment_cap)))
+            granted = min(remaining, max(0, desired - limits[index]))
+            limits[index] += granted
+            remaining -= granted
+
+    grant(core_indices, int(budget["core_attachment_regular_chars"]))
+    grant(core_indices, int(budget["core_attachment_max_chars"]))
+    if not core_only:
+        grant(ordinary_indices, int(budget["ordinary_attachment_regular_chars"]))
+        grant(ordinary_indices, int(budget["ordinary_attachment_max_chars"]))
+    return limits, remaining
+
+
+def _apply_dify_quality_budget(
+    primary: list[dict[str, Any]],
+    auxiliary: list[dict[str, Any]],
+    budget: dict[str, Any],
+) -> dict[str, Any]:
+    primary_body_refs = [_dify_primary_body_text_refs(material) for material in primary]
+    primary_body_demands = [_dify_text_ref_chars(refs) for refs in primary_body_refs]
+    attachment_entries = [
+        (attachment, _dify_attachment_text_refs(attachment))
+        for material in primary
+        for attachment in material.get("attachments") or []
+        if isinstance(attachment, dict)
+    ]
+    attachment_demands = [_dify_text_ref_chars(refs) for _attachment, refs in attachment_entries]
+    auxiliary_refs = [_dify_auxiliary_text_refs(material) for material in auxiliary]
+    auxiliary_demands = [_dify_text_ref_chars(refs) for refs in auxiliary_refs]
+
+    auxiliary_budget = int(budget["auxiliary_chars"])
+    auxiliary_allocation = min(sum(auxiliary_demands), auxiliary_budget)
+    auxiliary_unused = auxiliary_budget - auxiliary_allocation
+    auxiliary_limits = _balanced_text_limits(auxiliary_demands, auxiliary_allocation)
+
+    body_demand = sum(primary_body_demands)
+    body_base = int(budget["primary_body_chars"])
+    body_allocation = min(body_demand, body_base)
+    body_base_unused = body_base - body_allocation
+
+    attachment_base = int(
+        budget.get("primary_attachment_base_chars", budget["primary_core_attachment_chars"])
+    )
+    attachment_limits, attachment_base_unused = _allocate_dify_attachment_limits(
+        attachment_entries,
+        attachment_demands,
+        pool_chars=attachment_base,
+        budget=budget,
+    )
+
+    auxiliary_reflow = auxiliary_unused + int(budget.get("no_auxiliary_reflow_chars") or 0)
+    attachment_limits, auxiliary_reflow_unused = _allocate_dify_attachment_limits(
+        attachment_entries,
+        attachment_demands,
+        pool_chars=auxiliary_reflow,
+        budget=budget,
+        initial_limits=attachment_limits,
+        core_only=True,
+    )
+    body_from_auxiliary = min(
+        auxiliary_reflow_unused,
+        max(0, body_demand - body_allocation),
+    )
+    body_allocation += body_from_auxiliary
+    auxiliary_reflow_unused -= body_from_auxiliary
+
+    attachment_limits, body_reflow_unused = _allocate_dify_attachment_limits(
+        attachment_entries,
+        attachment_demands,
+        pool_chars=body_base_unused,
+        budget=budget,
+        initial_limits=attachment_limits,
+    )
+    body_spare = attachment_base_unused + body_reflow_unused + auxiliary_reflow_unused
+    body_allocation += min(body_spare, max(0, body_demand - body_allocation))
+
+    body_limits = _balanced_text_limits(primary_body_demands, body_allocation)
+    primary_body_trimmed = False
+    for refs, limit in zip(primary_body_refs, body_limits):
+        primary_body_trimmed = _fit_dify_text_refs_to_budget(refs, limit) or primary_body_trimmed
+
+    primary_attachment_trimmed = False
+    for (_attachment, refs), limit in zip(attachment_entries, attachment_limits):
+        primary_attachment_trimmed = _fit_dify_text_refs_to_budget(refs, limit) or primary_attachment_trimmed
+    core_attachment_trimmed = any(
+        bool(attachment.get("core_attachment")) and limit < demand
+        for ((attachment, _refs), demand, limit) in zip(
+            attachment_entries,
+            attachment_demands,
+            attachment_limits,
+        )
+    )
+
+    auxiliary_trimmed = False
+    for refs, limit in zip(auxiliary_refs, auxiliary_limits):
+        auxiliary_trimmed = _fit_dify_text_refs_to_budget(refs, limit) or auxiliary_trimmed
+
+    effective_core_attachment_chars = sum(
+        limit
+        for (attachment, _refs), limit in zip(attachment_entries, attachment_limits)
+        if bool(attachment.get("core_attachment"))
+    )
+    effective_ordinary_attachment_chars = sum(
+        limit
+        for (attachment, _refs), limit in zip(attachment_entries, attachment_limits)
+        if not bool(attachment.get("core_attachment"))
+    )
+    return {
+        "effective_primary_body_chars": body_allocation,
+        "effective_primary_core_attachment_chars": effective_core_attachment_chars,
+        "effective_primary_ordinary_attachment_chars": effective_ordinary_attachment_chars,
+        "effective_primary_attachment_chars": (
+            effective_core_attachment_chars + effective_ordinary_attachment_chars
+        ),
+        "effective_auxiliary_chars": auxiliary_allocation,
+        "auxiliary_unused_chars": auxiliary_unused,
+        "primary_body_trimmed": primary_body_trimmed,
+        "primary_attachment_trimmed": primary_attachment_trimmed,
+        "core_attachment_trimmed": core_attachment_trimmed,
+        "auxiliary_trimmed": auxiliary_trimmed,
+    }
+
+
+def _dify_serialized_sizes(compact: dict[str, Any]) -> tuple[int, int]:
+    serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+    return len(serialized), len(serialized.encode("utf-8"))
+
+
+def _dify_fixed_ratio(numerator: int, denominator: int) -> str | None:
+    if not denominator:
+        return None
+    return f"{int(numerator) / int(denominator):.6e}"
+
+
+def _refresh_dify_quality_size_fields(
+    compact: dict[str, Any],
+    *,
+    char_limit: int,
+    byte_limit: int,
+) -> tuple[int, int]:
+    for _ in range(128):
+        chars, bytes_size = _dify_serialized_sizes(compact)
+        values = {
+            "compact_pack_chars": chars,
+            "final_dify_input_chars": chars,
+            "compact_pack_bytes": bytes_size,
+            "final_dify_input_bytes": bytes_size,
+            "char_usage_ratio": _dify_fixed_ratio(chars, char_limit),
+            "byte_usage_ratio": _dify_fixed_ratio(bytes_size, byte_limit),
+        }
+        if "original_pack_chars" in compact:
+            values["compression_ratio"] = _dify_fixed_ratio(
+                int(compact.get("original_pack_chars") or 0),
+                chars,
+            )
+        if all(compact.get(key) == value for key, value in values.items()):
+            return chars, bytes_size
+        compact.update(values)
+    raise RuntimeError("Dify quality size fields did not converge")
+
+
+def _dify_limits_exceeded(chars: int, bytes_size: int, *, char_limit: int, byte_limit: int) -> bool:
+    return chars > char_limit or bytes_size > byte_limit
+
+
+def _shrink_dify_text_refs_for_overflow(
+    refs: list[tuple[Any, Any, int]],
+    *,
+    chars: int,
+    bytes_size: int,
+    char_limit: int,
+    byte_limit: int,
+) -> bool:
+    removable_chars = 0
+    removable_bytes = 0
+    for container, key, floor in refs:
+        text = str(container[key] or "")
+        effective_floor = min(len(text), max(0, floor))
+        removable_chars += len(text) - effective_floor
+        removable_bytes += len(text[effective_floor:].encode("utf-8"))
+    if removable_chars <= 0:
+        return False
+    char_excess = max(0, chars - char_limit)
+    byte_excess = max(0, bytes_size - byte_limit)
+    char_fraction = char_excess / removable_chars if char_excess else 0.0
+    byte_fraction = byte_excess / removable_bytes if byte_excess and removable_bytes else 0.0
+    removal_fraction = min(1.0, max(char_fraction, byte_fraction) * 1.15 + 0.01)
+    remaining_to_remove = max(1, int(removable_chars * removal_fraction))
+    changed = False
+    for container, key, floor in refs:
+        if remaining_to_remove <= 0:
+            break
+        text = str(container[key] or "")
+        effective_floor = min(len(text), max(0, floor))
+        removable = len(text) - effective_floor
+        if removable <= 0:
+            continue
+        removed = min(removable, remaining_to_remove)
+        container[key] = _truncate_dify_text(text, len(text) - removed)
+        remaining_to_remove -= removed
+        changed = True
+    return changed
+
+
+def _dify_auxiliary_overflow_refs(compact: dict[str, Any]) -> list[tuple[Any, Any, int]]:
+    refs: list[tuple[Any, Any, int]] = []
+    for material in compact.get("auxiliary_materials") or []:
+        if not isinstance(material, dict):
+            continue
+        refs.extend(_dify_text_refs_for_keys(material, ["content_text"], floor_chars=0))
+        refs.extend(
+            _dify_text_refs_for_keys(
+                material,
+                ["summary", "content_summary", "key_facts", "usable_points", "relevant_snippets", "attachment_summaries"],
+                floor_chars=40,
+            )
+        )
+        for attachment in material.get("attachments") or []:
+            if isinstance(attachment, dict):
+                refs.extend(
+                    _dify_attachment_text_refs(
+                        attachment,
+                        include_table_descriptions=True,
+                        floor_chars=40,
+                    )
+                )
+    return refs
+
+
+def _dify_ordinary_attachment_overflow_refs(compact: dict[str, Any]) -> list[tuple[Any, Any, int]]:
+    refs: list[tuple[Any, Any, int]] = []
+    for material in compact.get("primary_materials") or []:
+        if not isinstance(material, dict):
+            continue
+        for attachment in material.get("attachments") or []:
+            if isinstance(attachment, dict) and not attachment.get("core_attachment"):
+                refs.extend(
+                    _dify_attachment_text_refs(
+                        attachment,
+                        include_table_descriptions=False,
+                        floor_chars=60,
+                    )
+                )
+    return refs
+
+
+def _dify_table_description_overflow_refs(compact: dict[str, Any]) -> list[tuple[Any, Any, int]]:
+    tables: list[tuple[int, str, int, dict[str, Any]]] = []
+    for material in [*(compact.get("primary_materials") or []), *(compact.get("auxiliary_materials") or [])]:
+        if not isinstance(material, dict):
+            continue
+        for attachment in material.get("attachments") or []:
+            if not isinstance(attachment, dict):
+                continue
+            for table_index, table in enumerate(attachment.get("table_summaries") or []):
+                if isinstance(table, dict):
+                    tables.append(
+                        (
+                            int(table.get("evidence_value_score") or 0),
+                            str(attachment.get("articleattid") or ""),
+                            table_index,
+                            table,
+                        )
+                    )
+    refs: list[tuple[Any, Any, int]] = []
+    for _score, _attachment_id, _table_index, table in sorted(
+        tables,
+        key=lambda entry: (entry[0], entry[1], entry[2]),
+    ):
+        refs.extend(
+            _dify_text_refs_for_keys(
+                table,
+                ["summary", "business_value", "recommended_report_usage", "data_completeness_hint"],
+                floor_chars=60,
+            )
+        )
+    return refs
+
+
+def _dify_core_attachment_overflow_refs(compact: dict[str, Any]) -> list[tuple[Any, Any, int]]:
+    attachments = [
+        attachment
+        for material in compact.get("primary_materials") or []
+        if isinstance(material, dict)
+        for attachment in material.get("attachments") or []
+        if isinstance(attachment, dict) and attachment.get("core_attachment")
+    ]
+    attachments.sort(
+        key=lambda attachment: (
+            int(attachment.get("evidence_value_score") or 0),
+            str(attachment.get("articleattid") or ""),
+        )
+    )
+    refs: list[tuple[Any, Any, int]] = []
+    for attachment in attachments:
+        refs.extend(
+            _dify_attachment_text_refs(
+                attachment,
+                include_table_descriptions=False,
+                floor_chars=80,
+            )
+        )
+    return refs
+
+
+def _dify_primary_body_overflow_refs(compact: dict[str, Any]) -> list[tuple[Any, Any, int]]:
+    refs: list[tuple[Any, Any, int]] = []
+    for material in compact.get("primary_materials") or []:
+        if isinstance(material, dict):
+            refs.extend(_dify_primary_body_text_refs(material, floor_chars=0))
+    return refs
 
 
 def _second_pass_window(first_pass_chars: int, target_max_chars: int) -> dict[str, Any]:
@@ -2144,7 +2815,8 @@ def _compact_for_dify_hard_limit_second_pass(
     compact["second_pass_target_floor_chars"] = window["floor"]
     compact["second_pass_target_ceiling_chars"] = window["ceiling"]
     compression_reason.append("hard_limit_second_pass")
-    effective_target_ceiling = int(max(window["floor"], window["ceiling"] - 700))
+    serialization_headroom = 500 if target_max_chars < _dify_input_thresholds()["full_input"] else 700
+    effective_target_ceiling = int(max(window["floor"], window["ceiling"] - serialization_headroom))
 
     min_summary_chars = {"light": 1_000, "medium": 900, "strong": 700}.get(str(window["tier"]), 700)
     if _trim_evidence_strings_to_target(compact, target_ceiling=effective_target_ceiling, min_chars=min_summary_chars):
@@ -2369,53 +3041,158 @@ def _compact_primary_content_limit(primary_source: list[dict[str, Any]], auxilia
 
 
 def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
-    original_pack_chars = len(json.dumps(compact_content_view(pack), ensure_ascii=False, sort_keys=True))
+    original_serialized = json.dumps(compact_content_view(pack), ensure_ascii=False, sort_keys=True)
+    original_pack_chars = len(original_serialized)
+    original_pack_bytes = len(original_serialized.encode("utf-8"))
     primary_source = [item for item in list(pack.get("primary_materials") or [])[:3] if isinstance(item, dict)]
     auxiliary_source = [item for item in list(pack.get("auxiliary_materials") or [])[:10] if isinstance(item, dict)]
     thresholds = _dify_input_thresholds()
     hard_limit = thresholds["hard_limit"]
-    target_max_chars = max_chars or hard_limit
-    dify_relevant_input_chars = _dify_relevant_input_chars(pack, primary_source, auxiliary_source)
+    hard_limit_bytes = thresholds["hard_limit_bytes"]
+    compact_preservation_enabled = _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False)
+    target_max_chars = hard_limit if max_chars is None else min(hard_limit, max(1, int(max_chars)))
+    vbp_enforcement_limit = (
+        min(target_max_chars, VBP_COMPACT_HARD_LIMIT)
+        if max_chars is None and compact_preservation_enabled
+        else target_max_chars
+    )
+    dify_relevant_input_chars, dify_relevant_input_bytes = _dify_relevant_input_sizes(
+        pack,
+        primary_source,
+        auxiliary_source,
+    )
     input_strategy = _dify_input_strategy(
         original_pack_chars=original_pack_chars,
         dify_relevant_input_chars=dify_relevant_input_chars,
+        dify_relevant_input_bytes=dify_relevant_input_bytes,
         primary_source=primary_source,
         auxiliary_source=auxiliary_source,
     )
-    preserve_detail = input_strategy in {"full_input", "attachment_led"}
-    primary_content_limit = _compact_primary_content_limit(primary_source, auxiliary_source, dify_relevant_input_chars, target_max_chars)
-    if input_strategy == "safe_compact":
-        primary_content_limit = min(primary_content_limit, 12000)
-    elif input_strategy == "table_heavy":
-        primary_content_limit = min(primary_content_limit, 9000)
-    primary = [
-        _compact_material_for_dify(
-            item,
-            "primary",
-            content_limit=primary_content_limit,
-            attachment_limit=10 if len(primary_source) == 1 else 8,
-            preserve_detail=preserve_detail,
+    quality_budget = _dify_quality_budget(
+        target_chars=_dify_quality_target_chars(
+            dify_relevant_input_chars=dify_relevant_input_chars,
+            target_max_chars=target_max_chars,
+            thresholds=thresholds,
+        ),
+        primary_count=len(primary_source),
+        auxiliary_count=len(auxiliary_source),
+    )
+    legacy_explicit_limit = max_chars is not None and target_max_chars < thresholds["full_input"]
+    if legacy_explicit_limit:
+        preserve_detail = input_strategy in {"full_input", "attachment_led"}
+        primary_content_limit = _compact_primary_content_limit(
+            primary_source,
+            auxiliary_source,
+            dify_relevant_input_chars,
+            target_max_chars,
         )
-        for item in primary_source
-    ]
-    auxiliary_content_limit = 900
-    auxiliary_attachment_limit = 4
-    if input_strategy == "safe_compact":
-        auxiliary_content_limit = 600
-        auxiliary_attachment_limit = 2
-    elif input_strategy in {"attachment_led", "table_heavy"}:
-        auxiliary_content_limit = 700
-        auxiliary_attachment_limit = 2
-    auxiliary = [
-        _compact_material_for_dify(item, "auxiliary", content_limit=auxiliary_content_limit, attachment_limit=auxiliary_attachment_limit, preserve_detail=False)
-        for item in auxiliary_source
-    ]
+        if input_strategy == "safe_compact":
+            primary_content_limit = min(primary_content_limit, 12_000)
+        elif input_strategy == "table_heavy":
+            primary_content_limit = min(primary_content_limit, 9_000)
+        primary = [
+            _compact_material_for_dify(
+                item,
+                "primary",
+                content_limit=primary_content_limit,
+                attachment_limit=10 if len(primary_source) == 1 else 8,
+                preserve_detail=preserve_detail,
+            )
+            for item in primary_source
+        ]
+        auxiliary_content_limit = 900
+        auxiliary_attachment_limit = 4
+        if input_strategy == "safe_compact":
+            auxiliary_content_limit = 600
+            auxiliary_attachment_limit = 2
+        elif input_strategy in {"attachment_led", "table_heavy"}:
+            auxiliary_content_limit = 700
+            auxiliary_attachment_limit = 2
+        auxiliary = [
+            _compact_material_for_dify(
+                item,
+                "auxiliary",
+                content_limit=auxiliary_content_limit,
+                attachment_limit=auxiliary_attachment_limit,
+                preserve_detail=False,
+            )
+            for item in auxiliary_source
+        ]
+        primary_body_chars = sum(
+            _dify_text_ref_chars(_dify_primary_body_text_refs(material)) for material in primary
+        )
+        core_attachment_chars = 0
+        ordinary_attachment_chars = 0
+        for material in primary:
+            for attachment in material.get("attachments") or []:
+                if not isinstance(attachment, dict):
+                    continue
+                attachment_chars = _dify_text_ref_chars(_dify_attachment_text_refs(attachment))
+                if attachment.get("core_attachment"):
+                    core_attachment_chars += attachment_chars
+                else:
+                    ordinary_attachment_chars += attachment_chars
+        auxiliary_chars = sum(
+            _dify_text_ref_chars(_dify_auxiliary_text_refs(material)) for material in auxiliary
+        )
+        budget_application = {
+            "primary_body_trimmed": False,
+            "primary_attachment_trimmed": False,
+            "core_attachment_trimmed": False,
+            "auxiliary_trimmed": False,
+            "effective_primary_body_chars": primary_body_chars,
+            "effective_primary_core_attachment_chars": core_attachment_chars,
+            "effective_primary_ordinary_attachment_chars": ordinary_attachment_chars,
+            "effective_primary_attachment_chars": core_attachment_chars + ordinary_attachment_chars,
+            "effective_auxiliary_chars": auxiliary_chars,
+            "auxiliary_unused_chars": max(0, int(quality_budget["auxiliary_chars"]) - auxiliary_chars),
+        }
+    else:
+        primary = [
+            _compact_material_for_dify(
+                item,
+                "primary",
+                preserve_detail=True,
+            )
+            for item in primary_source
+        ]
+        auxiliary = [
+            _compact_material_for_dify(
+                item,
+                "auxiliary",
+                content_limit=max(1, int(quality_budget["auxiliary_chars"])),
+                attachment_limit=5,
+                preserve_detail=False,
+            )
+            for item in auxiliary_source
+        ]
+        budget_application = _apply_dify_quality_budget(primary, auxiliary, quality_budget)
+    quality_budget.update(
+        {
+            "effective_primary_body_chars": budget_application["effective_primary_body_chars"],
+            "effective_primary_core_attachment_chars": budget_application["effective_primary_core_attachment_chars"],
+            "effective_primary_ordinary_attachment_chars": budget_application[
+                "effective_primary_ordinary_attachment_chars"
+            ],
+            "effective_primary_attachment_chars": budget_application[
+                "effective_primary_attachment_chars"
+            ],
+            "effective_auxiliary_chars": budget_application["effective_auxiliary_chars"],
+            "auxiliary_unused_chars": budget_application["auxiliary_unused_chars"],
+        }
+    )
     omitted_content: list[dict[str, Any]] = []
     compression_reason: list[str] = []
-    primary_detail_preserved = True
-    core_attachment_detail_preserved = True
-    auxiliary_detail_preserved = True
+    primary_detail_preserved = not bool(budget_application["primary_body_trimmed"])
+    core_attachment_detail_preserved = not bool(budget_application["core_attachment_trimmed"])
+    auxiliary_detail_preserved = not bool(budget_application["auxiliary_trimmed"])
     full_row_level_detail_preserved = True
+    if budget_application["primary_body_trimmed"]:
+        compression_reason.append("primary_content_budget_trimmed")
+    if budget_application["primary_attachment_trimmed"]:
+        compression_reason.append("primary_attachment_budget_trimmed")
+    if budget_application["auxiliary_trimmed"]:
+        compression_reason.append("auxiliary_content_trimmed")
     if input_strategy != "full_input":
         omitted_content.append(
             _omitted_content_entry(
@@ -2492,6 +3269,7 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
         "strategy_basis": _dify_input_strategy_basis(
             input_strategy,
             relevant_chars=dify_relevant_input_chars,
+            relevant_bytes=dify_relevant_input_bytes,
             thresholds=thresholds,
             primary_source=primary_source,
         ),
@@ -2508,6 +3286,9 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
         "warnings": [_limit_text(item, 260) for item in list(pack.get("warnings") or [])[:8]],
         "generation_guidance": copy.deepcopy(pack.get("generation_guidance") or {}),
     }
+    if not legacy_explicit_limit:
+        compact["quality_profile"] = "quality"
+        compact["quality_budget"] = quality_budget
     if (
         pack.get("evidence_schema_version") is not None
         and pack.get("source_evidence_schema_version") != 1
@@ -2532,12 +3313,9 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
         "企业操作建议",
     ]
     if input_strategy == "full_input":
-        compact["generation_guidance"]["detail_policy"] = "small_input_no_compression"
-        compact["generation_guidance"]["generation_mode"] = "single_pass_full_evidence"
-        compact["generation_guidance"]["detail_instruction"] = (
-            "输入证据量未超过安全阈值，主材料正文和主附件解析结果已尽量完整保留；"
-            "不要因为 evidence_pack 有 compact 标记就写得过短；"
-            "报告篇幅应来自事实覆盖和证据支撑型分析，不得无依据扩写。"
+        _set_full_input_detail_guidance(
+            compact["generation_guidance"],
+            auxiliary_compacted=bool(budget_application["auxiliary_trimmed"]),
         )
     elif input_strategy == "attachment_led":
         compact["generation_guidance"]["detail_policy"] = "attachment_led_full_core_attachment"
@@ -2626,7 +3404,10 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
         "warnings": [],
     }
     compact["dify_compacted"] = True
-    compact["compression_applied"] = input_strategy in {"light_compact", "safe_compact", "staged_generation"}
+    compact["compression_applied"] = input_strategy in {"light_compact", "safe_compact", "staged_generation"} or any(
+        bool(budget_application[key])
+        for key in ["primary_body_trimmed", "primary_attachment_trimmed", "auxiliary_trimmed"]
+    )
     compact["compression_reason"] = list(dict.fromkeys(compression_reason))
     compact["primary_detail_preserved"] = primary_detail_preserved
     compact["core_attachment_detail_preserved"] = core_attachment_detail_preserved
@@ -2634,13 +3415,19 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
     compact["full_row_level_detail_preserved"] = full_row_level_detail_preserved
     compact["detail_preserved"] = primary_detail_preserved and core_attachment_detail_preserved
     compact["original_pack_chars"] = original_pack_chars
+    compact["original_pack_bytes"] = original_pack_bytes
     compact["strategy_basis_chars"] = dify_relevant_input_chars
+    compact["strategy_basis_bytes"] = dify_relevant_input_bytes
     compact["dify_relevant_input_chars"] = dify_relevant_input_chars
+    compact["dify_relevant_input_bytes"] = dify_relevant_input_bytes
     compact["hard_limit_chars"] = hard_limit
+    compact["hard_limit_bytes"] = hard_limit_bytes
+    compact["target_max_chars"] = target_max_chars
     compact["full_input_max_chars"] = thresholds["full_input"]
     compact["safe_compact_max_chars"] = thresholds["safe_compact"]
     compact["strategy_thresholds"] = {
         "hard_limit_chars": hard_limit,
+        "hard_limit_bytes": hard_limit_bytes,
         "full_input_max_chars": thresholds["full_input"],
         "safe_compact_max_chars": thresholds["safe_compact"],
     }
@@ -2763,7 +3550,10 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
         break
     first_stage_chars = _refresh_dify_char_fields(compact)
     first_stage_evidence_items = copy.deepcopy(compact.get("evidence_items") or [])
-    compact_preservation_enabled = _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False)
+    if compact_preservation_enabled and first_stage_chars > vbp_enforcement_limit:
+        target_max_chars = vbp_enforcement_limit
+        compact["target_max_chars"] = target_max_chars
+        first_stage_chars = _refresh_dify_char_fields(compact)
     if first_stage_chars > target_max_chars:
         if compact_preservation_enabled:
             compact["evidence_items"] = protected_evidence_items(first_stage_evidence_items)
@@ -2840,11 +3630,243 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
                 "target_max_chars": target_max_chars,
             },
         )
-    compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
-    _refresh_dify_char_fields(compact)
-    compact["compression_ratio"] = round(original_pack_chars / compact["final_dify_input_chars"], 4) if compact["final_dify_input_chars"] else None
-    # The ratio's serialized width can change the final JSON size.
-    _refresh_dify_char_fields(compact)
+    omitted_identities = {
+        (
+            str(item.get("type") or ""),
+            str(item.get("articleattid") or ""),
+            str(item.get("filename") or ""),
+        )
+        for item in compact["omitted_content"]
+        if isinstance(item, dict)
+    }
+
+    def append_omitted_once(omitted_type: str, **kwargs: Any) -> None:
+        identity = (
+            omitted_type,
+            str(kwargs.get("articleattid") or ""),
+            str(kwargs.get("filename") or ""),
+        )
+        if identity in omitted_identities:
+            return
+        compact["omitted_content"].append(_omitted_content_entry(omitted_type, **kwargs))
+        omitted_identities.add(identity)
+
+    if budget_application["primary_body_trimmed"]:
+        append_omitted_once(
+            "primary_content_tail",
+            reason="主材料正文与结构化要点超过质量预算，已按主材料正文池均衡保留。",
+            risk="主材料尾部细节可能未完整进入 Dify，报告应优先依据保留正文和结构化规则。",
+            manual_review=True,
+            affects_primary_detail=True,
+        )
+    if budget_application["primary_attachment_trimmed"]:
+        append_omitted_once(
+            "attachment_summary_tail",
+            reason="主材料附件文本超过核心附件质量预算，已优先保留核心附件并均衡压缩摘要。",
+            risk="部分附件摘要细节可能未完整进入 Dify，结构化表格字段和关键事实仍优先保留。",
+            manual_review=True,
+            affects_core_attachment_detail=bool(budget_application["core_attachment_trimmed"]),
+        )
+    if budget_application["auxiliary_trimmed"]:
+        append_omitted_once(
+            "auxiliary_content_tail",
+            reason="辅助材料超过质量预算，已保留摘要、相关片段和可用要点。",
+            risk="辅助材料细节可能未完整进入 Dify，且不能作为主材料结论依据。",
+            manual_review=False,
+            affects_auxiliary_detail=True,
+        )
+
+    chars, bytes_size = _refresh_dify_quality_size_fields(
+        compact,
+        char_limit=target_max_chars,
+        byte_limit=hard_limit_bytes,
+    )
+    if compact_preservation_enabled and first_stage_chars > target_max_chars:
+        final_vbp_plan = secondary_compression_plan(first_stage_chars, hard_limit=target_max_chars)
+        final_vbp_ceiling = int(final_vbp_plan["target_ceiling_chars"])
+        if chars > final_vbp_ceiling:
+            compact = reduce_optional_evidence(
+                compact,
+                target_ceiling_chars=final_vbp_ceiling,
+                baseline_items=first_stage_evidence_items,
+            )
+            retention = mandatory_evidence_retention(first_stage_evidence_items, compact)
+            compact["mandatory_evidence_retention"] = retention
+            retention_rate = retention.get("rate")
+            if retention_rate is not None and float(retention_rate) < 0.9:
+                raise CompactPolicyError(
+                    "COMPACT_PROVENANCE_LOST",
+                    "mandatory evidence retention fell below 90 percent",
+                    metrics=retention,
+                )
+            chars, bytes_size = _refresh_dify_quality_size_fields(
+                compact,
+                char_limit=target_max_chars,
+                byte_limit=hard_limit_bytes,
+            )
+    if _dify_limits_exceeded(
+        chars,
+        bytes_size,
+        char_limit=target_max_chars,
+        byte_limit=hard_limit_bytes,
+    ) and any(
+        key in compact
+        for key in [
+            "primary_evidence",
+            "auxiliary_evidence",
+            "attachment_evidence",
+            "evidence_budget",
+        ]
+    ):
+        compact.pop("primary_evidence", None)
+        compact.pop("auxiliary_evidence", None)
+        compact.pop("attachment_evidence", None)
+        compact.pop("evidence_budget", None)
+        for material in [*compact.get("primary_materials", []), *compact.get("auxiliary_materials", [])]:
+            if isinstance(material, dict):
+                material.pop("attachment_summaries", None)
+        compression_reason.append("secondary_evidence_blocks_removed")
+        append_omitted_once(
+            "secondary_evidence_blocks",
+            reason="超过 Dify 变量长度或 UTF-8 字节限制，已移除重复的二级证据汇总块。",
+            risk="不影响主材料正文和主附件主体信息，因为 primary_materials 中仍保留核心证据。",
+            manual_review=False,
+        )
+        compact["compression_applied"] = True
+        compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+        chars, bytes_size = _refresh_dify_quality_size_fields(
+            compact,
+            char_limit=target_max_chars,
+            byte_limit=hard_limit_bytes,
+        )
+
+    shrink_phases = [
+        (
+            "auxiliary_content_trimmed",
+            _dify_auxiliary_overflow_refs,
+            "auxiliary_content_tail",
+            {
+                "reason": "输入超过 Dify 长度或 UTF-8 字节限制，已先压缩辅助正文、附件摘要和相关片段。",
+                "risk": "辅助材料细节可能未完整进入 Dify，不能作为主材料结论依据。",
+                "manual_review": False,
+                "affects_auxiliary_detail": True,
+            },
+            "auxiliary",
+        ),
+        (
+            "ordinary_attachment_trimmed",
+            _dify_ordinary_attachment_overflow_refs,
+            "ordinary_attachment_detail",
+            {
+                "reason": "辅助证据压缩后仍超限，已继续压缩主材料中的普通附件摘要。",
+                "risk": "普通附件细节可能不完整，核心附件仍优先保留。",
+                "manual_review": False,
+            },
+            "ordinary_attachment",
+        ),
+        (
+            "low_value_table_description_trimmed",
+            _dify_table_description_overflow_refs,
+            "low_value_table_descriptions",
+            {
+                "reason": "已压缩低价值表格描述文字，保留字段、行列数和结构化统计。",
+                "risk": "表格自然语言描述可能缩短，但关键字段结构仍保留。",
+                "manual_review": False,
+            },
+            "table",
+        ),
+        (
+            "core_attachment_summary_trimmed",
+            _dify_core_attachment_overflow_refs,
+            "core_attachment_low_relevance_summary",
+            {
+                "reason": "其他低优先级内容压缩后仍超限，已压缩核心附件中低相关摘要文本。",
+                "risk": "核心附件部分摘要细节可能缺失，报告不得编造未保留的行级事实。",
+                "manual_review": True,
+                "affects_core_attachment_detail": True,
+            },
+            "core_attachment",
+        ),
+        (
+            "primary_content_trimmed",
+            _dify_primary_body_overflow_refs,
+            "primary_content_tail",
+            {
+                "reason": "所有较低优先级内容压缩后仍超限，最后压缩主材料正文与正文结构化要点。",
+                "risk": "主材料尾部细节可能未完整进入 Dify，应人工复核高风险结论。",
+                "manual_review": True,
+                "affects_primary_detail": True,
+            },
+            "primary",
+        ),
+    ]
+    shrink_iterations = 0
+    max_shrink_iterations = 128
+    for reason_code, collector, omitted_type, omitted_kwargs, detail_kind in shrink_phases:
+        stagnant_iterations = 0
+        while _dify_limits_exceeded(
+            chars,
+            bytes_size,
+            char_limit=target_max_chars,
+            byte_limit=hard_limit_bytes,
+        ) and shrink_iterations < max_shrink_iterations:
+            previous_sizes = (chars, bytes_size)
+            refs = collector(compact)
+            changed = _shrink_dify_text_refs_for_overflow(
+                refs,
+                chars=chars,
+                bytes_size=bytes_size,
+                char_limit=target_max_chars,
+                byte_limit=hard_limit_bytes,
+            )
+            if not changed:
+                break
+            shrink_iterations += 1
+            compression_reason.append(reason_code)
+            append_omitted_once(omitted_type, **omitted_kwargs)
+            compact["compression_applied"] = True
+            if detail_kind == "auxiliary":
+                auxiliary_detail_preserved = False
+                if input_strategy == "full_input":
+                    _set_full_input_detail_guidance(
+                        compact["generation_guidance"],
+                        auxiliary_compacted=True,
+                    )
+            elif detail_kind == "core_attachment":
+                core_attachment_detail_preserved = False
+            elif detail_kind == "primary":
+                primary_detail_preserved = False
+            compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+            chars, bytes_size = _refresh_dify_quality_size_fields(
+                compact,
+                char_limit=target_max_chars,
+                byte_limit=hard_limit_bytes,
+            )
+            if chars >= previous_sizes[0] and bytes_size >= previous_sizes[1]:
+                stagnant_iterations += 1
+                if stagnant_iterations >= 2:
+                    break
+            else:
+                stagnant_iterations = 0
+
+    compact["primary_detail_preserved"] = primary_detail_preserved
+    compact["core_attachment_detail_preserved"] = core_attachment_detail_preserved
+    compact["auxiliary_detail_preserved"] = auxiliary_detail_preserved
+    compact["full_row_level_detail_preserved"] = full_row_level_detail_preserved
+    compact["detail_preserved"] = primary_detail_preserved and core_attachment_detail_preserved
+    compact["compression_reason"] = list(dict.fromkeys(compression_reason))
+    chars, bytes_size = _refresh_dify_quality_size_fields(
+        compact,
+        char_limit=target_max_chars,
+        byte_limit=hard_limit_bytes,
+    )
+    if _dify_limits_exceeded(
+        chars,
+        bytes_size,
+        char_limit=target_max_chars,
+        byte_limit=hard_limit_bytes,
+    ):
+        raise DifyEvidencePackLimitError(chars, bytes_size, target_max_chars, hard_limit_bytes)
     return compact
 
 
@@ -4009,10 +5031,11 @@ def _dify_input_strategy_from_pack(pack: dict[str, Any] | None) -> str:
         return strategy
     primary_source = [item for item in pack.get("primary_materials") or [] if isinstance(item, dict)]
     auxiliary_source = [item for item in pack.get("auxiliary_materials") or [] if isinstance(item, dict)]
-    evidence_chars = _dify_relevant_input_chars(pack, primary_source, auxiliary_source)
+    evidence_chars, evidence_bytes = _dify_relevant_input_sizes(pack, primary_source, auxiliary_source)
     return _dify_input_strategy(
         original_pack_chars=evidence_chars,
         dify_relevant_input_chars=evidence_chars,
+        dify_relevant_input_bytes=evidence_bytes,
         primary_source=primary_source,
         auxiliary_source=auxiliary_source,
     )
@@ -6190,6 +7213,8 @@ def get_analysis_pack(pack_id: str, full: bool = False) -> dict[str, Any]:
         return pack
     try:
         compact = _compact_evidence_pack_for_dify(pack)
+    except DifyEvidencePackLimitError as exc:
+        raise _dify_limit_http_exception(exc) from exc
     except CompactPolicyError as exc:
         logger.warning("analysis_pack_compaction_blocked pack_id=%s code=%s", pack_id, exc.code)
         raise HTTPException(
@@ -6229,6 +7254,8 @@ def get_analysis_pack_diagnostics(pack_id: str) -> dict[str, Any]:
     pack = _read_database_evidence_pack(pack_id)
     try:
         dify_pack = _compact_evidence_pack_for_dify(pack)
+    except DifyEvidencePackLimitError as exc:
+        raise _dify_limit_http_exception(exc) from exc
     except CompactPolicyError as exc:
         logger.warning("analysis_pack_diagnostics_compaction_blocked pack_id=%s code=%s", pack_id, exc.code)
         raise HTTPException(

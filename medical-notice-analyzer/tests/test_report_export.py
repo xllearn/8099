@@ -73,7 +73,7 @@ class DeploymentConfigTests(unittest.TestCase):
             os.environ.pop("PUBLIC_BASE_URL", None)
             self.assertEqual(
                 main_module._download_url("report.docx"),
-                "http://192.168.34.88:8099/download/report.docx",
+                "http://192.168.34.87:8099/download/report.docx",
             )
 
             os.environ["PUBLIC_BASE_URL"] = "http://example.internal:18099/"

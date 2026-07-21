@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_BASE_URL = "http://192.168.34.88:8099"
+DEFAULT_BASE_URL = "http://192.168.34.87:8099"
 TERMINAL_STATUSES = {"finished", "failed", "needs_manual_review"}
 STOPWORDS = set(
     "关于 通知 公告 公开 征求 意见 医用 耗材 医疗 药品 采购 项目 分析 工作 开展 广东 河南 吉林 天津 江苏 宁夏 重庆 新疆 甘肃 省 市 自治区 的 和 与 有关 相关".split()

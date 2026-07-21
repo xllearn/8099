@@ -88,6 +88,469 @@ class RecordsApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.client = TestClient(main_module.app)
 
+    def test_dify_input_thresholds_default_to_quality_profile(self) -> None:
+        with patch.dict(main_module.os.environ, {}, clear=False):
+            for name in [
+                "DIFY_PLATFORM_STRING_MAX_CHARS",
+                "DIFY_FULL_INPUT_MAX_CHARS",
+                "DIFY_SAFE_COMPACT_MAX_CHARS",
+                "DIFY_EVIDENCE_PACK_HARD_MAX_CHARS",
+                "DIFY_VARIABLE_HARD_MAX_CHARS",
+                "DIFY_EVIDENCE_PACK_HARD_MAX_BYTES",
+            ]:
+                main_module.os.environ.pop(name, None)
+            thresholds = main_module._dify_input_thresholds()
+
+        self.assertEqual(thresholds["platform_limit"], 400000)
+        self.assertEqual(thresholds["full_input"], 160000)
+        self.assertEqual(thresholds["safe_compact"], 220000)
+        self.assertEqual(thresholds["hard_limit"], 240000)
+        self.assertEqual(thresholds["hard_limit_bytes"], 870400)
+
+    def test_dify_quality_budget_allocates_full_target_and_prioritizes_primary_evidence(self) -> None:
+        budget = main_module._dify_quality_budget(
+            target_chars=160000,
+            primary_count=1,
+            auxiliary_count=3,
+        )
+
+        self.assertEqual(budget["target_chars"], 160000)
+        self.assertEqual(budget["primary_count"], 1)
+        self.assertEqual(budget["auxiliary_count"], 3)
+        self.assertGreaterEqual(budget["primary_body_chars"], 50000)
+        self.assertGreaterEqual(budget["primary_core_attachment_chars"], 70000)
+        self.assertLessEqual(budget["auxiliary_chars"], 16000)
+        self.assertEqual(
+            budget["allocated_keys"],
+            [
+                "primary_body_chars",
+                "primary_core_attachment_chars",
+                "auxiliary_chars",
+                "metadata_reserve_chars",
+            ],
+        )
+        self.assertEqual(sum(budget[key] for key in budget["allocated_keys"]), 160000)
+
+    def test_dify_quality_budget_reflows_unused_auxiliary_share(self) -> None:
+        budget = main_module._dify_quality_budget(
+            target_chars=160003,
+            primary_count=1,
+            auxiliary_count=0,
+        )
+
+        self.assertEqual(budget["auxiliary_chars"], 0)
+        self.assertEqual(sum(budget[key] for key in budget["allocated_keys"]), 160003)
+        self.assertEqual(budget["primary_body_chars"], 160003 * 35 // 100)
+        self.assertEqual(
+            budget["primary_core_attachment_chars"],
+            (160003 * 45 // 100) + (160003 * 8 // 100),
+        )
+
+    def test_dify_quality_capacity_tiers_select_real_budget_targets(self) -> None:
+        thresholds = {
+            "platform_limit": 400000,
+            "full_input": 160000,
+            "safe_compact": 220000,
+            "light_compact": 220000,
+            "hard_limit": 240000,
+            "hard_limit_bytes": 870400,
+        }
+        cases = [
+            (159999, "full_input", 160000),
+            (160001, "light_compact", 220000),
+            (219999, "light_compact", 220000),
+            (220001, "safe_compact", 220000),
+            (239999, "safe_compact", 220000),
+            (240001, "staged_generation", 220000),
+        ]
+
+        with patch.object(main_module, "_dify_input_thresholds", return_value=thresholds):
+            for relevant_chars, expected_strategy, expected_budget in cases:
+                with self.subTest(relevant_chars=relevant_chars):
+                    strategy = main_module._dify_input_strategy(
+                        original_pack_chars=relevant_chars,
+                        dify_relevant_input_chars=relevant_chars,
+                        primary_source=[],
+                        auxiliary_source=[],
+                    )
+                    budget_target = main_module._dify_quality_target_chars(
+                        dify_relevant_input_chars=relevant_chars,
+                        target_max_chars=999999,
+                        thresholds=thresholds,
+                    )
+
+                    self.assertEqual(strategy, expected_strategy)
+                    self.assertEqual(budget_target, expected_budget)
+
+        self.assertEqual(
+            main_module._dify_quality_target_chars(
+                dify_relevant_input_chars=220001,
+                target_max_chars=180000,
+                thresholds=thresholds,
+            ),
+            180000,
+        )
+
+    def test_large_pack_uses_220k_budget_and_retains_more_than_160k_budget(self) -> None:
+        source_text = "P" * 300000
+        pack = {
+            "pack_id": "pack_quality_tier_retention",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Large primary",
+                    "content_text": source_text,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+            "generation_guidance": {},
+        }
+        env = {
+            "DIFY_FULL_INPUT_MAX_CHARS": "160000",
+            "DIFY_SAFE_COMPACT_MAX_CHARS": "220000",
+            "DIFY_EVIDENCE_PACK_HARD_MAX_CHARS": "240000",
+            "DIFY_EVIDENCE_PACK_HARD_MAX_BYTES": "2000000",
+        }
+
+        with patch.dict(main_module.os.environ, env, clear=False):
+            compact_160k = main_module._compact_evidence_pack_for_dify(pack, max_chars=160000)
+            compact_220k = main_module._compact_evidence_pack_for_dify(pack, max_chars=240000)
+
+        retained_160k = len(compact_160k["primary_materials"][0]["content_text"])
+        retained_220k = len(compact_220k["primary_materials"][0]["content_text"])
+        self.assertEqual(compact_160k["quality_budget"]["target_chars"], 160000)
+        self.assertEqual(compact_220k["quality_budget"]["target_chars"], 220000)
+        self.assertGreater(retained_220k, retained_160k + 30000)
+
+    def test_refresh_dify_size_fields_counts_utf8_bytes(self) -> None:
+        compact = {"text": "中😀"}
+
+        chars = main_module._refresh_dify_size_fields(compact)
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        serialized_chars = len(serialized)
+        serialized_bytes = len(serialized.encode("utf-8"))
+
+        self.assertEqual(chars, serialized_chars)
+        self.assertEqual(compact["compact_pack_chars"], serialized_chars)
+        self.assertEqual(compact["final_dify_input_chars"], serialized_chars)
+        self.assertEqual(compact["compact_pack_bytes"], serialized_bytes)
+        self.assertEqual(compact["final_dify_input_bytes"], serialized_bytes)
+        self.assertGreater(serialized_bytes, serialized_chars)
+
+    def test_compact_dify_size_fields_match_final_serialization(self) -> None:
+        compact = main_module._compact_evidence_pack_for_dify(
+            {
+                "pack_id": "x",
+                "primary_materials": [],
+                "auxiliary_materials": [],
+                "generation_guidance": {},
+            }
+        )
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+
+        self.assertEqual(compact["compact_pack_chars"], len(serialized))
+        self.assertEqual(compact["final_dify_input_chars"], len(serialized))
+        self.assertEqual(compact["compact_pack_bytes"], len(serialized.encode("utf-8")))
+        self.assertEqual(compact["final_dify_input_bytes"], len(serialized.encode("utf-8")))
+
+    def test_compact_dify_large_multibyte_pack_respects_quality_char_and_byte_limits(self) -> None:
+        pack = {
+            "pack_id": "pack_quality_multibyte_large",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "主材料😀",
+                    "content_text": "主材料正文😀" * 40000,
+                    "attachments": [
+                        {
+                            "articleattid": "att1",
+                            "filename": "核心附件📎.pdf",
+                            "core_attachment": True,
+                            "parse_status": "parsed_summary",
+                            "summary": "核心附件价格与规则📎" * 18000,
+                            "important_sections": ["核心操作步骤✅" * 5000],
+                            "table_summaries": [],
+                        }
+                    ],
+                }
+            ],
+            "auxiliary_materials": [
+                {
+                    "menu_code": "m2",
+                    "articleid": f"a{index}",
+                    "title": f"辅助材料{index}",
+                    "content_text": "辅助背景资料🌐" * 5000,
+                    "relevant_snippets": ["相关背景片段🔎" * 300],
+                    "attachments": [],
+                }
+                for index in range(3)
+            ],
+            "generation_guidance": {},
+        }
+        env = {
+            "DIFY_FULL_INPUT_MAX_CHARS": "160000",
+            "DIFY_SAFE_COMPACT_MAX_CHARS": "220000",
+            "DIFY_EVIDENCE_PACK_HARD_MAX_CHARS": "240000",
+            "DIFY_EVIDENCE_PACK_HARD_MAX_BYTES": "870400",
+        }
+
+        with patch.dict(main_module.os.environ, env, clear=False):
+            compact = main_module._compact_evidence_pack_for_dify(pack, max_chars=999999)
+
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        serialized_bytes = serialized.encode("utf-8")
+        self.assertEqual(compact["quality_profile"], "quality")
+        self.assertLessEqual(len(serialized), 240000)
+        self.assertLessEqual(len(serialized_bytes), 870400)
+        self.assertEqual(compact["compact_pack_chars"], len(serialized))
+        self.assertEqual(compact["final_dify_input_chars"], len(serialized))
+        self.assertEqual(compact["compact_pack_bytes"], len(serialized_bytes))
+        self.assertEqual(compact["final_dify_input_bytes"], len(serialized_bytes))
+        self.assertEqual(compact["hard_limit_bytes"], 870400)
+        self.assertEqual(compact["strategy_thresholds"]["hard_limit_bytes"], 870400)
+        self.assertLessEqual(float(compact["char_usage_ratio"]), 1.0)
+        self.assertLessEqual(float(compact["byte_usage_ratio"]), 1.0)
+
+    def test_compact_dify_shrinks_when_only_utf8_byte_limit_is_exceeded(self) -> None:
+        primary_text = "汉" * 10000
+        pack = {
+            "pack_id": "pack_byte_only_overflow",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "纯多字节主材料",
+                    "content_text": primary_text,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+            "generation_guidance": {},
+        }
+
+        with patch.dict(
+            main_module.os.environ,
+            {
+                "DIFY_EVIDENCE_PACK_HARD_MAX_CHARS": "240000",
+                "DIFY_EVIDENCE_PACK_HARD_MAX_BYTES": "20000",
+            },
+            clear=False,
+        ):
+            compact = main_module._compact_evidence_pack_for_dify(pack)
+
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        self.assertLess(compact["original_pack_chars"], compact["hard_limit_chars"])
+        self.assertLessEqual(len(serialized), compact["hard_limit_chars"])
+        self.assertLessEqual(len(serialized.encode("utf-8")), 20000)
+        self.assertEqual(compact["hard_limit_bytes"], 20000)
+        self.assertLess(len(compact["primary_materials"][0]["content_text"]), len(primary_text))
+        self.assertIn("primary_content_trimmed", compact["compression_reason"])
+
+    def test_mixed_emoji_ascii_byte_overflow_keeps_shrinking_until_within_limit(self) -> None:
+        pack = {
+            "pack_id": "pack_mixed_emoji_ascii",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Mixed bytes",
+                    "content_text": ("😀" * 2000) + ("a" * 18000),
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+            "generation_guidance": {},
+        }
+
+        with patch.dict(
+            main_module.os.environ,
+            {"DIFY_EVIDENCE_PACK_HARD_MAX_BYTES": "16384"},
+            clear=False,
+        ):
+            compact = main_module._compact_evidence_pack_for_dify(pack)
+
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        self.assertLessEqual(len(serialized.encode("utf-8")), 16384)
+        self.assertLess(
+            len(compact["primary_materials"][0]["content_text"]),
+            len(pack["primary_materials"][0]["content_text"]),
+        )
+
+    def test_full_input_late_byte_trim_does_not_claim_no_compression(self) -> None:
+        pack = {
+            "pack_id": "pack_full_input_late_aux_trim",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Primary",
+                    "content_text": "a" * 7000,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [
+                {
+                    "menu_code": "m2",
+                    "articleid": "a1",
+                    "title": "Auxiliary",
+                    "content_text": "😀" * 1500,
+                    "attachments": [],
+                }
+            ],
+            "generation_guidance": {},
+        }
+
+        with patch.dict(
+            main_module.os.environ,
+            {"DIFY_EVIDENCE_PACK_HARD_MAX_BYTES": "16384"},
+            clear=False,
+        ):
+            compact = main_module._compact_evidence_pack_for_dify(pack)
+
+        self.assertEqual(compact["input_strategy"], "full_input")
+        self.assertFalse(compact["auxiliary_detail_preserved"])
+        self.assertEqual(
+            compact["generation_guidance"]["detail_policy"],
+            "full_input_primary_preserved_auxiliary_compact",
+        )
+        self.assertIn(
+            "辅助材料已按背景证据预算压缩",
+            compact["generation_guidance"]["detail_instruction"],
+        )
+
+    def test_quality_size_ratios_are_fixed_width_and_match_final_json(self) -> None:
+        compact = main_module._compact_evidence_pack_for_dify(
+            {
+                "pack_id": "x",
+                "primary_materials": [],
+                "auxiliary_materials": [],
+                "generation_guidance": {},
+            },
+            max_chars=4291,
+        )
+        serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
+        chars = len(serialized)
+        bytes_size = len(serialized.encode("utf-8"))
+
+        self.assertEqual(compact["compact_pack_chars"], chars)
+        self.assertEqual(compact["final_dify_input_chars"], chars)
+        self.assertEqual(compact["compact_pack_bytes"], bytes_size)
+        self.assertEqual(compact["final_dify_input_bytes"], bytes_size)
+        self.assertIsInstance(compact["char_usage_ratio"], str)
+        self.assertIsInstance(compact["byte_usage_ratio"], str)
+        self.assertIsInstance(compact["compression_ratio"], str)
+        self.assertEqual(compact["char_usage_ratio"], f"{chars / 4291:.6e}")
+        self.assertEqual(
+            compact["byte_usage_ratio"],
+            f"{bytes_size / compact['hard_limit_bytes']:.6e}",
+        )
+        self.assertEqual(
+            compact["compression_ratio"],
+            f"{compact['original_pack_chars'] / chars:.6e}",
+        )
+
+    def test_quality_size_ratios_stay_fixed_width_across_10x_and_100x(self) -> None:
+        formatted = [
+            main_module._dify_fixed_ratio(9999999, 1000000),
+            main_module._dify_fixed_ratio(10, 1),
+            main_module._dify_fixed_ratio(100, 1),
+        ]
+        self.assertTrue(all(value is not None for value in formatted))
+        self.assertEqual(len({len(value or "") for value in formatted}), 1)
+        self.assertEqual(
+            [float(value or "nan") for value in formatted],
+            [9.999999, 10.0, 100.0],
+        )
+
+    def test_dify_strategy_stages_payload_when_utf8_bytes_exceed_hard_limit(self) -> None:
+        thresholds = main_module._dify_input_thresholds()
+
+        direct = main_module._dify_input_strategy(
+            original_pack_chars=219000,
+            dify_relevant_input_chars=219000,
+            dify_relevant_input_bytes=thresholds["hard_limit_bytes"] + 1,
+            primary_source=[],
+            auxiliary_source=[],
+        )
+        emoji_pack = {
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Byte-heavy primary",
+                    "content_text": "😀" * 219000,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+
+        self.assertEqual(direct, "staged_generation")
+        self.assertEqual(
+            main_module._dify_input_strategy_from_pack(emoji_pack),
+            "staged_generation",
+        )
+
+    def test_compact_dify_raises_controlled_error_when_limit_is_impossible(self) -> None:
+        sensitive_text = "不得出现在异常中的原始正文🔒"
+        pack = {
+            "pack_id": "pack_impossible_limit",
+            "primary_materials": [
+                {
+                    "menu_code": "m1",
+                    "articleid": "p1",
+                    "title": "Primary",
+                    "content_text": sensitive_text * 200,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+
+        with self.assertRaises(main_module.DifyEvidencePackLimitError) as caught:
+            main_module._compact_evidence_pack_for_dify(pack, max_chars=1000)
+
+        error = caught.exception
+        self.assertGreater(error.chars, error.char_limit)
+        self.assertEqual(error.char_limit, 1000)
+        self.assertGreater(error.bytes_size, 0)
+        self.assertGreater(error.byte_limit, 0)
+        self.assertNotIn(sensitive_text, str(error))
+        self.assertNotIn(sensitive_text, repr(error))
+
+    def test_analysis_pack_endpoints_return_controlled_413_for_compaction_limit_error(self) -> None:
+        error = main_module.DifyEvidencePackLimitError(250001, 870401, 240000, 870400)
+        safe_pack = {
+            "pack_id": "pack_limit_error",
+            "primary_materials": [],
+            "auxiliary_materials": [],
+        }
+        expected_detail = {
+            "code": "dify_evidence_pack_limit_exceeded",
+            "chars": 250001,
+            "bytes": 870401,
+            "char_limit": 240000,
+            "byte_limit": 870400,
+        }
+
+        with patch.object(main_module, "_read_database_evidence_pack", return_value=safe_pack), patch.object(
+            main_module,
+            "_compact_evidence_pack_for_dify",
+            side_effect=error,
+        ):
+            pack_response = self.client.get("/analysis/packs/pack_limit_error")
+            diagnostics_response = self.client.get("/analysis/packs/pack_limit_error/diagnostics")
+
+        self.assertEqual(pack_response.status_code, 413)
+        self.assertEqual(pack_response.json(), {"detail": expected_detail})
+        self.assertEqual(diagnostics_response.status_code, 413)
+        self.assertEqual(diagnostics_response.json(), {"detail": expected_detail})
+        response_text = pack_response.text + diagnostics_response.text
+        self.assertNotIn("不得出现在异常中的原始正文", response_text)
+
     def test_records_list_filters_paginates_and_omits_content(self) -> None:
         calls = []
 
@@ -974,7 +1437,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(compact_response.status_code, 200)
         compact = compact_response.json()
         self.assertTrue(compact["dify_compacted"])
-        self.assertLess(len(json.dumps(compact, ensure_ascii=False)), 80000)
+        self.assertLessEqual(compact["compact_pack_chars"], compact["hard_limit_chars"])
         self.assertEqual(compact["input_strategy"], "full_input")
         self.assertEqual(compact["primary_materials"][0]["attachments"][0]["summary"], long_attachment_summary)
         self.assertLessEqual(compact["dify_relevant_input_chars"], compact["full_input_max_chars"])
@@ -988,7 +1451,10 @@ class RecordsApiTests(unittest.TestCase):
         self.assertNotIn("声  明", guidance_text)
         self.assertIn("generation_warnings", guidance_text)
         self.assertEqual(full_response.status_code, 200)
-        self.assertGreater(len(json.dumps(full_response.json(), ensure_ascii=False)), 80000)
+        self.assertGreater(
+            len(json.dumps(full_response.json(), ensure_ascii=False)),
+            main_module._dify_input_thresholds()["full_input"] // 2,
+        )
 
     def test_dify_compact_preserves_single_primary_material_when_under_limit(self) -> None:
         content_text = "primary rules price enterprise execution " * 260
@@ -1354,14 +1820,20 @@ class RecordsApiTests(unittest.TestCase):
 
         compact = main_module._compact_evidence_pack_for_dify(pack)
 
-        self.assertGreater(compact["original_pack_chars"], 65000)
+        self.assertGreater(compact["original_pack_chars"], compact["full_input_max_chars"] // 3)
         self.assertEqual(compact["input_strategy"], "full_input")
         self.assertEqual(compact["input_strategy_type"], "size_based")
         self.assertEqual(compact["strategy_basis"], "dify_relevant_input_chars_within_full_input_threshold")
         self.assertTrue(compact["detail_preserved"])
-        self.assertFalse(compact["compression_applied"])
+        self.assertTrue(compact["compression_applied"])
+        self.assertFalse(compact["auxiliary_detail_preserved"])
+        self.assertIn("auxiliary_content_trimmed", compact["compression_reason"])
         self.assertEqual(compact["primary_materials"][0]["content_text"], content_text)
         self.assertEqual(compact["primary_materials"][0]["attachments"][0]["summary"], attachment_summary)
+        self.assertEqual(
+            compact["generation_guidance"]["detail_policy"],
+            "full_input_primary_preserved_auxiliary_compact",
+        )
         self.assertLessEqual(compact["dify_relevant_input_chars"], compact["full_input_max_chars"])
         self.assertNotIn("secondary_evidence_blocks", {item["type"] for item in compact["omitted_content"]})
 
@@ -1419,6 +1891,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(compact["final_dify_input_chars"], compact["compact_pack_chars"])
 
     def test_dify_input_uses_safe_compact_near_hard_limit_and_keeps_core_attachment(self) -> None:
+        thresholds = main_module._dify_input_thresholds()
         primary_text = "primary procurement rule deadline execution " * 900
         core_summary = "core attachment enterprise product selected price purchase volume " * 550
         aux_body = "auxiliary historical background should be compacted " * 800
@@ -1469,6 +1942,14 @@ class RecordsApiTests(unittest.TestCase):
             ],
             "generation_guidance": {},
         }
+        relevant_chars = main_module._dify_relevant_input_chars(
+            pack,
+            pack["primary_materials"],
+            pack["auxiliary_materials"],
+        )
+        target_chars = thresholds["safe_compact"] + (thresholds["hard_limit"] - thresholds["safe_compact"]) // 2
+        pack["primary_materials"][0]["content_text"] += "x" * max(0, target_chars - relevant_chars)
+        pack["primary_materials"][0]["content_text_length"] = len(pack["primary_materials"][0]["content_text"])
 
         compact = main_module._compact_evidence_pack_for_dify(pack)
 
@@ -1480,7 +1961,10 @@ class RecordsApiTests(unittest.TestCase):
         self.assertIn("auxiliary_content_trimmed", compact["compression_reason"])
         self.assertLessEqual(compact["compact_pack_chars"], compact["hard_limit_chars"])
         self.assertTrue(compact["primary_materials"][0]["attachments"][0]["table_summaries"])
-        self.assertLessEqual(len(compact["auxiliary_materials"][0]["content_text"]), 700)
+        self.assertLessEqual(
+            len(compact["auxiliary_materials"][0]["content_text"]),
+            compact["quality_budget"]["auxiliary_chars"],
+        )
         self.assertIn("auxiliary_content_tail", {item["type"] for item in compact["omitted_content"]})
         self.assertIn("safe_compact", compact["generation_guidance"]["detail_policy"])
 
@@ -1578,27 +2062,29 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertEqual(compact["input_strategy"], "staged_generation")
         self.assertEqual(compact["input_strategy_type"], "complexity_based")
-        self.assertEqual(compact["strategy_basis"], "multi_primary_materials")
+        self.assertEqual(compact["strategy_basis"], "dify_relevant_input_chars_exceeds_hard_limit")
         self.assertTrue(compact["compression_applied"])
         self.assertIn("staged_generation_complexity_compact", compact["compression_reason"])
-        self.assertLess(compact["compact_pack_chars"], 65000)
+        self.assertLessEqual(compact["compact_pack_chars"], compact["hard_limit_chars"])
+        self.assertLessEqual(compact["compact_pack_bytes"], compact["hard_limit_bytes"])
         self.assertIn("per_material_then_synthesis", compact["generation_guidance"]["generation_mode"])
         self.assertIn("3000-5000", compact["generation_guidance"]["target_report_length"])
 
-    def test_dify_input_marks_two_primary_pack_for_staged_generation(self) -> None:
+    def test_dify_input_keeps_two_small_primary_materials_in_full_input(self) -> None:
         pack = {
-            "pack_id": "pack_two_primary_staged",
+            "pack_id": "pack_two_primary_small",
             "primary_materials": [
-                {"menu_code": "m", "articleid": "p1", "title": "Primary 1", "content_text": "primary one " * 4000, "attachments": []},
-                {"menu_code": "m", "articleid": "p2", "title": "Primary 2", "content_text": "primary two " * 4000, "attachments": []},
+                {"menu_code": "m", "articleid": "p1", "title": "Primary 1", "content_text": "primary one " * 40, "attachments": []},
+                {"menu_code": "m", "articleid": "p2", "title": "Primary 2", "content_text": "primary two " * 40, "attachments": []},
             ],
             "auxiliary_materials": [],
         }
 
         compact = main_module._compact_evidence_pack_for_dify(pack)
 
-        self.assertEqual(compact["input_strategy"], "staged_generation")
-        self.assertEqual(main_module._dify_input_strategy_from_pack(pack), "staged_generation")
+        self.assertEqual(compact["input_strategy"], "full_input")
+        self.assertEqual(compact["strategy_basis"], "dify_relevant_input_chars_within_full_input_threshold")
+        self.assertEqual(main_module._dify_input_strategy_from_pack(pack), "full_input")
 
     def test_pack_diagnostics_marks_short_body_with_rich_core_attachment_as_attachment_led(self) -> None:
         pack = {
@@ -3998,7 +4484,7 @@ class RecordsApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
             main_module.os.environ,
             {
-                "DIFY_BASE_URL": "http://192.168.34.86/v1",
+                "DIFY_BASE_URL": "http://dify.invalid/v1",
                 "DIFY_WORKFLOW_API_KEY": "",
                 "DIFY_REPORT_WORKFLOW_ENDPOINT": "/workflows/run",
             },

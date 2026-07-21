@@ -14,7 +14,7 @@ DEFAULT_MODEL_PROVIDER = "langgenius/tongyi/tongyi"
 DEFAULT_MODEL_NAME = "qwen3-max-2025-09-23"
 DEFAULT_FAST_MODEL_PROVIDER = "langgenius/tongyi/tongyi"
 DEFAULT_FAST_MODEL_NAME = "qwen-plus-latest"
-DEFAULT_BACKEND_BASE_URL = "http://192.168.34.88:8099"
+DEFAULT_BACKEND_BASE_URL = "http://192.168.34.87:8099"
 
 
 def prompt(name: str) -> str:

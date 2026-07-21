@@ -353,7 +353,7 @@ workflow:
           write: 10
         title: Fetch Evidence Pack
         type: http-request
-        url: http://192.168.34.88:8099/analysis/packs/{{#start_node.pack_id#}}
+        url: http://192.168.34.87:8099/analysis/packs/{{#start_node.pack_id#}}?run_id={{#start_node.run_id#}}
         variables: []
       height: 128
       id: fetch_evidence_pack

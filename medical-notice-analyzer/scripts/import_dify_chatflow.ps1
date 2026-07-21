@@ -7,7 +7,7 @@ param(
     [string]$ModelName = "qwen3-max-2025-09-23",
     [string]$FastModelProvider = "langgenius/tongyi/tongyi",
     [string]$FastModelName = "qwen-plus-latest",
-    [string]$BackendBaseUrl = "http://192.168.34.88:8099",
+    [string]$BackendBaseUrl = "http://192.168.34.87:8099",
     [string]$PythonExe = "",
     [switch]$CreateDuplicate
 )
