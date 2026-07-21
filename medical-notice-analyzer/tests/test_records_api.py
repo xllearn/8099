@@ -551,6 +551,40 @@ class RecordsApiTests(unittest.TestCase):
         response_text = pack_response.text + diagnostics_response.text
         self.assertNotIn("不得出现在异常中的原始正文", response_text)
 
+    def test_analysis_run_diagnostics_returns_controlled_413_for_compaction_limit_error(self) -> None:
+        error = main_module.DifyEvidencePackLimitError(250001, 870401, 240000, 870400)
+        run = {
+            "run_id": "run_limit_error",
+            "pack_id": "pack_limit_error",
+            "status": "finished",
+        }
+        safe_pack = {
+            "pack_id": "pack_limit_error",
+            "primary_materials": [],
+            "auxiliary_materials": [],
+        }
+        expected_detail = {
+            "code": "dify_evidence_pack_limit_exceeded",
+            "chars": 250001,
+            "bytes": 870401,
+            "char_limit": 240000,
+            "byte_limit": 870400,
+        }
+
+        client = TestClient(main_module.app, raise_server_exceptions=False)
+        with patch.object(main_module, "_read_analysis_run", return_value=run), patch.object(
+            main_module, "_read_database_evidence_pack", return_value=safe_pack
+        ), patch.object(
+            main_module,
+            "_compact_evidence_pack_for_dify",
+            side_effect=error,
+        ):
+            response = client.get("/analysis/runs/run_limit_error/diagnostics")
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json(), {"detail": expected_detail})
+        self.assertNotIn("不得出现在异常中的原始正文", response.text)
+
     def test_records_list_filters_paginates_and_omits_content(self) -> None:
         calls = []
 

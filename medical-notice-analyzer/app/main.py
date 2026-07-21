@@ -8126,6 +8126,8 @@ def get_analysis_run_diagnostics(run_id: str) -> dict[str, Any]:
 
     try:
         dify_pack = _compact_evidence_pack_for_dify(pack) if pack else None
+    except DifyEvidencePackLimitError as exc:
+        raise _dify_limit_http_exception(exc) from exc
     except CompactPolicyError as exc:
         logger.warning("analysis_run_diagnostics_compaction_blocked run_id=%s pack_id=%s code=%s", run_id, pack_id, exc.code)
         return _analysis_error(422, exc.code, "evidence pack compact failed")
