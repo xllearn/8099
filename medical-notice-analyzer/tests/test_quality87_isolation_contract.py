@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+import yaml
 
 import app.main as main_module
 
@@ -84,15 +87,27 @@ class Quality87IsolationContractTests(unittest.TestCase):
                 self.assertNotIn("192.168.34.86", text)
                 self.assertNotIn("192.168.34.88", text)
 
-    def test_dify_fetch_callback_targets_quality87_and_keeps_run_id(self) -> None:
+    def test_dify_fetch_callback_targets_quality87_with_declared_pack_id_only(self) -> None:
         workflow = (PROJECT_ROOT / "dify_workflow_pack_id_human_style.yml").read_text(
             encoding="utf-8-sig"
         )
-
-        self.assertIn(
-            "http://192.168.34.87:8099/analysis/packs/{{#start_node.pack_id#}}?run_id={{#start_node.run_id#}}",
-            workflow,
+        data = yaml.safe_load(workflow)
+        nodes = data["workflow"]["graph"]["nodes"]
+        by_id = {node["id"]: node["data"] for node in nodes}
+        callback_url = by_id["fetch_evidence_pack"]["url"]
+        declared_start_variables = {
+            item["variable"] for item in by_id["start_node"]["variables"]
+        }
+        callback_start_refs = set(
+            re.findall(r"\{\{#start_node\.([A-Za-z0-9_]+)#\}\}", callback_url)
         )
+
+        self.assertEqual(
+            callback_url,
+            "http://192.168.34.87:8099/analysis/packs/{{#start_node.pack_id#}}",
+        )
+        self.assertEqual(callback_start_refs, {"pack_id"})
+        self.assertLessEqual(callback_start_refs, declared_start_variables)
         self.assertNotIn("192.168.34.86", workflow)
         self.assertNotIn("192.168.34.88", workflow)
 

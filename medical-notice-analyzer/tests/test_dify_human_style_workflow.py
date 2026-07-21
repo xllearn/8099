@@ -1,3 +1,4 @@
+import re
 import unittest
 from pathlib import Path
 
@@ -22,10 +23,17 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
         self.assertIn("report_memory", start_by_name)
         self.assertFalse(start_by_name["report_memory"]["required"])
         self.assertGreaterEqual(start_by_name["report_memory"]["max_length"], 15000)
-        self.assertEqual(
-            by_id["fetch_evidence_pack"]["url"],
-            "http://192.168.34.87:8099/analysis/packs/{{#start_node.pack_id#}}?run_id={{#start_node.run_id#}}",
+
+        callback_url = by_id["fetch_evidence_pack"]["url"]
+        callback_start_refs = set(
+            re.findall(r"\{\{#start_node\.([A-Za-z0-9_]+)#\}\}", callback_url)
         )
+        self.assertEqual(
+            callback_url,
+            "http://192.168.34.87:8099/analysis/packs/{{#start_node.pack_id#}}",
+        )
+        self.assertEqual(callback_start_refs, {"pack_id"})
+        self.assertLessEqual(callback_start_refs, set(start_by_name))
 
         for node_id in ["generate_report", "qa_report_first", "revise_report", "qa_revised_report"]:
             model_params = by_id[node_id]["model"]["completion_params"]
