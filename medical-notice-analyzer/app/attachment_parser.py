@@ -117,6 +117,7 @@ def _business_table_flags(headers: list[str]) -> dict[str, bool]:
 
 
 FIELD_COLUMN_KEYWORDS = {
+    "specification": ["specification", "spec", "model", "规格", "型号", "规格型号"],
     "enterprise": ["enterprise", "company", "manufacturer", "supplier", "distributor", "企业", "申报企业", "生产企业", "配送企业", "浼佷笟"],
     "product": ["product", "item", "goods", "耗材", "产品", "通用名", "项目名称", "浜у搧", "椤圭洰"],
     "registration_cert": ["registration", "certificate", "cert", "注册证", "备案号", "娉ㄥ唽璇", "澶囨"],
@@ -138,6 +139,47 @@ def _column_type_map(headers: list[str]) -> dict[str, list[str]]:
             if any(keyword.lower() in normalized_lower for keyword in keywords):
                 result[field].append(normalized)
     return result
+
+
+def table_column_map_is_usable(column_map: dict[str, int]) -> bool:
+    roles = set(column_map)
+    identity_roles = {"enterprise", "product", "registration_cert", "medical_insurance_code", "group"}
+    detail_roles = {
+        "product",
+        "specification",
+        "registration_cert",
+        "medical_insurance_code",
+        "price",
+        "purchase_volume",
+        "selected_status",
+        "region",
+        "group",
+    }
+    return (
+        len(roles) >= 2
+        and bool(roles & identity_roles)
+        and bool(roles & detail_roles)
+        and len(set(column_map.values())) == len(column_map)
+    )
+
+
+def resolve_table_column_map(headers: list[str]) -> tuple[dict[str, int], str]:
+    candidates = _column_type_map(headers)
+    resolved: dict[str, int] = {}
+    has_duplicate_match = False
+    for field, names in candidates.items():
+        matched_names = {str(name) for name in names if str(name)}
+        positions = [
+            index
+            for index, header in enumerate(headers)
+            if str(header) and str(header) in matched_names
+        ]
+        if len(positions) == 1:
+            resolved[field] = positions[0]
+        elif len(positions) > 1:
+            has_duplicate_match = True
+    mapping_status = "clear" if table_column_map_is_usable(resolved) and not has_duplicate_match else "ambiguous"
+    return resolved, mapping_status
 
 
 def _numeric_value(value: Any) -> float | None:
@@ -222,7 +264,7 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _clean_text(text: Any) -> str:
-    return re.sub(r"\s+", " ", str(text or "")).strip()
+    return re.sub(r"\s+", " ", str("" if text is None else text)).strip()
 
 
 def _section_summaries_from_text(text: str, *, per_topic_limit: int = 260) -> list[str]:
@@ -298,6 +340,7 @@ def _table_summary(
 ) -> dict[str, Any]:
     key_columns = _key_columns(headers)
     column_map = _column_type_map(headers)
+    resolved_column_map, mapping_status = resolve_table_column_map(headers)
     field_stats, stats_warnings = _field_stats(headers, data_rows or [], column_map)
     flags = _business_table_flags(headers)
     table_heavy = rows >= max(1, _int_env("TABLE_HEAVY_ROW_THRESHOLD", 5000))
@@ -317,6 +360,11 @@ def _table_summary(
         "selected_status_columns": column_map["selected_status"],
         "region_columns": column_map["region"],
         "group_columns": column_map["group"],
+        "resolved_column_map": resolved_column_map,
+        "mapping_status": mapping_status,
+        # Small handoff only: the model may inspect these source values but may
+        # never replace them. The final Dify payload keeps projected row values.
+        "source_rows": [list(row) for row in list(data_rows or [])[:40]],
         "sample_rows_count": sample_count,
         "summary": f"该表主要包含 {rows} 行、{columns} 列，关键字段包括：{', '.join(key_columns or headers[:6])}。",
         "business_value": default_business_value,
@@ -390,6 +438,7 @@ def _parse_docx(content: bytes) -> tuple[str, list[dict[str, Any]]]:
                 columns=len(headers),
                 headers=headers,
                 sample_count=max(0, min(len(rows) - header_index - 1, 20)),
+                data_rows=rows[header_index + 1 :],
                 default_business_value="可用于补充附件中的结构化规则或清单信息。",
             )
         )
@@ -528,23 +577,31 @@ def _parse_pdf(content: bytes) -> str:
 def _pdf_table_summaries(tables: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for table in tables:
-        matrix = list(table.get("matrix") or [])
+        matrix = [_row_values(row) for row in list(table.get("matrix") or [])]
         row_count = len(matrix)
         column_count = max((len(row) for row in matrix if isinstance(row, list)), default=0)
-        headers = [str(value or "") for value in (matrix[0] if matrix else [])]
-        summaries.append(
+        headers, header_index = _select_header_row(matrix)
+        summary = _table_summary(
+            sheet_name=f"PDF page {int(table.get('page_no') or 0)}",
+            rows=row_count,
+            columns=column_count,
+            headers=headers,
+            sample_count=max(0, min(row_count - header_index - 1, 20)),
+            default_business_value="Structured procurement table extracted from a PDF attachment.",
+            data_rows=matrix[header_index + 1 :],
+        )
+        summary.update(
             {
                 "sheet_name": f"PDF page {int(table.get('page_no') or 0)}",
                 "page_no": int(table.get("page_no") or 0),
                 "table_index": int(table.get("table_index") or 0),
                 "row_count": row_count,
                 "column_count": column_count,
-                "headers": headers,
                 "fingerprint": str(table.get("fingerprint") or ""),
-                "summary": f"Structured PDF table with {row_count} rows and {column_count} columns.",
                 "evidence_level": "C",
             }
         )
+        summaries.append(summary)
     return summaries
 
 

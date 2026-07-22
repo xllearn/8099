@@ -20,7 +20,7 @@ SUCCESS_STATUSES = {
     "unsupported",
 }
 FAILURE_STATUSES = {"download_failed", "network_unreachable", "parse_failed", "partial_parse", "temp_file_cleanup_failed"}
-PARSER_CACHE_VERSION = "20260715-structured-pdf-v1"
+PARSER_CACHE_VERSION = "20260722-row-handoff-v1"
 
 
 def _bool_env(name: str, default: bool = False) -> bool:

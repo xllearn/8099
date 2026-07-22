@@ -490,7 +490,8 @@ workflow:
 
 
             写作目标：生成接近人工报告的医药公告采购分析稿，而不是简单摘要。人工报告通常具备短标题、导语、主题化规则拆解、必要 Markdown 表格、企业关注点和清晰的企业执行影响。
-            必须遵守 evidence_pack.generation_guidance 中的 input_strategy、target_report_length、detail_policy、generation_mode、mandatory_sections 和 detail_instruction。
+            必须遵守 evidence_pack.generation_guidance 中的全部约束，包括 input_strategy、target_report_length、detail_policy、generation_mode、mandatory_sections、detail_instruction、self_contained_report_rule、large_row_detail_rule 和 source_trace_visibility_rule。
+            最终报告必须自包含；企业、产品、规格、需求量和价格明细过多时，只在正文展示有依据的代表性原始行。不得生成附录，不得引导读者查阅附件，不得在正文输出页码、表号、行列号或列索引。
             如果 input_strategy=full_input，说明输入证据量较小，不要主动压缩正文、附件摘要、附件表格摘要、产品/价格字段或操作步骤；报告篇幅应来自事实覆盖和证据支撑型分析。
             如果 input_strategy=light_compact，只能压缩重复模板和低价值噪声，仍要保留核心规则、操作步骤、表格列名、产品范围和价格字段。
             如果 input_strategy=staged_generation，需要先按每个主材料和核心附件拆解，再综合成最终报告；辅助材料只作背景，不能覆盖主材料结论。
