@@ -216,6 +216,7 @@ def reduce_optional_evidence(
     *,
     target_ceiling_chars: int,
     baseline_items: Iterable[dict[str, Any]] | None = None,
+    mandatory_fields_limit_chars: int = MANDATORY_FIELDS_LIMIT,
 ) -> dict[str, Any]:
     target = max(1_000, int(target_ceiling_chars))
     original = copy.deepcopy(pack)
@@ -229,11 +230,16 @@ def reduce_optional_evidence(
     mandatory_ids = _mandatory_dependency_closure(baseline)
     mandatory_items = [item for item in baseline if str(item.get("evidence_id") or "") in mandatory_ids]
     mandatory_chars = json_chars({"evidence_schema_version": 2, "evidence_items": mandatory_items})
-    if mandatory_chars > min(MANDATORY_FIELDS_LIMIT, target):
+    mandatory_limit = min(max(1_000, int(mandatory_fields_limit_chars)), target)
+    if mandatory_chars > mandatory_limit:
         raise CompactPolicyError(
             "COMPACT_MANDATORY_FIELDS_OVER_LIMIT",
             "mandatory evidence fields exceed the compact input allowance",
-            metrics={"mandatory_chars": mandatory_chars, "target_ceiling_chars": target},
+            metrics={
+                "mandatory_chars": mandatory_chars,
+                "mandatory_limit_chars": mandatory_limit,
+                "target_ceiling_chars": target,
+            },
         )
 
     protected_ids = _protected_evidence_ids(items)

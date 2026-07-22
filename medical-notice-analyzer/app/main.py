@@ -43,6 +43,7 @@ from pypdf import PdfReader
 from app.attachment_cache import cleanup_cache, load_cached_result, store_cached_result
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
+from app.evidence_summary_llm import enrich_evidence_pack_summaries
 from app.attachment_task_process import (
     AttachmentTaskProcessError,
     AttachmentTaskProcessTimeout,
@@ -51,7 +52,6 @@ from app.attachment_task_process import (
 from app.pdf_table_parser import rule_version as pdf_table_rule_version
 from app.compact_pack import (
     CompactPolicyError,
-    DEFAULT_HARD_LIMIT as VBP_COMPACT_HARD_LIMIT,
     annotate_secondary_compression,
     mandatory_evidence_retention,
     protected_evidence_items,
@@ -761,7 +761,7 @@ def health() -> dict[str, Any]:
         "run_checkpoints_enabled": _analysis_checkpoints_enabled(),
         "run_recovery_enabled": _analysis_recovery_enabled(),
         "compact_cache_enabled": compact_cache_enabled(),
-        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
+        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260722-new87-240k-min-v1").strip(),
         "site_cache_dir_configured": bool((os.getenv("SITE_CACHE_DIR") or "").strip()),
         "max_attachment_bytes": MAX_ATTACHMENT_BYTES,
     }
@@ -1630,12 +1630,23 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
             continue
         summary = str(table.get("summary") or "")
         business_value = str(table.get("business_value") or "")
+        headers = list(table.get("headers") or [])
+        semantic_map = table.get("semantic_column_map") if isinstance(table.get("semantic_column_map"), dict) else {}
+        semantic_indexes: list[int] = []
+        for raw_index in semantic_map.values():
+            try:
+                index = int(raw_index)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index < len(headers):
+                semantic_indexes.append(index)
+        effective_header_limit = max(table_header_limit, max(semantic_indexes, default=-1) + 1)
         table_summaries.append(
             {
                 "sheet_name": table.get("sheet_name") or "",
                 "rows": table.get("rows") or 0,
                 "columns_count": table.get("columns_count") or 0,
-                "headers": list(table.get("headers") or [])[:table_header_limit],
+                "headers": headers[:effective_header_limit],
                 "key_columns": list(table.get("key_columns") or [])[:table_key_column_limit],
                 "enterprise_columns": list(table.get("enterprise_columns") or [])[:table_key_column_limit],
                 "product_columns": list(table.get("product_columns") or [])[:table_key_column_limit],
@@ -1656,6 +1667,10 @@ def _compact_attachment_for_dify(attachment: dict[str, Any], *, role: str = "pri
                 "contains_purchase_volume": bool(table.get("contains_purchase_volume")),
                 "table_heavy": bool(table.get("table_heavy") or _table_summary_is_heavy(table)),
                 "field_stats": copy.deepcopy(table.get("field_stats") or {}),
+                "semantic_summary": _limit_text(table.get("semantic_summary"), table_summary_limit),
+                "semantic_column_map": copy.deepcopy(table.get("semantic_column_map") or {}),
+                "semantic_summary_source": table.get("semantic_summary_source") or "",
+                "row_values": copy.deepcopy(list(table.get("row_values") or [])[:40]),
                 "evidence_value_score": int(table.get("evidence_value_score") or 0),
                 "data_completeness_hint": table.get("data_completeness_hint") or "",
                 "recommended_report_usage": table.get("recommended_report_usage") or (
@@ -2336,11 +2351,22 @@ def _profile_table_summary_for_dify(
     field_stats_field_limit: int = 0,
     minimal_table: bool = False,
 ) -> dict[str, Any]:
+    headers = list(table.get("headers") or [])
+    semantic_map = table.get("semantic_column_map") if isinstance(table.get("semantic_column_map"), dict) else {}
+    semantic_indexes: list[int] = []
+    for raw_index in semantic_map.values():
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= index < len(headers):
+            semantic_indexes.append(index)
+    effective_header_limit = max(header_limit, max(semantic_indexes, default=-1) + 1)
     compact = {
         "sheet_name": table.get("sheet_name") or "",
         "rows": table.get("rows") or 0,
         "columns_count": table.get("columns_count") or 0,
-        "headers": list(table.get("headers") or [])[:header_limit],
+        "headers": headers[:effective_header_limit],
         "key_columns": list(table.get("key_columns") or [])[:key_column_limit],
         "enterprise_columns": list(table.get("enterprise_columns") or [])[: max(4, key_column_limit // 2)],
         "product_columns": list(table.get("product_columns") or [])[: max(4, key_column_limit // 2)],
@@ -2369,6 +2395,10 @@ def _profile_table_summary_for_dify(
         ),
         "summary": _limit_text(table.get("summary"), summary_limit),
         "business_value": _limit_text(table.get("business_value"), business_limit),
+        "semantic_summary": _limit_text(table.get("semantic_summary"), summary_limit),
+        "semantic_column_map": copy.deepcopy(table.get("semantic_column_map") or {}),
+        "semantic_summary_source": table.get("semantic_summary_source") or "",
+        "row_values": copy.deepcopy(list(table.get("row_values") or [])[:40]),
     }
     if keep_field_stats:
         compact["field_stats"] = copy.deepcopy(table.get("field_stats") or {})
@@ -2404,6 +2434,10 @@ def _profile_table_summary_for_dify(
             "evidence_value_score",
             "summary",
             "business_value",
+            "semantic_summary",
+            "semantic_column_map",
+            "semantic_summary_source",
+            "row_values",
         }
         compact = {key: value for key, value in compact.items() if key in allowed_keys}
     return compact
@@ -2947,7 +2981,7 @@ def _compact_for_dify_hard_limit_second_pass(
             _omitted_content_entry(
                 "hard_limit_attachment_detail_compacted",
                 reason="二次压缩 attachment_summaries 后仍超过 Dify 变量限制，已进一步压缩附件 summary、important_sections 和 table_summaries。",
-                risk="附件细节只保留报告必要字段，产品级逐行核验需人工打开附件。",
+                risk="未进入证据包的产品级逐行明细不得作为本次报告事实。",
                 manual_review=True,
                 affects_core_attachment_detail=True,
             )
@@ -3051,11 +3085,6 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
     hard_limit_bytes = thresholds["hard_limit_bytes"]
     compact_preservation_enabled = _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False)
     target_max_chars = hard_limit if max_chars is None else min(hard_limit, max(1, int(max_chars)))
-    vbp_enforcement_limit = (
-        min(target_max_chars, VBP_COMPACT_HARD_LIMIT)
-        if max_chars is None and compact_preservation_enabled
-        else target_max_chars
-    )
     dify_relevant_input_chars, dify_relevant_input_bytes = _dify_relevant_input_sizes(
         pack,
         primary_source,
@@ -3198,7 +3227,7 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
             _omitted_content_entry(
                 "attachment_full_text",
                 reason="附件全文和 Excel 全量行数据不进入 Dify，仅保留摘要、关键事实、字段统计和结构化表格信息。",
-                risk="模型不能逐行核验未输入的附件明细；涉及产品级核验时需人工打开附件。",
+                risk="模型不能逐行核验未输入的明细，报告只能使用当前证据包内的事实。",
                 manual_review=input_strategy in {"safe_compact", "table_heavy", "staged_generation"},
                 affects_core_attachment_detail=False,
             )
@@ -3225,7 +3254,7 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
             _omitted_content_entry(
                 "excel_full_rows",
                 reason="表格行数较多，未将全量行输入 Dify，仅保留字段结构、统计摘要和样例值。",
-                risk="模型无法逐行核验全部产品明细，如需精确产品级核验应人工打开附件。",
+                risk="模型无法逐行核验全部产品明细，报告只能展示当前证据包内有依据的代表性原始行。",
                 manual_review=True,
                 affects_core_attachment_detail=False,
             )
@@ -3550,10 +3579,6 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
         break
     first_stage_chars = _refresh_dify_char_fields(compact)
     first_stage_evidence_items = copy.deepcopy(compact.get("evidence_items") or [])
-    if compact_preservation_enabled and first_stage_chars > vbp_enforcement_limit:
-        target_max_chars = vbp_enforcement_limit
-        compact["target_max_chars"] = target_max_chars
-        first_stage_chars = _refresh_dify_char_fields(compact)
     if first_stage_chars > target_max_chars:
         if compact_preservation_enabled:
             compact["evidence_items"] = protected_evidence_items(first_stage_evidence_items)
@@ -3588,6 +3613,7 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
                     compact,
                     target_ceiling_chars=int(plan["target_ceiling_chars"]),
                     baseline_items=first_stage_evidence_items,
+                    mandatory_fields_limit_chars=max(1_000, target_max_chars - 1_000),
                 )
             retention = mandatory_evidence_retention(first_stage_evidence_items, compact)
             compact["mandatory_evidence_retention"] = retention
@@ -3689,6 +3715,7 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
                 compact,
                 target_ceiling_chars=final_vbp_ceiling,
                 baseline_items=first_stage_evidence_items,
+                mandatory_fields_limit_chars=max(1_000, target_max_chars - 1_000),
             )
             retention = mandatory_evidence_retention(first_stage_evidence_items, compact)
             compact["mandatory_evidence_retention"] = retention
@@ -3872,7 +3899,7 @@ def _compact_evidence_pack_for_dify_uncached(pack: dict[str, Any], max_chars: in
 
 def _compact_cache_version_context(pack: dict[str, Any], target_max_chars: int) -> dict[str, Any]:
     return {
-        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260716-s3c-v1").strip(),
+        "compact_rule_version": (os.getenv("COMPACT_RULE_VERSION") or "20260722-new87-240k-min-v1").strip(),
         "pack_version": str(pack.get("pack_version") or ""),
         "evidence_schema_version": pack.get("evidence_schema_version"),
         "source_evidence_schema_version": pack.get("source_evidence_schema_version"),
@@ -6913,6 +6940,7 @@ def _build_database_evidence_pack_impl(
     if pdf_table_items:
         pack["evidence_items"] = [*list(pack.get("evidence_items") or []), *copy.deepcopy(pdf_table_items)]
         pack = validate_evidence_pack(pack)
+    pack = enrich_evidence_pack_summaries(pack)
     if vbp_fact_extraction_enabled():
         pack = enrich_vbp_facts(pack)
     pack.pop("source_evidence_schema_version", None)
@@ -9209,7 +9237,7 @@ def _build_evidence_pack(
         tables_summary.extend(table_summaries)
         attachment_warnings = list(attachment.get("warnings") or [])
         if any((summary.get("row_count") or 0) > 30_000 for summary in table_summaries):
-            attachment_warnings.append("大表已结构化摘要，完整明细以原始附件为准。")
+            attachment_warnings.append("大表已结构化摘要，报告仅使用当前输入的结构化信息和代表性原始行。")
         summary_text = _summarize_attachment_text(str(attachment.get("text") or ""))
         attachment_items.append(
             {
@@ -9304,7 +9332,7 @@ def _summarize_table(table: dict[str, Any], source_ref: str) -> dict[str, Any]:
     if row_count > 5_000:
         warnings.append("超过5000行的大表已仅保留摘要、统计、关键行和业务口径。")
     if row_count > 30_000:
-        warnings.append("大表已结构化摘要，完整明细以原始附件为准。")
+        warnings.append("大表已结构化摘要，报告仅使用当前输入的结构化信息和代表性原始行。")
     price_values = _detect_price_values(headers, body)
     important_rows = _select_important_rows(headers, body, limit=50 if row_count <= 30_000 else 20)
     return {
