@@ -18,6 +18,9 @@ STEP_DEFINITIONS = [
     ("final_output", "完成输出"),
 ]
 
+DIFY_PACK_NEAR_LIMIT_CHARS = 220_000
+DIFY_PACK_HARD_LIMIT_CHARS = 240_000
+
 
 def _text(value: Any) -> str:
     return value if isinstance(value, str) else ""
@@ -421,12 +424,12 @@ def build_pack_diagnostics(pack: dict[str, Any], dify_pack: dict[str, Any] | Non
                 "辅助材料字数明显超过主材料，应避免报告反客为主。",
             )
         )
-    if dify_compact_pack_chars > 75000:
+    if dify_compact_pack_chars > DIFY_PACK_NEAR_LIMIT_CHARS:
         diagnosis.append(
             _diagnosis(
                 "DIFY_PACK_NEAR_LIMIT",
                 "warning",
-                "传给 Dify 的精简证据包接近 80000 字符限制，后续可能需要进一步压缩。",
+                f"传给 Dify 的精简证据包接近 {DIFY_PACK_HARD_LIMIT_CHARS} 字符限制，后续可能需要进一步压缩。",
             )
         )
     if dify_compact_pack_chars and full_pack_chars > dify_compact_pack_chars * 1.2:
