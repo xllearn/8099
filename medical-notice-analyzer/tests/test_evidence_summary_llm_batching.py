@@ -35,8 +35,18 @@ class EvidenceSummaryLlmBatchingTests(unittest.TestCase):
         with patch.object(summary, "_request_summaries", side_effect=fake_request):
             result = summary._request_summaries_batched(_tables(6))
 
-        self.assertEqual([4, 1, 2], [len(batch) for batch in calls])
-        self.assertEqual({f"table-{index}" for index in range(6)}, set(result))
+        self.assertEqual(
+            [
+                ["table-0", "table-1", "table-2", "table-3"],
+                ["table-2"],
+                ["table-4", "table-5"],
+            ],
+            calls,
+        )
+        self.assertEqual(
+            {f"table-{index}": _result(f"table-{index}") for index in range(6)},
+            result,
+        )
 
     def test_stops_after_completely_empty_batch(self):
         calls: list[list[str]] = []
@@ -50,6 +60,31 @@ class EvidenceSummaryLlmBatchingTests(unittest.TestCase):
 
         self.assertEqual({}, result)
         self.assertEqual([4], [len(batch) for batch in calls])
+
+    def test_stops_after_later_empty_batch_without_discarding_prior_results(self):
+        calls: list[list[str]] = []
+
+        def fake_request(tables: list[dict[str, str]]) -> dict[str, dict[str, object]]:
+            table_ids = [table["table_id"] for table in tables]
+            calls.append(table_ids)
+            if len(calls) == 1:
+                return {table_id: _result(table_id) for table_id in table_ids}
+            return {}
+
+        with patch.object(summary, "_request_summaries", side_effect=fake_request):
+            result = summary._request_summaries_batched(_tables(12))
+
+        self.assertEqual(
+            [
+                ["table-0", "table-1", "table-2", "table-3"],
+                ["table-4", "table-5", "table-6", "table-7"],
+            ],
+            calls,
+        )
+        self.assertEqual(
+            {f"table-{index}": _result(f"table-{index}") for index in range(4)},
+            result,
+        )
 
 
 if __name__ == "__main__":
