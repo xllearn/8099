@@ -642,6 +642,31 @@ workflow:
                 type: array
                 items:
                   type: object
+                  properties:
+                    issue_id:
+                      type: string
+                    severity:
+                      type: string
+                      enum:
+                      - fatal
+                      - high
+                      - major
+                      - minor
+                    problem_type:
+                      type: string
+                    report_text:
+                      type: string
+                    source_basis:
+                      type: string
+                    fix_instruction:
+                      type: string
+                  required:
+                  - issue_id
+                  - severity
+                  - problem_type
+                  - report_text
+                  - source_basis
+                  - fix_instruction
             required:
             - passed
             - round
@@ -670,75 +695,86 @@ workflow:
               import json
               import re
 
-              def extract_json(text):
-                  text = (text or "").strip()
-                  text = re.sub(r"^```(?:json)?\s*", "", text)
-                  text = re.sub(r"\s*```$", "", text)
-                  start = text.find("{")
-                  if start < 0:
-                      raise ValueError("JSON object not found")
-                  depth = 0
-                  in_string = False
-                  escape = False
-                  for index in range(start, len(text)):
-                      char = text[index]
-                      if in_string:
-                          if escape:
-                              escape = False
-                          elif char == "\\":
-                              escape = True
-                          elif char == '"':
-                              in_string = False
-                          continue
-                      if char == '"':
-                          in_string = True
-                      elif char == "{":
-                          depth += 1
-                      elif char == "}":
-                          depth -= 1
-                          if depth == 0:
-                              return json.loads(text[start:index + 1])
-                  raise ValueError("JSON object not closed")
+              fields = (
+                  "issue_id",
+                  "severity",
+                  "problem_type",
+                  "report_text",
+                  "source_basis",
+                  "fix_instruction",
+              )
+              errors = []
+
+              def add_error(detail):
+                  if detail not in errors:
+                      errors.append(detail)
 
               try:
-                  data = extract_json(quality_text)
-              except Exception as exc:
-                  data = {
-                      "passed": False,
-                      "round": 1,
-                      "issues": [{
-                          "issue_id": "Q_PARSE",
-                          "severity": "fatal",
-                          "problem_type": "quality_json_parse_failed",
-                          "report_text": "",
-                          "source_basis": "",
-                          "fix_instruction": str(exc),
-                      }],
-                  }
-              if not isinstance(data, dict):
+                  if not isinstance(quality_text, str):
+                      raise ValueError("quality response must be text")
+                  text = quality_text.strip()
+                  if text.startswith("```"):
+                      text = re.sub(r"^```(?:json)?[ \t]*\r?\n?", "", text, count=1, flags=re.IGNORECASE)
+                      text = re.sub(r"\r?\n?```[ \t]*$", "", text).strip()
+                  if not text.startswith("{"):
+                      raise ValueError("quality response must start with an object")
+                  data = json.loads(text)
+                  if not isinstance(data, dict):
+                      raise ValueError("quality response must be an object")
+              except Exception:
                   data = {}
+                  add_error("quality JSON must be an object")
+
+              passed_candidate = data.get("passed") is True
+              if not isinstance(data.get("passed"), bool):
+                  add_error("passed must be boolean")
+              round_value = data.get("round")
+              if isinstance(round_value, bool) or not isinstance(round_value, int):
+                  add_error("round must be integer")
+                  round_value = 1
               raw_issues = data.get("issues")
               if not isinstance(raw_issues, list):
+                  add_error("issues must be array")
                   raw_issues = []
+
               issues = []
               for index, raw_issue in enumerate(raw_issues, start=1):
                   if not isinstance(raw_issue, dict):
+                      add_error("issues[%d] must be object" % index)
                       continue
-                  severity = str(raw_issue.get("severity") or "minor").lower()
+                  if raw_issue.get("issue_id") == "Q_PARSE":
+                      add_error("issue_id Q_PARSE is reserved")
+                      continue
+                  invalid_fields = [field for field in fields if not isinstance(raw_issue.get(field), str)]
+                  if invalid_fields:
+                      add_error("issues[%d] has invalid fields" % index)
+                      continue
+                  severity = raw_issue["severity"].strip().lower()
                   if severity not in {"fatal", "high", "major", "minor"}:
-                      severity = "minor"
+                      add_error("issues[%d] has invalid severity" % index)
+                      continue
                   issues.append({
-                      "issue_id": str(raw_issue.get("issue_id") or "Q%03d" % index),
+                      "issue_id": raw_issue["issue_id"],
                       "severity": severity,
-                      "problem_type": str(raw_issue.get("problem_type") or "unspecified"),
-                      "report_text": str(raw_issue.get("report_text") or ""),
-                      "source_basis": str(raw_issue.get("source_basis") or ""),
-                      "fix_instruction": str(raw_issue.get("fix_instruction") or ""),
+                      "problem_type": raw_issue["problem_type"],
+                      "report_text": raw_issue["report_text"],
+                      "source_basis": raw_issue["source_basis"],
+                      "fix_instruction": raw_issue["fix_instruction"],
+                  })
+
+              if errors:
+                  issues.append({
+                      "issue_id": "Q_PARSE",
+                      "severity": "fatal",
+                      "problem_type": "quality_contract_invalid",
+                      "report_text": "",
+                      "source_basis": "",
+                      "fix_instruction": "; ".join(errors[:4])[:160],
                   })
               blocking = any(issue["severity"] in {"fatal", "high", "major"} for issue in issues)
               data = {
-                  "passed": bool(data.get("passed")) and not blocking,
-                  "round": 1,
+                  "passed": passed_candidate and not errors and not blocking,
+                  "round": round_value,
                   "issues": issues,
               }
               return {
@@ -779,29 +815,95 @@ workflow:
         code: |
           def main(pack_id: str, generation_json: str, quality_json: str) -> dict:
               import json
+
+              def fatal_issue(issue_id, problem_type, detail):
+                  return {
+                      "issue_id": issue_id,
+                      "severity": "fatal",
+                      "problem_type": problem_type,
+                      "report_text": "",
+                      "source_basis": "",
+                      "fix_instruction": detail[:160],
+                  }
+
+              generation_issues = []
               try:
-                  generation = json.loads(generation_json or "{}")
+                  generation = json.loads(generation_json)
               except Exception:
                   generation = {}
+                  generation_issues.append(fatal_issue("Q_GENERATION_PARSE", "generation_json_parse_failed", "generation JSON could not be decoded"))
+              if not isinstance(generation, dict):
+                  generation = {}
+                  generation_issues.append(fatal_issue("Q_GENERATION_PARSE", "generation_json_not_object", "generation JSON must be an object"))
+
+              generation_contract_errors = []
+              version_value = generation.get("version")
+              if isinstance(version_value, bool) or not isinstance(version_value, int) or not 1 <= version_value <= 999:
+                  version_value = 1
+                  generation_contract_errors.append("version must be an integer from 1 to 999")
+              report_title = generation.get("report_title")
+              if not isinstance(report_title, str):
+                  report_title = ""
+                  generation_contract_errors.append("report_title must be string")
+              report_markdown = generation.get("report_markdown")
+              if not isinstance(report_markdown, str):
+                  report_markdown = ""
+                  generation_contract_errors.append("report_markdown must be string")
+              elif not report_markdown.strip():
+                  generation_contract_errors.append("report_markdown must be non-empty")
+              generation_warnings = generation.get("generation_warnings")
+              if not isinstance(generation_warnings, list):
+                  generation_warnings = []
+                  generation_contract_errors.append("generation_warnings must be array")
+              if generation_contract_errors:
+                  generation_issues.append(fatal_issue(
+                      "Q_GENERATION_CONTRACT",
+                      "generation_contract_invalid",
+                      "; ".join(generation_contract_errors[:4]),
+                  ))
+
+              quality_issues = []
+              quality_errors = []
               try:
-                  quality = json.loads(quality_json or "{}")
+                  quality = json.loads(quality_json)
               except Exception:
-                  quality = {"passed": False, "issues": []}
+                  quality = {}
+                  quality_errors.append("quality JSON could not be decoded")
               if not isinstance(quality, dict):
-                  quality = {"passed": False, "issues": []}
-              issues = quality.get("issues")
-              if not isinstance(issues, list):
-                  issues = []
-              passed = bool(quality.get("passed"))
-              remaining = [] if passed else issues
+                  quality = {}
+                  quality_errors.append("quality JSON must be an object")
+              raw_quality_issues = quality.get("issues")
+              if not isinstance(raw_quality_issues, list):
+                  raw_quality_issues = []
+                  quality_errors.append("quality issues must be array")
+              else:
+                  quality_issues = raw_quality_issues
+              quality_passed = quality.get("passed") is True
+              if not isinstance(quality.get("passed"), bool):
+                  quality_errors.append("quality passed must be boolean")
+              if quality_errors:
+                  quality_issues.append(fatal_issue("Q_PARSE", "quality_contract_invalid", "; ".join(quality_errors[:4])))
+                  quality_passed = False
+              blocking_quality_issue = any(
+                  isinstance(issue, dict)
+                  and isinstance(issue.get("severity"), str)
+                  and issue.get("severity").strip().lower() in {"fatal", "high", "major"}
+                  for issue in quality_issues
+              )
+              passed = quality_passed and not blocking_quality_issue and not generation_issues
+              combined_issues = generation_issues + quality_issues
+              normalized_quality = dict(quality)
+              normalized_quality["passed"] = passed
+              normalized_quality["issues"] = combined_issues
+              remaining = [] if passed else combined_issues
               result = {
                   "status": "finished" if passed else "needs_manual_review",
                   "pack_id": pack_id,
-                  "report_title": generation.get("report_title") or "",
-                  "report_markdown": generation.get("report_markdown") or "",
-                  "version": int(generation.get("version") or 1),
-                  "quality_check": quality,
-                  "generation_warnings": generation.get("generation_warnings") or [],
+                  "report_title": report_title,
+                  "report_markdown": report_markdown,
+                  "version": version_value,
+                  "quality_check": normalized_quality,
+                  "generation_warnings": generation_warnings,
                   "remaining_issues": remaining,
               }
               return {
@@ -811,8 +913,8 @@ workflow:
                   "report_title": result["report_title"],
                   "report_markdown": result["report_markdown"],
                   "version": str(result["version"]),
-                  "quality_check": json.dumps(quality, ensure_ascii=False),
-                  "generation_warnings": json.dumps(result["generation_warnings"], ensure_ascii=False),
+                  "quality_check": json.dumps(normalized_quality, ensure_ascii=False),
+                  "generation_warnings": json.dumps(generation_warnings, ensure_ascii=False),
                   "remaining_issues": json.dumps(remaining, ensure_ascii=False),
               }
         code_language: python3

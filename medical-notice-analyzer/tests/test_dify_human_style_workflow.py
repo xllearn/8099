@@ -38,6 +38,13 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
             self.assertEqual(model_params.get("response_format"), "json_object")
             self.assertTrue(by_id[node_id]["structured_output"]["enabled"])
 
+        issue_schema = by_id["qa_report_first"]["structured_output"]["schema"]["properties"]["issues"]["items"]
+        self.assertEqual(
+            issue_schema["required"],
+            ["issue_id", "severity", "problem_type", "report_text", "source_basis", "fix_instruction"],
+        )
+        self.assertEqual(issue_schema["properties"]["severity"]["enum"], ["fatal", "high", "major", "minor"])
+
         generation_prompt = "\n".join(item.get("text", "") for item in by_id["generate_report"]["prompt_template"])
         qa_prompt = "\n".join(item.get("text", "") for item in by_id["qa_report_first"]["prompt_template"])
 
@@ -73,6 +80,7 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
         self.assertTrue(removed_ids.isdisjoint(by_id))
 
         edge_pairs = {(edge["source"], edge["target"]) for edge in edges}
+        self.assertTrue(all(edge["source"] in by_id and edge["target"] in by_id for edge in edges))
         self.assertTrue(
             {
                 ("parse_generation_json", "qa_report_first"),
@@ -96,6 +104,7 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
                     "report_title": "浙江采购公告分析",
                     "report_markdown": initial_report,
                     "version": 1,
+                    "generation_warnings": [],
                 },
                 ensure_ascii=False,
             ),
@@ -126,8 +135,16 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
             json.dumps(
                 {
                     "passed": True,
+                    "round": 1,
                     "issues": [
-                        {"issue_id": "Q001", "severity": "major", "problem_type": "unsupported_claim"},
+                        {
+                            "issue_id": "Q001",
+                            "severity": "major",
+                            "problem_type": "unsupported_claim",
+                            "report_text": "",
+                            "source_basis": "",
+                            "fix_instruction": "",
+                        },
                     ],
                 },
                 ensure_ascii=False,
@@ -137,6 +154,100 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
 
         self.assertFalse(quality["passed"])
         self.assertEqual(quality["issues"][0]["issue_id"], "Q001")
+
+    def test_parse_quality_fails_closed_on_malformed_contracts(self) -> None:
+        _, by_id, _ = self._load_workflow()
+        namespace: dict[str, object] = {}
+        exec(by_id["parse_quality_json"]["code"], namespace)
+
+        valid_issue = {
+            "issue_id": "Q001",
+            "severity": "minor",
+            "problem_type": "style",
+            "report_text": "",
+            "source_basis": "",
+            "fix_instruction": "",
+        }
+        malformed_payloads = [
+            {"passed": "false", "round": 1, "issues": []},
+            [{"passed": True, "round": 1, "issues": []}],
+            {"passed": True, "round": 1, "issues": {}},
+            {"passed": True, "round": 1, "issues": ["not an object"]},
+            {"passed": True, "round": 1, "issues": [{**valid_issue, "severity": "unknown"}]},
+        ]
+        for payload in malformed_payloads:
+            output = namespace["main"](json.dumps(payload, ensure_ascii=False))
+            quality = json.loads(output["quality_json"])
+            self.assertFalse(quality["passed"])
+            self.assertEqual(sum(issue["issue_id"] == "Q_PARSE" for issue in quality["issues"]), 1)
+
+        severe_output = namespace["main"](
+            json.dumps({"passed": True, "round": 1, "issues": [{**valid_issue, "severity": " major "}]}, ensure_ascii=False)
+        )
+        severe_quality = json.loads(severe_output["quality_json"])
+        self.assertEqual(severe_quality["issues"][0]["severity"], "major")
+        self.assertFalse(severe_quality["passed"])
+
+        minor_output = namespace["main"](
+            json.dumps({"passed": True, "round": 1, "issues": [valid_issue]}, ensure_ascii=False)
+        )
+        self.assertTrue(json.loads(minor_output["quality_json"])["passed"])
+
+    def test_final_result_fails_closed_and_preserves_valid_initial_bytes(self) -> None:
+        _, by_id, _ = self._load_workflow()
+        namespace: dict[str, object] = {}
+        exec(by_id["final_initial_result"]["code"], namespace)
+
+        valid_quality = json.dumps({"passed": True, "round": 1, "issues": []}, ensure_ascii=False)
+        malformed_generations = [
+            json.dumps([], ensure_ascii=False),
+            json.dumps("not an object", ensure_ascii=False),
+            json.dumps({"version": "v1", "report_title": "标题", "report_markdown": "正文", "generation_warnings": []}, ensure_ascii=False),
+            json.dumps({"version": 1, "report_title": "标题", "report_markdown": "   ", "generation_warnings": []}, ensure_ascii=False),
+            json.dumps({"version": 1, "report_title": "标题", "report_markdown": ["正文"], "generation_warnings": []}, ensure_ascii=False),
+        ]
+        for generation_json in malformed_generations:
+            output = namespace["main"]("pack", generation_json, valid_quality)
+            result = json.loads(output["result"])
+            self.assertEqual(result["status"], "needs_manual_review")
+            self.assertEqual(result["version"], 1)
+            self.assertTrue(any(issue["severity"] == "fatal" for issue in result["remaining_issues"]))
+
+        quality_not_object = namespace["main"](
+            "pack",
+            json.dumps({"version": 1, "report_title": "标题", "report_markdown": "正文", "generation_warnings": []}, ensure_ascii=False),
+            json.dumps([], ensure_ascii=False),
+        )
+        quality_result = json.loads(quality_not_object["result"])
+        self.assertEqual(quality_result["status"], "needs_manual_review")
+        self.assertTrue(any(issue["issue_id"] == "Q_PARSE" for issue in quality_result["remaining_issues"]))
+
+        quality_non_list = namespace["main"](
+            "pack",
+            json.dumps({"version": 1, "report_title": "标题", "report_markdown": "正文", "generation_warnings": []}, ensure_ascii=False),
+            json.dumps({"passed": True, "issues": {}}, ensure_ascii=False),
+        )
+        quality_non_list_result = json.loads(quality_non_list["result"])
+        self.assertEqual(quality_non_list_result["status"], "needs_manual_review")
+        self.assertTrue(any(issue["issue_id"] == "Q_PARSE" for issue in quality_non_list_result["remaining_issues"]))
+
+        initial_report = "  ## 初稿\n保留原始空白  \n"
+        valid_output = namespace["main"](
+            "pack",
+            json.dumps(
+                {
+                    "version": 1,
+                    "report_title": "标题",
+                    "report_markdown": initial_report,
+                    "generation_warnings": [],
+                },
+                ensure_ascii=False,
+            ),
+            valid_quality,
+        )
+        valid_result = json.loads(valid_output["result"])
+        self.assertEqual(valid_result["status"], "finished")
+        self.assertEqual(valid_result["report_markdown"].encode("utf-8"), initial_report.encode("utf-8"))
 
 
 if __name__ == "__main__":
