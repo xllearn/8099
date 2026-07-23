@@ -5220,27 +5220,60 @@ def _is_unusable_report_markdown(markdown: Any) -> bool:
     return len(text) < 8
 
 
-def _is_fragmentary_dify_report_markdown(markdown: Any, pack: dict[str, Any]) -> bool:
+DIFY_REPORT_CONTRACT_FRAGMENT_PHRASES = (
+    "报告内容，其中所有双引号转义",
+    "所有双引号转义为",
+    "换行符等特殊字符",
+    "只返回以下json结构",
+    '"report_markdown":',
+)
+
+
+def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
     text = str(markdown or "").strip()
     if _is_unusable_report_markdown(text):
-        return True
-    has_intro_or_first_section = bool(re.search(r"(^|\n)\s*(?:#{1,6}\s+)?(?:导语|一[、.．]|1[、.．])", text))
-    has_report_structure = bool(re.search(r"(^|\n)\s*(?:#{1,6}\s+)?(?:导语|一[、.．]|1[、.．]|二[、.．])", text))
-    starts_midstream = bool(re.match(r"^\s*(?:[-*]\s+|\|)", text))
-    starts_after_first_section = bool(re.match(r"^\s*(?:#{1,6}\s+)?(?:二|三|四|五|六|七|八|九|十|2|3|4|5|6|7|8|9|10)[、.．]", text))
+        return "EMPTY_OR_PLACEHOLDER"
+
+    compact = re.sub(r"\s+", "", text)
+    lowered = compact.lower()
+    if any(phrase.lower() in lowered for phrase in DIFY_REPORT_CONTRACT_FRAGMENT_PHRASES):
+        return "CONTRACT_FRAGMENT"
+
+    heading_prefix = r"(?m)^\s*(?:#{1,6}\s*)?"
+    has_intro = bool(re.search(rf"{heading_prefix}导语(?:\s|$|[：:])", text))
+    has_first_section = bool(re.search(rf"{heading_prefix}(?:一|1)[、.．]", text))
+    has_later_body_section = bool(
+        re.search(rf"{heading_prefix}(?:二|三|四|五|六|七|八|九|十|10|[2-9])[、.．]", text)
+    )
+    has_intro_or_first_section = has_intro or has_first_section
+    has_report_structure = (has_intro and (has_first_section or has_later_body_section)) or (
+        has_first_section and has_later_body_section
+    )
+    starts_midstream = bool(re.match(r"^\s*(?:[-*+]\s+|\|)", text))
+    starts_after_first_section = bool(
+        re.match(
+            r"^\s*(?:#{1,6}\s*)?(?:二|三|四|五|六|七|八|九|十|10|[2-9])[、.．]",
+            text,
+        )
+    )
     if starts_after_first_section and not has_intro_or_first_section:
-        return True
-    if len(text) < 500 and (starts_midstream or not has_report_structure):
-        return True
+        return "STARTS_MIDSTREAM"
+    if not has_report_structure:
+        return "MISSING_REPORT_STRUCTURE"
+
     diagnostics = build_pack_diagnostics(pack)
-    weighted_chars = int(diagnostics.get("weighted_evidence_chars") or diagnostics.get("total_content_chars") or 0)
-    if weighted_chars < 1000:
-        return False
-    if starts_midstream and not has_intro_or_first_section:
-        return True
-    if len(text) < 700 and (starts_midstream or not has_report_structure):
-        return True
-    return False
+    weighted_chars = int(
+        diagnostics.get("weighted_evidence_chars") or diagnostics.get("total_content_chars") or 0
+    )
+    if weighted_chars >= 1000 and len(text) < 700:
+        return "REPORT_TOO_SHORT"
+    if len(text) < 500 and starts_midstream:
+        return "REPORT_TOO_SHORT"
+    return "OK"
+
+
+def _is_fragmentary_dify_report_markdown(markdown: Any, pack: dict[str, Any]) -> bool:
+    return _dify_report_validation_code(markdown, pack) != "OK"
 
 
 def _fallback_text_snippet(text: str, limit: int = 380) -> str:
@@ -5362,37 +5395,100 @@ def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str
 
 
 def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
-    if not _is_fragmentary_dify_report_markdown(result.get("report_markdown"), pack):
-        return result
+    source_markdown = str(result.get("report_markdown") or "")
+    validation_code = _dify_report_validation_code(source_markdown, pack)
+    raw_quality_check = result.get("quality_check")
+    quality_check = dict(raw_quality_check) if isinstance(raw_quality_check, dict) else {"passed": None, "issues": []}
+    quality_issues = list(quality_check.get("issues") or []) if isinstance(quality_check.get("issues"), list) else []
+    quality_check["issues"] = quality_issues
+    observed = dict(result)
+    observed.update(
+        {
+            "candidate_source": "initial_generation",
+            "generation_report_chars": len(source_markdown),
+            "final_report_chars": len(source_markdown),
+            "generation_validation_code": validation_code,
+            "qa_passed": quality_check.get("passed"),
+            "qa_issue_count": len(quality_issues),
+            "fallback_used": bool(result.get("fallback_used")),
+        }
+    )
+    if validation_code == "OK":
+        return observed
+
     title, markdown, fallback_warnings = _fallback_report_from_pack(pack)
-    warnings = [*list(result.get("warnings") or []), *list(result.get("generation_warnings") or []), *fallback_warnings]
+    warnings = _dedupe_strings(
+        [
+            *list(result.get("warnings") or []),
+            *list(result.get("generation_warnings") or []),
+            *fallback_warnings,
+        ]
+    )
     issue = {
         "issue_id": "Q_DIFY_FRAGMENTARY_REPORT",
         "severity": "high",
         "problem_type": "empty_or_fragmentary_report",
-        "report_text": str(result.get("report_markdown") or ""),
+        "report_text": source_markdown,
         "source_basis": "evidence_pack",
-        "fix_instruction": "Dify 返回正文过短、占位或疑似只包含修订片段，已启用后端兜底报告，仍需人工复核或重新运行工作流。",
+        "fix_instruction": "Dify 返回正文过短、占位或契约片段，已启用后端保守兜底报告，需人工复核或重新运行工作流。",
     }
-    repaired = dict(result)
-    repaired.update(
+    if not any(
+        isinstance(existing, dict) and existing.get("issue_id") == issue["issue_id"]
+        for existing in quality_issues
+    ):
+        quality_issues.append(issue)
+    quality_check["passed"] = False
+
+    remaining_issues = [
+        existing
+        for existing in list(result.get("remaining_issues") or [])
+        if isinstance(existing, dict)
+    ]
+    if not any(existing.get("issue_id") == issue["issue_id"] for existing in remaining_issues):
+        remaining_issues.append(issue)
+    existing_failure_codes = result.get("generation_failure_codes")
+    generation_failure_codes = _dedupe_strings(
+        [
+            *(
+                list(existing_failure_codes)
+                if isinstance(existing_failure_codes, (list, tuple, set))
+                else [existing_failure_codes]
+                if existing_failure_codes
+                else []
+            ),
+            "OUTPUT_TRUNCATED",
+        ]
+    )
+    observed.update(
         {
             "status": "needs_manual_review",
             "report_title": title if _is_unusable_report_markdown(result.get("report_title")) else result.get("report_title") or title,
             "report_markdown": markdown,
-            "quality_check": {"passed": False, "issues": [issue]},
+            "quality_check": quality_check,
             "generation_warnings": warnings,
             "warnings": warnings,
-            "remaining_issues": [issue],
+            "remaining_issues": remaining_issues,
+            "candidate_source": "backend_pack_fallback",
+            "final_report_chars": len(markdown),
+            "fallback_used": True,
+            "fallback_reason": "OUTPUT_TRUNCATED",
+            "fallback_provider": "backend_pack_fallback",
+            "generation_failure_reason": "OUTPUT_TRUNCATED",
+            "generation_failure_codes": generation_failure_codes,
+            "provider": "backend_pack_fallback",
+            "qa_passed": False,
+            "qa_issue_count": len(quality_issues),
         }
     )
-    return repaired
+    return observed
 
 
 def _apply_local_quality_gate_to_dify_result(result: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
     generation_result = ReportGenerationResult.from_legacy_result(result, provider=str(result.get("provider") or "dify"))
     repaired_result = ForbiddenPhraseRepairer().run(generation_result, pack)
-    return QualityGate().run(repaired_result, pack).to_legacy_result()
+    gated = QualityGate().run(repaired_result, pack).to_legacy_result()
+    gated["final_report_chars"] = len(str(gated.get("report_markdown") or ""))
+    return gated
 
 
 def _set_failure_stage(result: dict[str, Any], stage: dict[str, Any]) -> dict[str, Any]:
