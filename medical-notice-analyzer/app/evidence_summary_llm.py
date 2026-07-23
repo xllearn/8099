@@ -23,7 +23,8 @@ _ALLOWED_FIELDS = {
     "region",
     "group",
 }
-_MAX_AMBIGUOUS_TABLES = 20
+_MAX_AMBIGUOUS_TABLES = 40
+_MAX_MODEL_TABLES_PER_REQUEST = 4
 _MAX_MODEL_ROWS_PER_TABLE = 40
 _MAX_PROJECTED_ROWS_PER_TABLE = 40
 _MAX_MODEL_INPUT_CHARS = 60_000
@@ -252,6 +253,36 @@ def _request_summaries(tables: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     return result
 
 
+def _request_summaries_batched(tables: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for start in range(0, len(tables), _MAX_MODEL_TABLES_PER_REQUEST):
+        batch = tables[start : start + _MAX_MODEL_TABLES_PER_REQUEST]
+        expected = {
+            str(table.get("table_id") or "")
+            for table in batch
+            if str(table.get("table_id") or "")
+        }
+        batch_results = _request_summaries(batch)
+        accepted = {
+            table_id: value
+            for table_id, value in batch_results.items()
+            if table_id in expected
+        }
+        result.update(accepted)
+        if not accepted:
+            break
+
+        missing = expected - accepted.keys()
+        for table in batch:
+            table_id = str(table.get("table_id") or "")
+            if table_id not in missing:
+                continue
+            retry_results = _request_summaries([table])
+            if table_id in retry_results:
+                result[table_id] = retry_results[table_id]
+    return result
+
+
 def enrich_evidence_pack_summaries(pack: dict[str, Any]) -> dict[str, Any]:
     guidance = pack.setdefault("generation_guidance", {})
     if isinstance(guidance, dict):
@@ -323,7 +354,7 @@ def enrich_evidence_pack_summaries(pack: dict[str, Any]) -> dict[str, Any]:
         request_tables = next_tables
         selected.append((table_id, table, rows))
 
-    model_results = _request_summaries(request_tables)
+    model_results = _request_summaries_batched(request_tables)
     if request_tables and _env_bool("ENABLE_EVIDENCE_SUMMARY_LLM") and not model_results:
         warnings = pack.setdefault("warnings", [])
         if "EVIDENCE_SUMMARY_LLM_UNAVAILABLE" not in warnings:
