@@ -5509,11 +5509,25 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
         quality_issues.append(issue)
     quality_check["passed"] = False
 
-    remaining_issues = [
-        existing
-        for existing in list(result.get("remaining_issues") or [])
+    quality_issues_by_id = {
+        existing["issue_id"]: dict(existing)
+        for existing in quality_issues
         if isinstance(existing, dict)
-    ]
+        and isinstance(existing.get("issue_id"), str)
+        and existing.get("issue_id")
+    }
+    remaining_issues = []
+    for existing in list(result.get("remaining_issues") or []):
+        if not isinstance(existing, dict):
+            continue
+        remaining_issue = dict(existing)
+        issue_id = remaining_issue.get("issue_id")
+        quality_issue = quality_issues_by_id.get(issue_id) if isinstance(issue_id, str) else None
+        if quality_issue is not None:
+            merged_issue = dict(quality_issue)
+            merged_issue.update(remaining_issue)
+            remaining_issue = merged_issue
+        remaining_issues.append(remaining_issue)
     if not any(existing.get("issue_id") == issue["issue_id"] for existing in remaining_issues):
         remaining_issues.append(issue)
     existing_failure_codes = result.get("generation_failure_codes")
