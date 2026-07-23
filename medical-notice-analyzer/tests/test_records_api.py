@@ -2813,6 +2813,38 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(gated["quality_gate"]["deliverable_status"], "needs_manual_review")
         self.assertIn("Q_LOCAL_QUALITY_GATE", {item["issue_id"] for item in gated["remaining_issues"]})
 
+    def test_local_quality_pipeline_refreshes_final_report_chars(self) -> None:
+        markdown = (
+            "## 导语\n"
+            + "浙江采购公告明确了申报范围、执行节点和企业核对要求。" * 30
+            + "\n\n## 一、核心规则\n"
+            + "企业应依据公告原文逐项核对申报规则、产品范围和执行时间。" * 30
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "浙江省医用耗材采购公告",
+                    "content_text": "浙江采购公告明确了申报范围、执行节点和企业核对要求。" * 30,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "浙江省医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "generation_warnings": [],
+            "warnings": [],
+            "remaining_issues": [],
+            "final_report_chars": 0,
+        }
+
+        gated = main_module._apply_local_quality_gate_to_dify_result(result, pack)
+
+        self.assertEqual(gated["final_report_chars"], len(gated["report_markdown"]))
+
     def test_analysis_run_progress_is_smooth_while_running(self) -> None:
         with patch("app.diagnostics.datetime") as datetime_mock:
             datetime_mock.fromisoformat.side_effect = main_module.datetime.fromisoformat
@@ -4189,6 +4221,123 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(result["quality_check"]["passed"], False)
         self.assertEqual(result["generation_warnings"], ["附件仅元数据"])
         self.assertEqual(result["remaining_issues"][0]["issue_id"], "Q001")
+
+    def test_valid_initial_generation_records_source_and_lengths(self) -> None:
+        markdown = (
+            "## 导语\n"
+            + "浙江省采购公告已明确执行安排，企业应依据原文核对申报与履约要求。" * 30
+            + "\n\n## 一、核心规则\n"
+            + "公告正文明确适用范围、申报规则、价格要求和执行时间，企业应建立逐项核对清单。" * 30
+            + "\n\n## 二、企业关注点\n"
+            + "企业应结合公告列明的时间节点、产品范围和平台要求安排内部准备工作。" * 30
+        )
+        pack = {
+            "pack_id": "pack_zhejiang_valid",
+            "primary_materials": [
+                {
+                    "title": "浙江省医用耗材采购公告",
+                    "content_text": "浙江省采购公告已明确执行安排，企业应依据原文核对申报与履约要求。" * 100,
+                    "summary": "公告明确了企业申报、价格和履约的基本规则。",
+                    "key_facts": [{"name": "地区", "value": "浙江省"}],
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "pack_id": "pack_zhejiang_valid",
+            "report_title": "浙江省医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "version": 1,
+            "quality_check": {"passed": True, "issues": []},
+            "generation_warnings": [],
+            "warnings": [],
+            "remaining_issues": [],
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["candidate_source"], "initial_generation")
+        self.assertEqual(repaired["generation_validation_code"], "OK")
+        self.assertEqual(repaired["generation_report_chars"], len(markdown))
+        self.assertEqual(repaired["final_report_chars"], len(markdown))
+        self.assertTrue(repaired["qa_passed"])
+        self.assertEqual(repaired["qa_issue_count"], 0)
+        self.assertFalse(repaired["fallback_used"])
+
+    def test_long_initial_generation_without_following_section_uses_fallback(self) -> None:
+        markdown = "## 导语\n" + "浙江采购公告情况说明。" * 200
+        pack = {
+            "pack_id": "pack_zhejiang_missing_structure",
+            "primary_materials": [
+                {
+                    "title": "浙江省采购公告",
+                    "content_text": "浙江采购公告原文证据。" * 300,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "pack_id": "pack_zhejiang_missing_structure",
+            "report_title": "浙江省采购公告分析",
+            "report_markdown": markdown,
+            "version": 1,
+            "quality_check": {"passed": True, "issues": []},
+            "generation_warnings": [],
+            "warnings": [],
+            "remaining_issues": [],
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
+        self.assertEqual(repaired["generation_validation_code"], "MISSING_REPORT_STRUCTURE")
+        self.assertEqual(repaired["status"], "needs_manual_review")
+        self.assertTrue(repaired["fallback_used"])
+
+    def test_contract_instruction_fragment_records_backend_fallback_source(self) -> None:
+        fragment = "报告内容，其中所有双引号转义为双引号，换行符等特殊字符也要正确处理。"
+        pack = {
+            "pack_id": "pack_contract_fragment",
+            "primary_materials": [
+                {
+                    "title": "浙江省采购公告",
+                    "content_text": "浙江采购公告原文证据。" * 300,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "needs_manual_review",
+            "pack_id": "pack_contract_fragment",
+            "report_title": "浙江省采购公告分析",
+            "report_markdown": fragment,
+            "version": 1,
+            "quality_check": {
+                "passed": False,
+                "issues": [{"issue_id": "Q_MODEL", "severity": "major", "problem_type": "summary_only"}],
+            },
+            "generation_warnings": [],
+            "warnings": [],
+            "remaining_issues": [{"issue_id": "Q_MODEL"}],
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
+        self.assertEqual(repaired["generation_validation_code"], "CONTRACT_FRAGMENT")
+        self.assertEqual(repaired["generation_report_chars"], len(fragment))
+        self.assertEqual(repaired["final_report_chars"], len(repaired["report_markdown"]))
+        self.assertTrue(repaired["fallback_used"])
+        self.assertEqual(repaired["generation_failure_reason"], "OUTPUT_TRUNCATED")
+        self.assertEqual(repaired["provider"], "backend_pack_fallback")
+        self.assertIn("OUTPUT_TRUNCATED", repaired["generation_failure_codes"])
+        self.assertFalse(repaired["qa_passed"])
+        self.assertGreaterEqual(repaired["qa_issue_count"], 1)
 
     def test_unusable_dify_report_gets_fallback_from_evidence_pack(self) -> None:
         pack = {
