@@ -5220,6 +5220,14 @@ def _is_unusable_report_markdown(markdown: Any) -> bool:
     return len(text) < 8
 
 
+def _is_placeholder_report_title(title: Any) -> bool:
+    text = str(title or "").strip()
+    if not text:
+        return True
+    compact = re.sub(r"\s+", "", text)
+    return compact in {"...", "…", "......", "。", "."}
+
+
 DIFY_REPORT_CONTRACT_FRAGMENT_PHRASES = (
     "报告内容，其中所有双引号转义",
     "所有双引号转义为",
@@ -5234,8 +5242,13 @@ DIFY_REPORT_CONTRACT_FRAGMENT_PHRASES = (
 
 def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
     text = str(markdown or "").strip()
-    if _is_unusable_report_markdown(text):
+    if not text:
         return "EMPTY_OR_PLACEHOLDER"
+
+    compact = re.sub(r"\s+", "", text)
+    if compact in {"...", "…", "......", "。", "."}:
+        return "EMPTY_OR_PLACEHOLDER"
+    lowered = compact.lower()
 
     nonempty_lines = [line.strip() for line in text.splitlines() if line.strip()]
     first_line = nonempty_lines[0] if nonempty_lines else ""
@@ -5261,14 +5274,12 @@ def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
     )
     if starts_unordered_list or starts_table or starts_ordered_list or starts_after_first_section:
         return "STARTS_MIDSTREAM"
-
-    compact = re.sub(r"\s+", "", text)
-    lowered = compact.lower()
     if any(phrase.lower() in lowered for phrase in DIFY_REPORT_CONTRACT_FRAGMENT_PHRASES):
         return "CONTRACT_FRAGMENT"
+    if len(text) < 8:
+        return "EMPTY_OR_PLACEHOLDER"
 
     heading_prefix = r"(?m)^\s*(?:#{1,6}\s*)?"
-    has_intro = bool(re.search(rf"{heading_prefix}导语(?:\s|$|[：:])", text))
     has_first_section = bool(re.search(rf"{heading_prefix}(?:一|1)[、.．]", text))
     has_later_body_section = bool(
         re.search(rf"{heading_prefix}(?:二|三|四|五|六|七|八|九|十|10|[2-9])[、.．]", text)
@@ -5290,9 +5301,7 @@ def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
             for position, title in markdown_headings
         )
     )
-    has_report_structure = (
-        has_intro and (has_first_section or has_later_body_section or has_natural_body_heading)
-    ) or (
+    has_report_structure = has_natural_body_heading or (
         has_first_section and has_later_body_section
     )
     if not has_report_structure:
@@ -5438,7 +5447,6 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
     qa_passed = quality_check.get("passed")
     qa_issue_count = len(quality_issues)
     observed = dict(result)
-    observed.pop("generation_failure_reason", None)
 
     existing_backend_fallback = bool(result.get("fallback_used")) and (
         str(result.get("fallback_provider") or "").strip() == "backend_pack_fallback"
@@ -5477,6 +5485,7 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
     if validation_code == "OK":
         return observed
 
+    observed.pop("generation_failure_reason", None)
     title, markdown, fallback_warnings = _fallback_report_from_pack(pack)
     warnings = _dedupe_strings(
         [
@@ -5520,10 +5529,11 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
             "OUTPUT_TRUNCATED",
         ]
     )
+    source_title = str(result.get("report_title") or "").strip()
     observed.update(
         {
             "status": "needs_manual_review",
-            "report_title": title if _is_unusable_report_markdown(result.get("report_title")) else result.get("report_title") or title,
+            "report_title": title if _is_placeholder_report_title(source_title) else source_title,
             "report_markdown": markdown,
             "quality_check": quality_check,
             "generation_warnings": warnings,

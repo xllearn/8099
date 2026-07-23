@@ -4254,6 +4254,7 @@ class RecordsApiTests(unittest.TestCase):
             "generation_warnings": [],
             "warnings": [],
             "remaining_issues": [],
+            "generation_failure_reason": "original",
         }
 
         repaired = main_module._repair_unusable_dify_result(result, pack)
@@ -4265,6 +4266,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertTrue(repaired["qa_passed"])
         self.assertEqual(repaired["qa_issue_count"], 0)
         self.assertFalse(repaired["fallback_used"])
+        self.assertEqual(repaired["generation_failure_reason"], "original")
 
     def test_natural_topic_headings_are_valid_initial_generation_structure(self) -> None:
         markdown = (
@@ -4305,6 +4307,38 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(repaired["status"], "finished")
         self.assertEqual(repaired["report_markdown"], markdown)
         self.assertFalse(repaired["fallback_used"])
+
+    def test_intro_with_only_plain_first_numbered_line_is_missing_structure(self) -> None:
+        markdown = (
+            "## 导语\n"
+            + "公告明确采购范围和执行要求，企业应依据原文核对申报与履约要求。" * 40
+            + "\n\n1. 事项\n"
+            + "该普通文本行不是 Markdown 主体标题，不能单独满足报告结构要求。" * 40
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["generation_validation_code"], "MISSING_REPORT_STRUCTURE")
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
+        self.assertNotEqual(repaired["report_markdown"], markdown)
 
     def test_long_initial_generation_without_following_section_uses_fallback(self) -> None:
         markdown = "## 导语\n" + "浙江采购公告情况说明。" * 200
@@ -4533,7 +4567,7 @@ class RecordsApiTests(unittest.TestCase):
         result = {
             "status": "needs_manual_review",
             "pack_id": "pack_contract_fragment",
-            "report_title": "浙江省采购公告分析",
+            "report_title": "采购分析",
             "report_markdown": fragment,
             "version": 1,
             "quality_check": {
@@ -4543,6 +4577,7 @@ class RecordsApiTests(unittest.TestCase):
             "generation_warnings": [],
             "warnings": [],
             "remaining_issues": [{"issue_id": "Q_MODEL"}],
+            "generation_failure_reason": "obsolete",
             "provider": "dify",
         }
 
@@ -4554,6 +4589,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(repaired["final_report_chars"], len(repaired["report_markdown"]))
         self.assertTrue(repaired["fallback_used"])
         self.assertNotEqual(repaired["report_markdown"], fragment)
+        self.assertEqual(repaired["report_title"], "采购分析")
         self.assertNotIn("generation_failure_reason", repaired)
         self.assertEqual(repaired["provider"], "dify")
         self.assertIn("OUTPUT_TRUNCATED", repaired["generation_failure_codes"])
@@ -4567,7 +4603,7 @@ class RecordsApiTests(unittest.TestCase):
 
     def test_bounded_json_contract_instructions_are_fragments(self) -> None:
         pack = {"primary_materials": [], "auxiliary_materials": []}
-        for fragment in ("按 JSON 格式输出", "只返回 JSON", "JSON 结构如下"):
+        for fragment in ("按 JSON 格式输出", "只返回JSON", "JSON 结构如下"):
             with self.subTest(fragment=fragment):
                 self.assertEqual(
                     main_module._dify_report_validation_code(fragment, pack),
@@ -4605,6 +4641,7 @@ class RecordsApiTests(unittest.TestCase):
         )
         fallback_markdown = fallback["report_markdown"]
         fallback_reason = fallback["fallback_reason"]
+        fallback["generation_failure_reason"] = "provider_original"
 
         observed = main_module._repair_unusable_dify_result(fallback, pack)
 
@@ -4614,6 +4651,7 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(observed["final_report_chars"], len(fallback_markdown))
         self.assertEqual(observed["generation_validation_code"], "PROVIDER_FALLBACK")
         self.assertEqual(observed["fallback_reason"], fallback_reason)
+        self.assertEqual(observed["generation_failure_reason"], "provider_original")
         self.assertEqual(observed["dify_error_code"], fallback["dify_error_code"])
         self.assertEqual(observed["dify_error_message"], fallback["dify_error_message"])
         self.assertEqual(observed["report_markdown"], fallback_markdown)
