@@ -4442,7 +4442,10 @@ class RecordsApiTests(unittest.TestCase):
 
         self.assertEqual(repaired["status"], "needs_manual_review")
         self.assertIn("## 导语", repaired["report_markdown"])
-        self.assertEqual(repaired["remaining_issues"][0]["issue_id"], "Q_DIFY_FRAGMENTARY_REPORT")
+        self.assertEqual(
+            [issue["issue_id"] for issue in repaired["remaining_issues"]],
+            ["Q001", "Q_DIFY_FRAGMENTARY_REPORT"],
+        )
 
     def test_dify_success_without_report_markdown_fails_provider_validation(self) -> None:
         raw = {
