@@ -44,6 +44,7 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
             ["issue_id", "severity", "problem_type", "report_text", "source_basis", "fix_instruction"],
         )
         self.assertEqual(issue_schema["properties"]["severity"]["enum"], ["fatal", "high", "major", "minor"])
+        self.assertEqual(by_id["qa_report_first"]["structured_output"]["schema"]["properties"]["round"]["enum"], [1])
 
         generation_prompt = "\n".join(item.get("text", "") for item in by_id["generate_report"]["prompt_template"])
         qa_prompt = "\n".join(item.get("text", "") for item in by_id["qa_report_first"]["prompt_template"])
@@ -181,6 +182,15 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
             self.assertFalse(quality["passed"])
             self.assertEqual(sum(issue["issue_id"] == "Q_PARSE" for issue in quality["issues"]), 1)
 
+        for invalid_round in [2, "1"]:
+            output = namespace["main"](
+                json.dumps({"passed": True, "round": invalid_round, "issues": []}, ensure_ascii=False)
+            )
+            quality = json.loads(output["quality_json"])
+            self.assertFalse(quality["passed"])
+            self.assertEqual(quality["round"], 1)
+            self.assertEqual(sum(issue["issue_id"] == "Q_PARSE" for issue in quality["issues"]), 1)
+
         severe_output = namespace["main"](
             json.dumps({"passed": True, "round": 1, "issues": [{**valid_issue, "severity": " major "}]}, ensure_ascii=False)
         )
@@ -248,6 +258,41 @@ class DifyHumanStyleWorkflowTests(unittest.TestCase):
         valid_result = json.loads(valid_output["result"])
         self.assertEqual(valid_result["status"], "finished")
         self.assertEqual(valid_result["report_markdown"].encode("utf-8"), initial_report.encode("utf-8"))
+
+        ordinary_warning_output = namespace["main"](
+            "pack",
+            json.dumps(
+                {
+                    "version": 1,
+                    "report_title": "标题",
+                    "report_markdown": initial_report,
+                    "generation_warnings": ["ordinary_warning"],
+                },
+                ensure_ascii=False,
+            ),
+            valid_quality,
+        )
+        self.assertEqual(json.loads(ordinary_warning_output["result"])["status"], "finished")
+
+        upstream_failure_output = namespace["main"](
+            "pack",
+            json.dumps(
+                {
+                    "version": 1,
+                    "report_title": "标题",
+                    "report_markdown": initial_report,
+                    "generation_warnings": ["generation_json_parse_failed"],
+                },
+                ensure_ascii=False,
+            ),
+            valid_quality,
+        )
+        upstream_failure_result = json.loads(upstream_failure_output["result"])
+        self.assertEqual(upstream_failure_result["status"], "needs_manual_review")
+        self.assertEqual(upstream_failure_result["report_markdown"].encode("utf-8"), initial_report.encode("utf-8"))
+        self.assertEqual(upstream_failure_result["generation_warnings"], ["generation_json_parse_failed"])
+        self.assertTrue(any(issue["issue_id"] == "Q_GENERATION_PARSE" for issue in upstream_failure_result["remaining_issues"]))
+        self.assertTrue(any(issue["issue_id"] == "Q_GENERATION_PARSE" for issue in upstream_failure_result["quality_check"]["issues"]))
 
 
 if __name__ == "__main__":

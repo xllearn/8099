@@ -638,6 +638,8 @@ workflow:
                 type: boolean
               round:
                 type: integer
+                enum:
+                - 1
               issues:
                 type: array
                 items:
@@ -729,8 +731,8 @@ workflow:
               if not isinstance(data.get("passed"), bool):
                   add_error("passed must be boolean")
               round_value = data.get("round")
-              if isinstance(round_value, bool) or not isinstance(round_value, int):
-                  add_error("round must be integer")
+              if isinstance(round_value, bool) or not isinstance(round_value, int) or round_value != 1:
+                  add_error("round must be integer 1")
                   round_value = 1
               raw_issues = data.get("issues")
               if not isinstance(raw_issues, list):
@@ -855,6 +857,12 @@ workflow:
               if not isinstance(generation_warnings, list):
                   generation_warnings = []
                   generation_contract_errors.append("generation_warnings must be array")
+              if "generation_json_parse_failed" in generation_warnings:
+                  generation_issues.append(fatal_issue(
+                      "Q_GENERATION_PARSE",
+                      "generation_json_parse_failed",
+                      "upstream generation JSON parsing failed",
+                  ))
               if generation_contract_errors:
                   generation_issues.append(fatal_issue(
                       "Q_GENERATION_CONTRACT",
