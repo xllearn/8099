@@ -4297,6 +4297,8 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(repaired["generation_validation_code"], "MISSING_REPORT_STRUCTURE")
         self.assertEqual(repaired["status"], "needs_manual_review")
         self.assertTrue(repaired["fallback_used"])
+        self.assertNotEqual(repaired["report_markdown"], markdown)
+        self.assertEqual(repaired["final_report_chars"], len(repaired["report_markdown"]))
 
     def test_contract_instruction_fragment_records_backend_fallback_source(self) -> None:
         fragment = "报告内容，其中所有双引号转义为双引号，换行符等特殊字符也要正确处理。"
@@ -4333,11 +4335,16 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(repaired["generation_report_chars"], len(fragment))
         self.assertEqual(repaired["final_report_chars"], len(repaired["report_markdown"]))
         self.assertTrue(repaired["fallback_used"])
+        self.assertNotEqual(repaired["report_markdown"], fragment)
         self.assertEqual(repaired["generation_failure_reason"], "OUTPUT_TRUNCATED")
         self.assertEqual(repaired["provider"], "backend_pack_fallback")
         self.assertIn("OUTPUT_TRUNCATED", repaired["generation_failure_codes"])
         self.assertFalse(repaired["qa_passed"])
         self.assertGreaterEqual(repaired["qa_issue_count"], 1)
+        quality_issues = {issue["issue_id"]: issue for issue in repaired["quality_check"]["issues"]}
+        remaining_issues = {issue["issue_id"]: issue for issue in repaired["remaining_issues"]}
+        self.assertEqual(quality_issues["Q_MODEL"]["severity"], "major")
+        self.assertEqual(remaining_issues["Q_MODEL"]["severity"], "major")
 
     def test_unusable_dify_report_gets_fallback_from_evidence_pack(self) -> None:
         pack = {
