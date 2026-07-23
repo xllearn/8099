@@ -4266,6 +4266,46 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(repaired["qa_issue_count"], 0)
         self.assertFalse(repaired["fallback_used"])
 
+    def test_natural_topic_headings_are_valid_initial_generation_structure(self) -> None:
+        markdown = (
+            "## 导语\n"
+            + "浙江省采购公告已明确执行安排，企业应依据原文核对申报与履约要求。" * 30
+            + "\n\n## 采购范围\n"
+            + "公告正文明确适用产品、申报主体和执行机构，企业应逐项核对自身业务范围。" * 30
+            + "\n\n## 价格规则\n"
+            + "企业应依据公告原文核对价格申报、平台操作和执行时间，不补充材料外事实。" * 30
+        )
+        pack = {
+            "pack_id": "pack_natural_headings",
+            "primary_materials": [
+                {
+                    "title": "浙江省医用耗材采购公告",
+                    "content_text": "浙江省采购公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "pack_id": "pack_natural_headings",
+            "report_title": "浙江省医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "generation_warnings": [],
+            "warnings": [],
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["candidate_source"], "initial_generation")
+        self.assertEqual(repaired["generation_validation_code"], "OK")
+        self.assertEqual(repaired["status"], "finished")
+        self.assertEqual(repaired["report_markdown"], markdown)
+        self.assertFalse(repaired["fallback_used"])
+
     def test_long_initial_generation_without_following_section_uses_fallback(self) -> None:
         markdown = "## 导语\n" + "浙江采购公告情况说明。" * 200
         pack = {
@@ -4299,6 +4339,183 @@ class RecordsApiTests(unittest.TestCase):
         self.assertTrue(repaired["fallback_used"])
         self.assertNotEqual(repaired["report_markdown"], markdown)
         self.assertEqual(repaired["final_report_chars"], len(repaired["report_markdown"]))
+        self.assertTrue(repaired["qa_passed"])
+        self.assertEqual(repaired["qa_issue_count"], 0)
+
+    def test_long_unordered_list_start_with_complete_headings_is_midstream(self) -> None:
+        markdown = (
+            "- 中选产品、价格与执行机构明细\n"
+            + "该列表内容来自返回片段，后续即使出现完整标题也不能证明开头未被截断。" * 50
+            + "\n\n## 导语\n"
+            + "公告明确采购范围和执行要求。" * 30
+            + "\n\n## 一、采购范围\n"
+            + "企业应核对产品范围与申报主体。" * 30
+            + "\n\n## 二、价格规则\n"
+            + "企业应核对价格申报与执行节点。" * 30
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["generation_validation_code"], "STARTS_MIDSTREAM")
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
+        self.assertNotEqual(repaired["report_markdown"], markdown)
+
+    def test_long_markdown_table_start_with_complete_headings_is_midstream(self) -> None:
+        markdown = (
+            "| 分类 | 要求 |\n"
+            "| --- | --- |\n"
+            "| 价格 | 按公告申报 |\n"
+            + "该表格内容来自返回片段，后续即使出现完整标题也不能证明开头未被截断。" * 50
+            + "\n\n## 导语\n"
+            + "公告明确采购范围和执行要求。" * 30
+            + "\n\n## 一、采购范围\n"
+            + "企业应核对产品范围与申报主体。" * 30
+            + "\n\n## 二、价格规则\n"
+            + "企业应核对价格申报与执行节点。" * 30
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["generation_validation_code"], "STARTS_MIDSTREAM")
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
+        self.assertNotEqual(repaired["report_markdown"], markdown)
+
+    def test_consecutive_ordered_list_start_is_midstream(self) -> None:
+        markdown = (
+            "1. 核对采购范围\n"
+            "2. 核对价格规则\n"
+            + "列表内容可能来自被截断的正文中段。" * 80
+            + "\n\n## 导语\n"
+            + "公告明确采购范围和执行要求。" * 30
+            + "\n\n## 一、采购范围\n"
+            + "企业应核对产品范围与申报主体。" * 30
+            + "\n\n## 二、价格规则\n"
+            + "企业应核对价格申报与执行节点。" * 30
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["generation_validation_code"], "STARTS_MIDSTREAM")
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
+
+    def test_single_first_numbered_heading_with_body_is_not_an_ordered_list_fragment(self) -> None:
+        markdown = (
+            "1. 采购范围\n"
+            + "公告正文明确适用产品、申报主体和执行机构，企业应逐项核对自身业务范围。" * 40
+            + "\n\n2. 价格规则\n"
+            + "企业应依据公告原文核对价格申报、平台操作和执行时间，不补充材料外事实。" * 40
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        observed = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(observed["generation_validation_code"], "OK")
+        self.assertEqual(observed["candidate_source"], "initial_generation")
+        self.assertEqual(observed["report_markdown"], markdown)
+
+    def test_second_section_start_is_midstream_even_if_intro_appears_later(self) -> None:
+        markdown = (
+            "## 二、价格规则\n"
+            + "企业应依据公告原文核对价格申报和执行节点。" * 50
+            + "\n\n## 导语\n"
+            + "公告明确采购范围和执行要求。" * 30
+            + "\n\n## 一、采购范围\n"
+            + "企业应核对产品范围与申报主体。" * 30
+        )
+        pack = {
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 150,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "status": "finished",
+            "report_title": "医用耗材采购公告分析",
+            "report_markdown": markdown,
+            "quality_check": {"passed": True, "issues": []},
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        repaired = main_module._repair_unusable_dify_result(result, pack)
+
+        self.assertEqual(repaired["generation_validation_code"], "STARTS_MIDSTREAM")
+        self.assertEqual(repaired["candidate_source"], "backend_pack_fallback")
 
     def test_contract_instruction_fragment_records_backend_fallback_source(self) -> None:
         fragment = "报告内容，其中所有双引号转义为双引号，换行符等特殊字符也要正确处理。"
@@ -4326,6 +4543,7 @@ class RecordsApiTests(unittest.TestCase):
             "generation_warnings": [],
             "warnings": [],
             "remaining_issues": [{"issue_id": "Q_MODEL"}],
+            "provider": "dify",
         }
 
         repaired = main_module._repair_unusable_dify_result(result, pack)
@@ -4336,15 +4554,77 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(repaired["final_report_chars"], len(repaired["report_markdown"]))
         self.assertTrue(repaired["fallback_used"])
         self.assertNotEqual(repaired["report_markdown"], fragment)
-        self.assertEqual(repaired["generation_failure_reason"], "OUTPUT_TRUNCATED")
-        self.assertEqual(repaired["provider"], "backend_pack_fallback")
+        self.assertNotIn("generation_failure_reason", repaired)
+        self.assertEqual(repaired["provider"], "dify")
         self.assertIn("OUTPUT_TRUNCATED", repaired["generation_failure_codes"])
         self.assertFalse(repaired["qa_passed"])
-        self.assertGreaterEqual(repaired["qa_issue_count"], 1)
+        self.assertEqual(repaired["qa_issue_count"], 1)
+        self.assertEqual(len(repaired["quality_check"]["issues"]), 2)
         quality_issues = {issue["issue_id"]: issue for issue in repaired["quality_check"]["issues"]}
         remaining_issues = {issue["issue_id"]: issue for issue in repaired["remaining_issues"]}
         self.assertEqual(quality_issues["Q_MODEL"]["severity"], "major")
         self.assertEqual(remaining_issues["Q_MODEL"]["severity"], "major")
+
+    def test_bounded_json_contract_instructions_are_fragments(self) -> None:
+        pack = {"primary_materials": [], "auxiliary_materials": []}
+        for fragment in ("按 JSON 格式输出", "只返回 JSON", "JSON 结构如下"):
+            with self.subTest(fragment=fragment):
+                self.assertEqual(
+                    main_module._dify_report_validation_code(fragment, pack),
+                    "CONTRACT_FRAGMENT",
+                )
+
+        technical_report = (
+            "## 导语\n"
+            + "本公告的数据交换附件采用 JSON 格式保存技术字段。" * 30
+            + "\n\n## 采购范围\n"
+            + "企业应依据公告原文核对产品范围和申报主体。" * 30
+        )
+        self.assertEqual(
+            main_module._dify_report_validation_code(technical_report, pack),
+            "OK",
+        )
+
+    def test_existing_provider_error_fallback_preserves_candidate_provenance(self) -> None:
+        pack = {
+            "pack_id": "pack_provider_timeout",
+            "primary_materials": [
+                {
+                    "title": "医用耗材采购公告",
+                    "content_text": "公告明确采购范围、价格规则和执行安排。" * 100,
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        fallback = main_module._fallback_result_from_dify_error(
+            main_module.DifyWorkflowError("TIMEOUT", "Dify 工作流调用超时"),
+            pack,
+            "pack_provider_timeout",
+            apply_quality_gate=False,
+        )
+        fallback_markdown = fallback["report_markdown"]
+        fallback_reason = fallback["fallback_reason"]
+
+        observed = main_module._repair_unusable_dify_result(fallback, pack)
+
+        self.assertEqual(observed["provider"], "dify")
+        self.assertEqual(observed["candidate_source"], "backend_pack_fallback")
+        self.assertEqual(observed["generation_report_chars"], 0)
+        self.assertEqual(observed["final_report_chars"], len(fallback_markdown))
+        self.assertEqual(observed["generation_validation_code"], "PROVIDER_FALLBACK")
+        self.assertEqual(observed["fallback_reason"], fallback_reason)
+        self.assertEqual(observed["dify_error_code"], fallback["dify_error_code"])
+        self.assertEqual(observed["dify_error_message"], fallback["dify_error_message"])
+        self.assertEqual(observed["report_markdown"], fallback_markdown)
+        self.assertIn(
+            "Q_DIFY_CALL_FAILED_FALLBACK",
+            {issue["issue_id"] for issue in observed["quality_check"]["issues"]},
+        )
+        self.assertNotIn(
+            "Q_DIFY_FRAGMENTARY_REPORT",
+            {issue["issue_id"] for issue in observed["quality_check"]["issues"]},
+        )
 
     def test_unusable_dify_report_gets_fallback_from_evidence_pack(self) -> None:
         pack = {

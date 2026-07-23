@@ -5225,6 +5225,9 @@ DIFY_REPORT_CONTRACT_FRAGMENT_PHRASES = (
     "所有双引号转义为",
     "换行符等特殊字符",
     "只返回以下json结构",
+    "按json格式输出",
+    "只返回json",
+    "json结构如下",
     '"report_markdown":',
 )
 
@@ -5233,6 +5236,31 @@ def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
     text = str(markdown or "").strip()
     if _is_unusable_report_markdown(text):
         return "EMPTY_OR_PLACEHOLDER"
+
+    nonempty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    first_line = nonempty_lines[0] if nonempty_lines else ""
+    starts_unordered_list = bool(re.match(r"^[-*+]\s+", first_line))
+    starts_table = first_line.startswith("|") or bool(
+        len(nonempty_lines) >= 2
+        and "|" in first_line
+        and re.match(
+            r"^:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?$",
+            nonempty_lines[1],
+        )
+    )
+    starts_ordered_list = bool(
+        len(nonempty_lines) >= 2
+        and re.match(r"^1[.．]\s+", nonempty_lines[0])
+        and re.match(r"^2[.．]\s+", nonempty_lines[1])
+    )
+    starts_after_first_section = bool(
+        re.match(
+            r"^(?:#{1,6}\s*)?(?:二|三|四|五|六|七|八|九|十|10|[2-9])[、.．]",
+            first_line,
+        )
+    )
+    if starts_unordered_list or starts_table or starts_ordered_list or starts_after_first_section:
+        return "STARTS_MIDSTREAM"
 
     compact = re.sub(r"\s+", "", text)
     lowered = compact.lower()
@@ -5245,19 +5273,28 @@ def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
     has_later_body_section = bool(
         re.search(rf"{heading_prefix}(?:二|三|四|五|六|七|八|九|十|10|[2-9])[、.．]", text)
     )
-    has_intro_or_first_section = has_intro or has_first_section
-    has_report_structure = (has_intro and (has_first_section or has_later_body_section)) or (
-        has_first_section and has_later_body_section
-    )
-    starts_midstream = bool(re.match(r"^\s*(?:[-*+]\s+|\|)", text))
-    starts_after_first_section = bool(
-        re.match(
-            r"^\s*(?:#{1,6}\s*)?(?:二|三|四|五|六|七|八|九|十|10|[2-9])[、.．]",
-            text,
+    markdown_headings = [
+        (match.start(), re.sub(r"\s+#+\s*$", "", match.group(1)).strip())
+        for match in re.finditer(r"(?m)^\s*#{1,6}\s*(.+?)\s*$", text)
+    ]
+    intro_heading_positions = [
+        position
+        for position, title in markdown_headings
+        if re.match(r"^导语(?:\s|$|[：:])", title)
+    ]
+    has_natural_body_heading = bool(
+        intro_heading_positions
+        and any(
+            position > intro_heading_positions[0]
+            and not re.match(r"^导语(?:\s|$|[：:])", title)
+            for position, title in markdown_headings
         )
     )
-    if starts_after_first_section and not has_intro_or_first_section:
-        return "STARTS_MIDSTREAM"
+    has_report_structure = (
+        has_intro and (has_first_section or has_later_body_section or has_natural_body_heading)
+    ) or (
+        has_first_section and has_later_body_section
+    )
     if not has_report_structure:
         return "MISSING_REPORT_STRUCTURE"
 
@@ -5266,8 +5303,6 @@ def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
         diagnostics.get("weighted_evidence_chars") or diagnostics.get("total_content_chars") or 0
     )
     if weighted_chars >= 1000 and len(text) < 700:
-        return "REPORT_TOO_SHORT"
-    if len(text) < 500 and starts_midstream:
         return "REPORT_TOO_SHORT"
     return "OK"
 
@@ -5396,20 +5431,46 @@ def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str
 
 def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -> dict[str, Any]:
     source_markdown = str(result.get("report_markdown") or "")
-    validation_code = _dify_report_validation_code(source_markdown, pack)
     raw_quality_check = result.get("quality_check")
     quality_check = dict(raw_quality_check) if isinstance(raw_quality_check, dict) else {"passed": None, "issues": []}
     quality_issues = list(quality_check.get("issues") or []) if isinstance(quality_check.get("issues"), list) else []
     quality_check["issues"] = quality_issues
+    qa_passed = quality_check.get("passed")
+    qa_issue_count = len(quality_issues)
     observed = dict(result)
+    observed.pop("generation_failure_reason", None)
+
+    existing_backend_fallback = bool(result.get("fallback_used")) and (
+        str(result.get("fallback_provider") or "").strip() == "backend_pack_fallback"
+    )
+    if existing_backend_fallback:
+        observed.update(
+            {
+                "quality_check": quality_check,
+                "candidate_source": "backend_pack_fallback",
+                "generation_report_chars": max(
+                    0,
+                    _safe_int_value(result.get("generation_report_chars"), 0),
+                ),
+                "final_report_chars": len(source_markdown),
+                "generation_validation_code": "PROVIDER_FALLBACK",
+                "qa_passed": qa_passed,
+                "qa_issue_count": qa_issue_count,
+                "fallback_used": True,
+            }
+        )
+        return observed
+
+    validation_code = _dify_report_validation_code(source_markdown, pack)
     observed.update(
         {
+            "quality_check": quality_check,
             "candidate_source": "initial_generation",
             "generation_report_chars": len(source_markdown),
             "final_report_chars": len(source_markdown),
             "generation_validation_code": validation_code,
-            "qa_passed": quality_check.get("passed"),
-            "qa_issue_count": len(quality_issues),
+            "qa_passed": qa_passed,
+            "qa_issue_count": qa_issue_count,
             "fallback_used": bool(result.get("fallback_used")),
         }
     )
@@ -5473,11 +5534,7 @@ def _repair_unusable_dify_result(result: dict[str, Any], pack: dict[str, Any]) -
             "fallback_used": True,
             "fallback_reason": "OUTPUT_TRUNCATED",
             "fallback_provider": "backend_pack_fallback",
-            "generation_failure_reason": "OUTPUT_TRUNCATED",
             "generation_failure_codes": generation_failure_codes,
-            "provider": "backend_pack_fallback",
-            "qa_passed": False,
-            "qa_issue_count": len(quality_issues),
         }
     )
     return observed
