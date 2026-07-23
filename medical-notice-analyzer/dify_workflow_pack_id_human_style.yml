@@ -1,5 +1,5 @@
 app:
-  description: 基于 pack_id/evidence_pack 的医药公告采购分析报告生成工作流，强化人工报告风格、覆盖度和资料说明边界。
+  description: 一次报告生成+一次只读语义质检。
   icon: DOC
   icon_background: '#E0F2FE'
   mode: workflow
@@ -11,7 +11,7 @@ dependencies:
   value:
     marketplace_plugin_unique_identifier: langgenius/deepseek:0.0.17@f7a5c1d222d17ee419b17a80d6e4923838fe93788dc724a3af73fbc6990b3a32
 kind: app
-version: 0.1.5
+version: 0.1.6
 workflow:
   conversation_variables: []
   environment_variables: []
@@ -160,95 +160,11 @@ workflow:
         isInIteration: false
         isInLoop: false
         sourceType: code
-        targetType: if-else
-      id: parse-quality-to-gate
+        targetType: code
+      id: parse-quality-to-final-initial
       source: parse_quality_json
       sourceHandle: source
-      target: quality_gate
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: if-else
-        targetType: code
-      id: quality-passed-to-final
-      source: quality_gate
-      sourceHandle: passed
       target: final_initial_result
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: if-else
-        targetType: llm
-      id: quality-revise-to-revise
-      source: quality_gate
-      sourceHandle: revise
-      target: revise_report
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: if-else
-        targetType: code
-      id: quality-minor-to-final
-      source: quality_gate
-      sourceHandle: 'false'
-      target: final_initial_result
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: llm
-        targetType: code
-      id: revise-to-parse-revision
-      source: revise_report
-      sourceHandle: source
-      target: parse_revision_json
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: code
-        targetType: llm
-      id: parse-revision-to-qa2
-      source: parse_revision_json
-      sourceHandle: source
-      target: qa_revised_report
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: llm
-        targetType: code
-      id: qa2-to-parse-quality2
-      source: qa_revised_report
-      sourceHandle: source
-      target: parse_revised_quality_json
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: code
-        targetType: code
-      id: parse-quality2-to-final-revised
-      source: parse_revised_quality_json
-      sourceHandle: source
-      target: final_revised_result
       targetHandle: target
       type: custom
       zIndex: 0
@@ -261,18 +177,6 @@ workflow:
       source: final_initial_result
       sourceHandle: source
       target: end_initial
-      targetHandle: target
-      type: custom
-      zIndex: 0
-    - data:
-        isInIteration: false
-        isInLoop: false
-        sourceType: code
-        targetType: end
-      id: final-revised-to-end
-      source: final_revised_result
-      sourceHandle: source
-      target: end_revised
       targetHandle: target
       type: custom
       zIndex: 0
@@ -709,12 +613,11 @@ workflow:
             \ 附件当作已读取全文。\n5. 是否遗漏主材料核心规则，包括范围对象、挂网/申报规则、价格规则、执行时间、企业要求、医疗机构/平台要求、暂停/撤销/信用风险。\n6. 是否遗漏附件表格摘要中的关键字段，例如企业、产品、注册证号、医保编码、价格、中选状态、采购量。\n\
             7. 是否把附件未解析、仅元数据、下载失败等材料完整性提示、声明或资料说明写入 report_markdown；这类内容只能进入 generation_warnings、warnings 或诊断中。\n8. 是否缺少必要 Markdown 表格；如果证据存在明显规则清单、状态表、价格/产品/中选结果结构信息而报告完全不用表格，应列为\
             \ major。\n9. 是否只有摘要、缺少影响分析、风险提示、企业建议或企业关注点；若缺少有原文支撑的分析内容，应列为 major，problem_type 使用 summary_only。\n10. 是否存在分析判断但不能从 evidence_pack 原文、附件摘要、key_facts、important_sections 或 table_summaries 推出；此类问题应列为 unsupported_claim 或 over_inference。\n11. 是否存在过度推断、绝对化表述或营销化语言。\n12. report_markdown 是否混入 JSON、调试信息、提示词或模型思考过程。\n13. 红色/蓝色/黄色标注是否基于 evidence_pack，是否改变事实含义。\n\
-            \nseverity 只能使用 fatal、high、major、minor。只有 fatal/high/major 需要自动修订，minor 不触发自动修订。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\
+            \nseverity 只能使用 fatal、high、major、minor。质检只识别和记录问题，不得修改 report_markdown。passed=false 时报告进入 needs_manual_review，不触发自动修订。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\
             \ngeneration_warnings:\n{{#parse_generation_json.generation_warnings_json#}}\n\nreport_markdown:\n{{#parse_generation_json.report_markdown#}}\n\
             \n返回 JSON：\n{\n  \"passed\": false,\n  \"round\": 1,\n  \"issues\": [\n    {\n      \"issue_id\": \"Q001\",\n\
             \      \"severity\": \"high\",\n      \"problem_type\": \"unsupported_claim\",\n      \"report_text\": \"\",\n\
-            \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ],\n  \"revision_instruction\": \"请只修订\
-            \ issues 指出的问题，不要重写无问题段落。\"\n}\n"
+            \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ]\n}\n"
         - role: user
           text: "长期记忆质检边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，不按长期记忆检查报告。\n- report_memory 只能用于写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实；如报告把 report_memory 当作当前公告事实来源，应列为 unsupported_claim 或 over_inference。"
         retry_config:
@@ -739,13 +642,10 @@ workflow:
                 type: array
                 items:
                   type: object
-              revision_instruction:
-                type: string
             required:
             - passed
             - round
             - issues
-            - revision_instruction
         title: Quality Check Round 1
         type: llm
         variables: []
@@ -765,29 +665,86 @@ workflow:
       type: custom
       width: 243
     - data:
-        code: "def main(quality_text: str) -> dict:\n    import json\n    import re\n\n    def extract_json(text):\n     \
-          \   text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\s*\", \"\", text)\n        text = re.sub(r\"\
-          \\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if start < 0:\n            return {}\n      \
-          \  depth = 0\n        in_string = False\n        escape = False\n        for index in range(start, len(text)):\n\
-          \            char = text[index]\n            if in_string:\n                if escape:\n                    escape\
-          \ = False\n                elif char == \"\\\\\":\n                    escape = True\n                elif char\
-          \ == '\"':\n                    in_string = False\n                continue\n            if char == '\"':\n    \
-          \            in_string = True\n            elif char == \"{\":\n                depth += 1\n            elif char\
-          \ == \"}\":\n                depth -= 1\n                if depth == 0:\n                    return json.loads(text[start:index\
-          \ + 1])\n        return json.loads(text[start:])\n    try:\n        data = extract_json(quality_text)\n    except\
-          \ Exception as exc:\n        data = {\n            \"passed\": False,\n            \"round\": 1,\n            \"\
-          issues\": [{\"issue_id\": \"Q_PARSE\", \"severity\": \"fatal\", \"problem_type\": \"quality_json_parse_failed\"\
-          , \"report_text\": \"\", \"source_basis\": \"\", \"fix_instruction\": str(exc)}],\n            \"revision_instruction\"\
-          : \"Quality node did not return valid JSON. Revise or review manually.\",\n        }\n    issues = data.get(\"issues\"\
-          ) if isinstance(data, dict) else []\n    if not isinstance(issues, list):\n        issues = []\n    severe = []\n\
-          \    for issue in issues:\n        if not isinstance(issue, dict):\n            continue\n        severity = str(issue.get(\"\
-          severity\") or \"\").lower()\n        if severity in {\"fatal\", \"high\", \"major\"}:\n            severe.append(issue)\n\
-          \    passed = bool(data.get(\"passed\")) if isinstance(data, dict) else False\n    if passed:\n        route = \"\
-          passed\"\n    elif severe:\n        route = \"revise\"\n    else:\n        route = \"minor_only\"\n    if isinstance(data,\
-          \ dict):\n        data[\"issues\"] = issues\n    return {\n        \"quality_json\": json.dumps(data if isinstance(data,\
-          \ dict) else {}, ensure_ascii=False),\n        \"issues_json\": json.dumps(issues, ensure_ascii=False),\n      \
-          \  \"severe_issues_json\": json.dumps(severe, ensure_ascii=False),\n        \"revision_instruction\": str(data.get(\"\
-          revision_instruction\") or \"\") if isinstance(data, dict) else \"\",\n        \"route\": route,\n    }\n"
+        code: |
+          def main(quality_text: str) -> dict:
+              import json
+              import re
+
+              def extract_json(text):
+                  text = (text or "").strip()
+                  text = re.sub(r"^```(?:json)?\s*", "", text)
+                  text = re.sub(r"\s*```$", "", text)
+                  start = text.find("{")
+                  if start < 0:
+                      raise ValueError("JSON object not found")
+                  depth = 0
+                  in_string = False
+                  escape = False
+                  for index in range(start, len(text)):
+                      char = text[index]
+                      if in_string:
+                          if escape:
+                              escape = False
+                          elif char == "\\":
+                              escape = True
+                          elif char == '"':
+                              in_string = False
+                          continue
+                      if char == '"':
+                          in_string = True
+                      elif char == "{":
+                          depth += 1
+                      elif char == "}":
+                          depth -= 1
+                          if depth == 0:
+                              return json.loads(text[start:index + 1])
+                  raise ValueError("JSON object not closed")
+
+              try:
+                  data = extract_json(quality_text)
+              except Exception as exc:
+                  data = {
+                      "passed": False,
+                      "round": 1,
+                      "issues": [{
+                          "issue_id": "Q_PARSE",
+                          "severity": "fatal",
+                          "problem_type": "quality_json_parse_failed",
+                          "report_text": "",
+                          "source_basis": "",
+                          "fix_instruction": str(exc),
+                      }],
+                  }
+              if not isinstance(data, dict):
+                  data = {}
+              raw_issues = data.get("issues")
+              if not isinstance(raw_issues, list):
+                  raw_issues = []
+              issues = []
+              for index, raw_issue in enumerate(raw_issues, start=1):
+                  if not isinstance(raw_issue, dict):
+                      continue
+                  severity = str(raw_issue.get("severity") or "minor").lower()
+                  if severity not in {"fatal", "high", "major", "minor"}:
+                      severity = "minor"
+                  issues.append({
+                      "issue_id": str(raw_issue.get("issue_id") or "Q%03d" % index),
+                      "severity": severity,
+                      "problem_type": str(raw_issue.get("problem_type") or "unspecified"),
+                      "report_text": str(raw_issue.get("report_text") or ""),
+                      "source_basis": str(raw_issue.get("source_basis") or ""),
+                      "fix_instruction": str(raw_issue.get("fix_instruction") or ""),
+                  })
+              blocking = any(issue["severity"] in {"fatal", "high", "major"} for issue in issues)
+              data = {
+                  "passed": bool(data.get("passed")) and not blocking,
+                  "round": 1,
+                  "issues": issues,
+              }
+              return {
+                  "quality_json": json.dumps(data, ensure_ascii=False),
+                  "issues_json": json.dumps(issues, ensure_ascii=False),
+              }
         code_language: python3
         desc: ''
         outputs:
@@ -795,15 +752,6 @@ workflow:
             children: null
             type: string
           quality_json:
-            children: null
-            type: string
-          revision_instruction:
-            children: null
-            type: string
-          route:
-            children: null
-            type: string
-          severe_issues_json:
             children: null
             type: string
         selected: false
@@ -828,363 +776,45 @@ workflow:
       type: custom
       width: 243
     - data:
-        cases:
-        - case_id: passed
-          conditions:
-          - comparison_operator: is
-            id: quality-passed-condition
-            value: passed
-            varType: string
-            variable_selector:
-            - parse_quality_json
-            - route
-          id: passed
-          logical_operator: and
-        - case_id: revise
-          conditions:
-          - comparison_operator: is
-            id: quality-revise-condition
-            value: revise
-            varType: string
-            variable_selector:
-            - parse_quality_json
-            - route
-          id: revise
-          logical_operator: and
-        desc: ''
-        selected: false
-        title: Quality Gate
-        type: if-else
-      height: 173
-      id: quality_gate
-      position:
-        x: 2400
-        y: 180
-      positionAbsolute:
-        x: 2400
-        y: 180
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        context:
-          enabled: false
-          variable_selector: []
-        desc: ''
-        memory:
-          enabled: false
-          role_prefix:
-            assistant: ''
-            user: ''
-          window:
-            enabled: false
-            size: 50
-        model:
-          completion_params:
-            max_tokens: 8192
-            reasoning_effort: high
-            response_format: json_object
-            temperature: 0
-            thinking: true
-          mode: chat
-          name: deepseek-v4-pro
-          provider: langgenius/deepseek/deepseek
-        prompt_template:
-        - id: cea1292b-c511-4663-a313-f9c4d7dbe8db
-          role: user
-          text: "你是中文医药器械政策分析报告修订助手。请只补齐缺失项和修复 quality_check.issues 指出的问题，不要重写无问题段落，不要新增 evidence_pack 中不存在的内容。不要输出思考过程，只返回一个合法\
-            \ JSON 对象，不要使用 Markdown 代码围栏。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\nprevious report_title:\n\
-            {{#parse_generation_json.report_title#}}\n\nprevious report_markdown:\n{{#parse_generation_json.report_markdown#}}\n\
-            \nquality_check.issues:\n{{#parse_quality_json.issues_json#}}\n\nrevision_instruction:\n{{#parse_quality_json.revision_instruction#}}\n\
-            \n修订要求：\n- 输出完整修订后的 report_markdown，不要只输出片段。\n- 保持人工报告风格：导语、主题化规则拆解、必要 Markdown 表格、企业关注点。\n- 只补齐缺失项、删除无依据内容、删除 report_markdown 中的额外材料说明或声明，不重写无问题段落。\n\
-            - 如缺少主材料核心规则或附件表格摘要，应在合适章节补充，但只能使用 evidence_pack 明确披露的信息。\n- 不要在 report_markdown 中生成额外材料说明或声明；材料限制只放入 warnings。\n- 不要编造未解析附件中的企业、产品、价格、中选结果。\n\
-            - 不要把 JSON、质检过程、调试信息写入 report_markdown。\n\n返回 JSON：\n{\n  \"version\": 2,\n  \"report_title\": \"\",\n  \"report_markdown\"\
-            : \"\",\n  \"fixed_issue_ids\": [],\n  \"revision_notes\": \"\"\n}\n"
-        - role: user
-          text: "长期记忆修订边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，完全忽略长期记忆。\n- report_memory 只能用于修订写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实，不得新增 evidence_pack 中没有的事实、日期、价格、企业、产品或规则。"
-        retry_config:
-          enabled: false
-          exponential_backoff:
-            enabled: false
-            max_interval: 10000
-            multiplier: 2
-          max_retries: 2
-          retry_interval: 1000
-        selected: false
-        structured_output:
-          enabled: true
-          schema:
-            type: object
-            properties:
-              version:
-                type: integer
-              report_title:
-                type: string
-              report_markdown:
-                type: string
-              fixed_issue_ids:
-                type: array
-                items:
-                  type: string
-              revision_notes:
-                type: string
-            required:
-            - version
-            - report_title
-            - report_markdown
-            - fixed_issue_ids
-            - revision_notes
-        title: Revise Report JSON
-        type: llm
-        variables: []
-        vision:
-          enabled: false
-      height: 89
-      id: revise_report
-      position:
-        x: 2700
-        y: 300
-      positionAbsolute:
-        x: 2700
-        y: 300
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        code: "def main(revision_text: str, previous_title: str, previous_report: str) -> dict:\n    import json\n    import\
-          \ re\n\n    def extract_json(text):\n        text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\\
-          s*\", \"\", text)\n        text = re.sub(r\"\\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if\
-          \ start < 0:\n            return {}\n        depth = 0\n        in_string = False\n        escape = False\n    \
-          \    for index in range(start, len(text)):\n            char = text[index]\n            if in_string:\n        \
-          \        if escape:\n                    escape = False\n                elif char == \"\\\\\":\n              \
-          \      escape = True\n                elif char == '\"':\n                    in_string = False\n              \
-          \  continue\n            if char == '\"':\n                in_string = True\n            elif char == \"{\":\n \
-          \               depth += 1\n            elif char == \"}\":\n                depth -= 1\n                if depth\
-          \ == 0:\n                    return json.loads(text[start:index + 1])\n        return json.loads(text[start:])\n\
-          \    try:\n        data = extract_json(revision_text)\n    except Exception as exc:\n        data = {\n        \
-          \    \"version\": 2,\n            \"report_title\": previous_title or \"\",\n            \"report_markdown\": previous_report\
-          \ or \"\",\n            \"fixed_issue_ids\": [],\n            \"revision_notes\": \"Revision node did not return\
-          \ valid JSON; kept previous report: \" + str(exc),\n        }\n    if not isinstance(data, dict):\n        data\
-          \ = {}\n    data.setdefault(\"version\", 2)\n    data.setdefault(\"report_title\", previous_title or \"\")\n   \
-          \ data.setdefault(\"report_markdown\", previous_report or \"\")\n    data.setdefault(\"fixed_issue_ids\", [])\n\
-          \    data.setdefault(\"revision_notes\", \"\")\n    return {\n        \"revision_json\": json.dumps(data, ensure_ascii=False),\n\
-          \        \"report_title\": str(data.get(\"report_title\") or \"\"),\n        \"report_markdown\": str(data.get(\"\
-          report_markdown\") or \"\"),\n        \"version\": str(data.get(\"version\") or 2),\n        \"fixed_issue_ids_json\"\
-          : json.dumps(data.get(\"fixed_issue_ids\") or [], ensure_ascii=False),\n    }\n"
-        code_language: python3
-        desc: ''
-        outputs:
-          fixed_issue_ids_json:
-            children: null
-            type: string
-          report_markdown:
-            children: null
-            type: string
-          report_title:
-            children: null
-            type: string
-          revision_json:
-            children: null
-            type: string
-          version:
-            children: null
-            type: string
-        selected: false
-        title: Parse Revision JSON
-        type: code
-        variables:
-        - value_selector:
-          - revise_report
-          - text
-          variable: revision_text
-        - value_selector:
-          - parse_generation_json
-          - report_title
-          variable: previous_title
-        - value_selector:
-          - parse_generation_json
-          - report_markdown
-          variable: previous_report
-      height: 53
-      id: parse_revision_json
-      position:
-        x: 3000
-        y: 300
-      positionAbsolute:
-        x: 3000
-        y: 300
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        context:
-          enabled: false
-          variable_selector: []
-        desc: ''
-        memory:
-          enabled: false
-          role_prefix:
-            assistant: ''
-            user: ''
-          window:
-            enabled: false
-            size: 50
-        model:
-          completion_params:
-            max_tokens: 4096
-            response_format: json_object
-            temperature: 0
-            thinking: false
-          mode: chat
-          name: deepseek-v4-flash
-          provider: langgenius/deepseek/deepseek
-        prompt_template:
-        - role: user
-          text: "你是中文医药器械政策分析报告质检助手。请核对报告是否忠实于 evidence_pack。不要输出思考过程，只返回一个合法 JSON 对象，不要使用 Markdown 代码围栏。\n\n质检重点：\n1. 是否存在\
-            \ evidence_pack 中没有依据的事实。\n2. 日期、数字、价格、主体名称、项目阶段、适用范围是否错误。\n3. 是否混淆主材料和辅助材料，辅助材料是否反客为主。\n4. 是否把 metadata_only、network_unreachable、download_failed、unsupported、parse_failed\
-            \ 附件当作已读取全文。\n5. 是否遗漏主材料核心规则，包括范围对象、挂网/申报规则、价格规则、执行时间、企业要求、医疗机构/平台要求、暂停/撤销/信用风险。\n6. 是否遗漏附件表格摘要中的关键字段，例如企业、产品、注册证号、医保编码、价格、中选状态、采购量。\n\
-            7. 是否把附件未解析、仅元数据、下载失败等材料完整性提示、声明或资料说明写入 report_markdown；这类内容只能进入 generation_warnings、warnings 或诊断中。\n8. 是否缺少必要 Markdown 表格；如果证据存在明显规则清单、状态表、价格/产品/中选结果结构信息而报告完全不用表格，应列为\
-            \ major。\n9. 是否只有摘要、缺少影响分析、风险提示、企业建议或企业关注点；若缺少有原文支撑的分析内容，应列为 major，problem_type 使用 summary_only。\n10. 是否存在分析判断但不能从 evidence_pack 原文、附件摘要、key_facts、important_sections 或 table_summaries 推出；此类问题应列为 unsupported_claim 或 over_inference。\n11. 是否存在过度推断、绝对化表述或营销化语言。\n12. report_markdown 是否混入 JSON、调试信息、提示词或模型思考过程。\n13. 红色/蓝色/黄色标注是否基于 evidence_pack，是否改变事实含义。\n\
-            \nseverity 只能使用 fatal、high、major、minor。只有 fatal/high/major 需要自动修订，minor 不触发自动修订。\n\nevidence_pack:\n{{#parse_evidence_pack.evidence_pack_json#}}\n\
-            \ngeneration_warnings:\n{{#parse_generation_json.generation_warnings_json#}}\n\nreport_markdown:\n{{#parse_revision_json.report_markdown#}}\n\
-            \n返回 JSON：\n{\n  \"passed\": false,\n  \"round\": 2,\n  \"issues\": [\n    {\n      \"issue_id\": \"Q001\",\n\
-            \      \"severity\": \"high\",\n      \"problem_type\": \"unsupported_claim\",\n      \"report_text\": \"\",\n\
-            \      \"source_basis\": \"\",\n      \"fix_instruction\": \"\"\n    }\n  ],\n  \"revision_instruction\": \"请只修订\
-            \ issues 指出的问题，不要重写无问题段落。\"\n}\n"
-        - role: user
-          text: "长期记忆质检边界：\nuse_report_memory:\n{{#start_node.use_report_memory#}}\n\nreport_memory:\n{{#start_node.report_memory#}}\n\n规则：\n- report_memory 为空或 use_report_memory=false 时，不按长期记忆检查报告。\n- report_memory 只能用于写作规则、分析口径、常见错误、附件处理、表格规则和质检规则。\n- 不得使用 report_memory 覆盖当前公告事实；如修订稿把 report_memory 当作当前公告事实来源，应列为 unsupported_claim 或 over_inference。"
-        retry_config:
-          enabled: false
-          exponential_backoff:
-            enabled: false
-            max_interval: 10000
-            multiplier: 2
-          max_retries: 2
-          retry_interval: 1000
-        selected: false
-        structured_output:
-          enabled: true
-          schema:
-            type: object
-            properties:
-              passed:
-                type: boolean
-              round:
-                type: integer
-              issues:
-                type: array
-                items:
-                  type: object
-              revision_instruction:
-                type: string
-            required:
-            - passed
-            - round
-            - issues
-            - revision_instruction
-        title: Quality Check Round 2
-        type: llm
-        variables: []
-        vision:
-          enabled: false
-      height: 89
-      id: qa_revised_report
-      position:
-        x: 3300
-        y: 300
-      positionAbsolute:
-        x: 3300
-        y: 300
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        code: "def main(quality_text: str) -> dict:\n    import json\n    import re\n\n    def extract_json(text):\n     \
-          \   text = (text or \"\").strip()\n        text = re.sub(r\"^```(?:json)?\\s*\", \"\", text)\n        text = re.sub(r\"\
-          \\s*```$\", \"\", text)\n        start = text.find(\"{\")\n        if start < 0:\n            return {}\n      \
-          \  depth = 0\n        in_string = False\n        escape = False\n        for index in range(start, len(text)):\n\
-          \            char = text[index]\n            if in_string:\n                if escape:\n                    escape\
-          \ = False\n                elif char == \"\\\\\":\n                    escape = True\n                elif char\
-          \ == '\"':\n                    in_string = False\n                continue\n            if char == '\"':\n    \
-          \            in_string = True\n            elif char == \"{\":\n                depth += 1\n            elif char\
-          \ == \"}\":\n                depth -= 1\n                if depth == 0:\n                    return json.loads(text[start:index\
-          \ + 1])\n        return json.loads(text[start:])\n    try:\n        data = extract_json(quality_text)\n    except\
-          \ Exception as exc:\n        data = {\n            \"passed\": False,\n            \"round\": 2,\n            \"\
-          issues\": [{\"issue_id\": \"Q_PARSE\", \"severity\": \"fatal\", \"problem_type\": \"quality_json_parse_failed\"\
-          , \"report_text\": \"\", \"source_basis\": \"\", \"fix_instruction\": str(exc)}],\n            \"revision_instruction\"\
-          : \"Quality node did not return valid JSON. Revise or review manually.\",\n        }\n    issues = data.get(\"issues\"\
-          ) if isinstance(data, dict) else []\n    if not isinstance(issues, list):\n        issues = []\n    severe = []\n\
-          \    for issue in issues:\n        if not isinstance(issue, dict):\n            continue\n        severity = str(issue.get(\"\
-          severity\") or \"\").lower()\n        if severity in {\"fatal\", \"high\", \"major\"}:\n            severe.append(issue)\n\
-          \    passed = bool(data.get(\"passed\")) if isinstance(data, dict) else False\n    if passed:\n        route = \"\
-          passed\"\n    elif severe:\n        route = \"revise\"\n    else:\n        route = \"minor_only\"\n    if isinstance(data,\
-          \ dict):\n        data[\"issues\"] = issues\n    return {\n        \"quality_json\": json.dumps(data if isinstance(data,\
-          \ dict) else {}, ensure_ascii=False),\n        \"issues_json\": json.dumps(issues, ensure_ascii=False),\n      \
-          \  \"severe_issues_json\": json.dumps(severe, ensure_ascii=False),\n        \"revision_instruction\": str(data.get(\"\
-          revision_instruction\") or \"\") if isinstance(data, dict) else \"\",\n        \"route\": route,\n    }\n"
-        code_language: python3
-        desc: ''
-        outputs:
-          issues_json:
-            children: null
-            type: string
-          quality_json:
-            children: null
-            type: string
-          revision_instruction:
-            children: null
-            type: string
-          route:
-            children: null
-            type: string
-          severe_issues_json:
-            children: null
-            type: string
-        selected: false
-        title: Parse Revised Quality JSON
-        type: code
-        variables:
-        - value_selector:
-          - qa_revised_report
-          - text
-          variable: quality_text
-      height: 53
-      id: parse_revised_quality_json
-      position:
-        x: 3600
-        y: 300
-      positionAbsolute:
-        x: 3600
-        y: 300
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        code: "def main(pack_id: str, generation_json: str, quality_json: str) -> dict:\n    import json\n    try:\n     \
-          \   generation = json.loads(generation_json or \"{}\")\n    except Exception:\n        generation = {}\n    try:\n\
-          \        quality = json.loads(quality_json or \"{}\")\n    except Exception:\n        quality = {\"passed\": False,\
-          \ \"issues\": []}\n    issues = quality.get(\"issues\") if isinstance(quality, dict) else []\n    if not isinstance(issues,\
-          \ list):\n        issues = []\n    remaining = [] if quality.get(\"passed\") else [i for i in issues if isinstance(i,\
-          \ dict) and str(i.get(\"severity\") or \"\").lower() == \"minor\"]\n    result = {\n        \"status\": \"finished\"\
-          ,\n        \"pack_id\": pack_id,\n        \"report_title\": generation.get(\"report_title\") or \"\",\n        \"\
-          report_markdown\": generation.get(\"report_markdown\") or \"\",\n        \"version\": int(generation.get(\"version\"\
-          ) or 1),\n        \"quality_check\": quality,\n        \"generation_warnings\": generation.get(\"generation_warnings\"\
-          ) or [],\n        \"remaining_issues\": remaining,\n    }\n    return {\n        \"result\": json.dumps(result,\
-          \ ensure_ascii=False),\n        \"status\": result[\"status\"],\n        \"pack_id\": pack_id,\n        \"report_title\"\
-          : result[\"report_title\"],\n        \"report_markdown\": result[\"report_markdown\"],\n        \"version\": str(result[\"\
-          version\"]),\n        \"quality_check\": json.dumps(quality, ensure_ascii=False),\n        \"generation_warnings\"\
-          : json.dumps(result[\"generation_warnings\"], ensure_ascii=False),\n        \"remaining_issues\": json.dumps(remaining,\
-          \ ensure_ascii=False),\n    }\n"
+        code: |
+          def main(pack_id: str, generation_json: str, quality_json: str) -> dict:
+              import json
+              try:
+                  generation = json.loads(generation_json or "{}")
+              except Exception:
+                  generation = {}
+              try:
+                  quality = json.loads(quality_json or "{}")
+              except Exception:
+                  quality = {"passed": False, "issues": []}
+              if not isinstance(quality, dict):
+                  quality = {"passed": False, "issues": []}
+              issues = quality.get("issues")
+              if not isinstance(issues, list):
+                  issues = []
+              passed = bool(quality.get("passed"))
+              remaining = [] if passed else issues
+              result = {
+                  "status": "finished" if passed else "needs_manual_review",
+                  "pack_id": pack_id,
+                  "report_title": generation.get("report_title") or "",
+                  "report_markdown": generation.get("report_markdown") or "",
+                  "version": int(generation.get("version") or 1),
+                  "quality_check": quality,
+                  "generation_warnings": generation.get("generation_warnings") or [],
+                  "remaining_issues": remaining,
+              }
+              return {
+                  "result": json.dumps(result, ensure_ascii=False),
+                  "status": result["status"],
+                  "pack_id": pack_id,
+                  "report_title": result["report_title"],
+                  "report_markdown": result["report_markdown"],
+                  "version": str(result["version"]),
+                  "quality_check": json.dumps(quality, ensure_ascii=False),
+                  "generation_warnings": json.dumps(result["generation_warnings"], ensure_ascii=False),
+                  "remaining_issues": json.dumps(remaining, ensure_ascii=False),
+              }
         code_language: python3
         desc: ''
         outputs:
@@ -1239,86 +869,6 @@ workflow:
       positionAbsolute:
         x: 2700
         y: -67.14285714285714
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        code: "def main(pack_id: str, generation_json: str, revision_json: str, revised_quality_json: str) -> dict:\n    import\
-          \ json\n    try:\n        generation = json.loads(generation_json or \"{}\")\n    except Exception:\n        generation\
-          \ = {}\n    try:\n        revision = json.loads(revision_json or \"{}\")\n    except Exception:\n        revision\
-          \ = {}\n    try:\n        quality = json.loads(revised_quality_json or \"{}\")\n    except Exception:\n        quality\
-          \ = {\"passed\": False, \"issues\": []}\n    issues = quality.get(\"issues\") if isinstance(quality, dict) else\
-          \ []\n    if not isinstance(issues, list):\n        issues = []\n    passed = bool(quality.get(\"passed\"))\n  \
-          \  result = {\n        \"status\": \"finished\" if passed else \"needs_manual_review\",\n        \"pack_id\": pack_id,\n\
-          \        \"report_title\": revision.get(\"report_title\") or generation.get(\"report_title\") or \"\",\n       \
-          \ \"report_markdown\": revision.get(\"report_markdown\") or generation.get(\"report_markdown\") or \"\",\n     \
-          \   \"version\": int(revision.get(\"version\") or 2),\n        \"quality_check\": quality,\n        \"generation_warnings\"\
-          : generation.get(\"generation_warnings\") or [],\n        \"remaining_issues\": [] if passed else issues,\n    }\n\
-          \    return {\n        \"result\": json.dumps(result, ensure_ascii=False),\n        \"status\": result[\"status\"\
-          ],\n        \"pack_id\": pack_id,\n        \"report_title\": result[\"report_title\"],\n        \"report_markdown\"\
-          : result[\"report_markdown\"],\n        \"version\": str(result[\"version\"]),\n        \"quality_check\": json.dumps(quality,\
-          \ ensure_ascii=False),\n        \"generation_warnings\": json.dumps(result[\"generation_warnings\"], ensure_ascii=False),\n\
-          \        \"remaining_issues\": json.dumps(result[\"remaining_issues\"], ensure_ascii=False),\n    }\n"
-        code_language: python3
-        desc: ''
-        outputs:
-          generation_warnings:
-            children: null
-            type: string
-          pack_id:
-            children: null
-            type: string
-          quality_check:
-            children: null
-            type: string
-          remaining_issues:
-            children: null
-            type: string
-          report_markdown:
-            children: null
-            type: string
-          report_title:
-            children: null
-            type: string
-          result:
-            children: null
-            type: string
-          status:
-            children: null
-            type: string
-          version:
-            children: null
-            type: string
-        selected: false
-        title: Final Revised Result
-        type: code
-        variables:
-        - value_selector:
-          - start_node
-          - pack_id
-          variable: pack_id
-        - value_selector:
-          - parse_generation_json
-          - generation_json
-          variable: generation_json
-        - value_selector:
-          - parse_revision_json
-          - revision_json
-          variable: revision_json
-        - value_selector:
-          - parse_revised_quality_json
-          - quality_json
-          variable: revised_quality_json
-      height: 53
-      id: final_revised_result
-      position:
-        x: 3900
-        y: 300
-      positionAbsolute:
-        x: 3900
-        y: 300
       selected: false
       sourcePosition: right
       targetPosition: left
@@ -1447,70 +997,6 @@ workflow:
       positionAbsolute:
         x: 3005.714285714286
         y: -67.14285714285714
-      selected: false
-      sourcePosition: right
-      targetPosition: left
-      type: custom
-      width: 243
-    - data:
-        desc: ''
-        outputs:
-        - value_selector:
-          - final_revised_result
-          - result
-          value_type: string
-          variable: result
-        - value_selector:
-          - final_revised_result
-          - status
-          value_type: string
-          variable: status
-        - value_selector:
-          - final_revised_result
-          - pack_id
-          value_type: string
-          variable: pack_id
-        - value_selector:
-          - final_revised_result
-          - report_title
-          value_type: string
-          variable: report_title
-        - value_selector:
-          - final_revised_result
-          - report_markdown
-          value_type: string
-          variable: report_markdown
-        - value_selector:
-          - final_revised_result
-          - version
-          value_type: string
-          variable: version
-        - value_selector:
-          - final_revised_result
-          - quality_check
-          value_type: string
-          variable: quality_check
-        - value_selector:
-          - final_revised_result
-          - generation_warnings
-          value_type: string
-          variable: generation_warnings
-        - value_selector:
-          - final_revised_result
-          - remaining_issues
-          value_type: string
-          variable: remaining_issues
-        selected: false
-        title: End Revised
-        type: end
-      height: 297
-      id: end_revised
-      position:
-        x: 4200
-        y: 300
-      positionAbsolute:
-        x: 4200
-        y: 300
       selected: false
       sourcePosition: right
       targetPosition: left
