@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
 
+
+logger = logging.getLogger("medical_notice_analyzer")
 
 _ALLOWED_LLM_ORIGIN = "https://api.deepseek.com"
 _DEFAULT_DIRECT_MAX_CHARS = 80_000
@@ -230,29 +235,28 @@ def _split_text(text: str, limit: int) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def _payload_chunks(payload: dict[str, Any], limit: int) -> list[str]:
-    documents: list[str] = []
-    for index, material in enumerate(
-        [*list(payload.get("primary_materials") or []), *list(payload.get("auxiliary_materials") or [])],
-        start=1,
+def _payload_chunks(payload: dict[str, Any], limit: int) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for collection_key, role, role_label in (
+        ("primary_materials", "primary", "主材料"),
+        ("auxiliary_materials", "auxiliary", "辅助材料"),
     ):
-        role = "主材料" if material.get("role") == "primary" else "辅助材料"
-        documents.append(
-            f"{role}{index}\n"
-            + json.dumps(material, ensure_ascii=False, separators=(",", ":"))
-        )
-    chunks: list[str] = []
-    current = ""
-    for document in documents:
-        for part in _split_text(document, limit):
-            candidate = f"{current}\n\n{part}".strip() if current else part
-            if current and len(candidate) > limit:
-                chunks.append(current)
-                current = part
-            else:
-                current = candidate
-    if current:
-        chunks.append(current)
+        for material_index, material in enumerate(
+            list(payload.get(collection_key) or [])
+        ):
+            document = (
+                f"{role_label}{material_index + 1}\n"
+                + json.dumps(material, ensure_ascii=False, separators=(",", ":"))
+            )
+            for chunk_index, part in enumerate(_split_text(document, limit)):
+                chunks.append(
+                    {
+                        "role": role,
+                        "material_index": material_index,
+                        "chunk_index": chunk_index,
+                        "text": part,
+                    }
+                )
     return chunks
 
 
@@ -304,6 +308,72 @@ def _request_long_summary(chunk: str, output_chars: int) -> str:
     except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
         return ""
     return summary[:output_chars]
+
+
+def _request_long_summaries(
+    chunks: list[dict[str, Any]],
+    output_chars: int,
+) -> tuple[list[str], int]:
+    if not chunks:
+        return [], 0
+    configured = _env_int("LONG_EVIDENCE_LLM_CONCURRENCY", 5)
+    worker_limit = max(4, min(6, configured))
+    workers = min(worker_limit, len(chunks))
+    started = time.perf_counter()
+    with ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="evidence-summary",
+    ) as executor:
+        summaries = list(
+            executor.map(
+                lambda chunk: _request_long_summary(chunk["text"], output_chars),
+                chunks,
+            )
+        )
+    logger.info(
+        "long_evidence_llm_compression_completed chunk_count=%s concurrency=%s "
+        "success_count=%s elapsed_ms=%s",
+        len(chunks),
+        workers,
+        sum(bool(summary) for summary in summaries),
+        round((time.perf_counter() - started) * 1000),
+    )
+    return summaries, workers
+
+
+def _compressed_materials(
+    payload: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    summaries: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[tuple[str, int], list[str]] = {}
+    for chunk, summary in zip(chunks, summaries):
+        grouped.setdefault(
+            (str(chunk["role"]), int(chunk["material_index"])),
+            [],
+        ).append(summary)
+
+    result: dict[str, list[dict[str, Any]]] = {
+        "primary": [],
+        "auxiliary": [],
+    }
+    for collection_key, role in (
+        ("primary_materials", "primary"),
+        ("auxiliary_materials", "auxiliary"),
+    ):
+        for material_index, material in enumerate(
+            list(payload.get(collection_key) or [])
+        ):
+            compressed = {
+                key: copy.deepcopy(value)
+                for key, value in material.items()
+                if key not in {"body", "attachments"}
+            }
+            compressed["body"] = "\n\n".join(
+                grouped.get((role, material_index), [])
+            )
+            result[role].append(compressed)
+    return result["primary"], result["auxiliary"]
 
 
 def _rule_compress(payload: dict[str, Any], max_chars: int) -> dict[str, Any]:
@@ -384,13 +454,19 @@ def prepare_generation_payload(pack: dict[str, Any]) -> dict[str, Any]:
     output_limit = max(2_000, _env_int("LONG_EVIDENCE_LLM_OUTPUT_CHARS", _DEFAULT_LLM_OUTPUT_CHARS))
     chunks = _payload_chunks(payload, chunk_limit)
     per_chunk_output = max(2_000, min(output_limit, (final_limit - 5_000) // max(1, len(chunks))))
-    summaries = [_request_long_summary(chunk, per_chunk_output) for chunk in chunks]
+    summaries, _ = _request_long_summaries(chunks, per_chunk_output)
     if chunks and all(summaries):
+        compressed_primary, compressed_auxiliary = _compressed_materials(
+            payload,
+            chunks,
+            summaries,
+        )
         compressed = {
             "pack_variant": "generation_payload",
             "input_strategy": "llm_compressed",
             "effective_content_chars": effective_chars,
-            "compressed_evidence": summaries,
+            "primary_materials": compressed_primary,
+            "auxiliary_materials": compressed_auxiliary,
             "generation_guidance": copy.deepcopy(payload["generation_guidance"]),
             "generation_warnings": [],
         }
