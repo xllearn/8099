@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 
 
-_ALLOWED_LLM_ORIGIN = "http://192.168.34.97"
+_ALLOWED_LLM_ORIGIN = "https://api.deepseek.com"
 _DEFAULT_DIRECT_MAX_CHARS = 80_000
 _DEFAULT_LLM_CHUNK_CHARS = 55_000
 _DEFAULT_LLM_OUTPUT_CHARS = 14_000
@@ -261,7 +261,7 @@ def _request_long_summary(chunk: str, output_chars: int) -> str:
         return ""
     base_url = (os.getenv("EVIDENCE_SUMMARY_LLM_BASE_URL") or _ALLOWED_LLM_ORIGIN).strip().rstrip("/")
     chat_path = (os.getenv("EVIDENCE_SUMMARY_LLM_CHAT_PATH") or "/v1/chat/completions").strip()
-    model = (os.getenv("EVIDENCE_SUMMARY_LLM_MODEL") or "elian-deepseek-v4-flash").strip()
+    model = (os.getenv("EVIDENCE_SUMMARY_LLM_MODEL") or "deepseek-v4-flash").strip()
     api_key = (os.getenv("EVIDENCE_SUMMARY_LLM_API_KEY") or "").strip()
     if base_url != _ALLOWED_LLM_ORIGIN or not chat_path.startswith("/") or "://" in chat_path:
         return ""

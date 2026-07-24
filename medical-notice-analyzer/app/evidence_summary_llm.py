@@ -10,7 +10,7 @@ import httpx
 from app.attachment_parser import resolve_table_column_map, table_column_map_is_usable
 
 
-_ALLOWED_ORIGIN = "http://192.168.34.97"
+_ALLOWED_ORIGIN = "https://api.deepseek.com"
 _ALLOWED_FIELDS = {
     "enterprise",
     "product",
@@ -171,7 +171,7 @@ def _request_summaries(tables: list[dict[str, Any]]) -> dict[str, dict[str, Any]
         return {}
     base_url = (os.getenv("EVIDENCE_SUMMARY_LLM_BASE_URL") or _ALLOWED_ORIGIN).strip().rstrip("/")
     chat_path = (os.getenv("EVIDENCE_SUMMARY_LLM_CHAT_PATH") or "/v1/chat/completions").strip()
-    model = (os.getenv("EVIDENCE_SUMMARY_LLM_MODEL") or "elian-deepseek-v4-flash").strip()
+    model = (os.getenv("EVIDENCE_SUMMARY_LLM_MODEL") or "deepseek-v4-flash").strip()
     api_key = (os.getenv("EVIDENCE_SUMMARY_LLM_API_KEY") or "").strip()
     if base_url != _ALLOWED_ORIGIN or not chat_path.startswith("/") or "://" in chat_path:
         return {}
