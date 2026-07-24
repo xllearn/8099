@@ -270,6 +270,7 @@ def _request_long_summary(chunk: str, output_chars: int) -> str:
     payload = {
         "model": model,
         "temperature": 0,
+        "thinking": {"type": "disabled"},
         "messages": [
             {
                 "role": "system",

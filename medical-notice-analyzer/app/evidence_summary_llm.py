@@ -181,6 +181,7 @@ def _request_summaries(tables: list[dict[str, Any]]) -> dict[str, dict[str, Any]
     payload = {
         "model": model,
         "temperature": 0,
+        "thinking": {"type": "disabled"},
         "messages": [
             {
                 "role": "system",
