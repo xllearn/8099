@@ -165,6 +165,7 @@ def publish_docx_atomically(
     render: Callable[[Path], None],
     *,
     timing_observer: Callable[[str, int], None] | None = None,
+    enforce_body_safety: bool = True,
 ) -> None:
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -175,11 +176,13 @@ def publish_docx_atomically(
         render(staging_path)
         if not staging_path.is_file():
             raise FormalBodySafetyError("DOCX 临时文件未生成")
-        scan_started_ns = time.monotonic_ns()
-        try:
-            hits = scan_docx(staging_path)
-        finally:
-            _observe_timing(timing_observer, "word_scan_ms", scan_started_ns)
+        hits: tuple[ForbiddenPhraseHit, ...] = ()
+        if enforce_body_safety:
+            scan_started_ns = time.monotonic_ns()
+            try:
+                hits = scan_docx(staging_path)
+            finally:
+                _observe_timing(timing_observer, "word_scan_ms", scan_started_ns)
         if hits:
             phrases = ",".join(dict.fromkeys(hit.phrase for hit in hits))
             raise FormalBodySafetyError(f"DOCX 正文安全扫描未通过:{phrases}")

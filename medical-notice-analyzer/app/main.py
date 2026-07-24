@@ -794,6 +794,10 @@ def _word_export_enabled() -> bool:
     return _env_bool("ENABLE_WORD_EXPORT", False)
 
 
+def _dify_debug_passthrough_enabled() -> bool:
+    return _env_bool("ENABLE_DIFY_DEBUG_PASSTHROUGH", False)
+
+
 def _word_export_disabled_response(endpoint: str) -> JSONResponse:
     logger.warning("word_export_disabled endpoint=%s", endpoint)
     response = _analysis_error(503, WORD_EXPORT_DISABLED_CODE, WORD_EXPORT_DISABLED_MESSAGE)
@@ -4820,11 +4824,15 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
         generation_failure_codes.append("OUTPUT_EMPTY")
     generation_failure_codes = _dedupe_strings(generation_failure_codes)
 
+    debug_passthrough = bool(normalized.get("dify_debug_passthrough"))
     fallback_used = bool(normalized.get("fallback_used"))
-    if dify_error_code or "FALLBACK_REPORT_USED" in generation_failure_codes or "OUTPUT_TRUNCATED" in generation_failure_codes:
-        fallback_used = True
-    if any(isinstance(item, dict) and item.get("issue_id") in {"Q_DIFY_CALL_FAILED_FALLBACK", "Q_DIFY_FRAGMENTARY_REPORT"} for item in remaining_issues):
-        fallback_used = True
+    if debug_passthrough:
+        fallback_used = False
+    else:
+        if dify_error_code or "FALLBACK_REPORT_USED" in generation_failure_codes or "OUTPUT_TRUNCATED" in generation_failure_codes:
+            fallback_used = True
+        if any(isinstance(item, dict) and item.get("issue_id") in {"Q_DIFY_CALL_FAILED_FALLBACK", "Q_DIFY_FRAGMENTARY_REPORT"} for item in remaining_issues):
+            fallback_used = True
 
     body_safety = scan_formal_body(
         FormalBodyDocument(markdown=report_markdown, report_ir=report_ir)
@@ -4840,14 +4848,25 @@ def _normalize_analysis_run_schema(record: dict[str, Any]) -> dict[str, Any]:
         or repair_failed
         or (raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not deliverable)
     )
-    word_export_available = bool(
+    normal_word_export_available = bool(
         body_safety.safe
         and not repair_failed
         and raw_status in {"finished", "needs_manual_review"}
         and _word_export_enabled()
     )
+    debug_word_export_available = bool(
+        debug_passthrough
+        and body_safety.has_body
+        and raw_status in {"finished", "needs_manual_review"}
+        and _word_export_enabled()
+    )
+    word_export_available = normal_word_export_available or debug_word_export_available
     draft_word_export_available = word_export_available
-    final_word_export_available = bool(word_export_available and deliverable)
+    final_word_export_available = bool(
+        normal_word_export_available
+        and deliverable
+        and not debug_passthrough
+    )
     if raw_status in RUN_TERMINAL_STATUSES and body_safety.has_body and not body_safety.safe:
         safety_code = (
             "FORMAL_BODY_EMPTY" if not body_safety.has_body else "FORBIDDEN_PHRASE_IN_FORMAL_BODY"
@@ -5203,12 +5222,14 @@ def _normalize_dify_result(response_json: dict[str, Any], pack_id: str) -> dict[
     if status not in {"finished", "needs_manual_review", "failed"}:
         status = "finished" if workflow_status.lower() in {"succeeded", "finished", ""} else workflow_status.lower()
     warnings = _parse_json_list(output.get("generation_warnings") or output.get("warnings"))
+    debug_passthrough = _dify_debug_passthrough_enabled()
+    raw_report_markdown = str(output.get("report_markdown") or "")
     return {
         "workflow_run_id": workflow_run_id,
         "status": status,
         "pack_id": str(output.get("pack_id") or pack_id),
         "report_title": str(output.get("report_title") or ""),
-        "report_markdown": _clean_model_output(str(output.get("report_markdown") or "")),
+        "report_markdown": raw_report_markdown if debug_passthrough else _clean_model_output(raw_report_markdown),
         "version": int(output.get("version") or 1),
         "quality_check": quality_check,
         "generation_warnings": warnings,
@@ -5216,6 +5237,9 @@ def _normalize_dify_result(response_json: dict[str, Any], pack_id: str) -> dict[
         "remaining_issues": _parse_json_list(output.get("remaining_issues")),
         "provider_stage": provider_stage,
         "failure_stages": [provider_stage],
+        "dify_debug_passthrough": debug_passthrough,
+        "candidate_source": "dify_raw_output" if debug_passthrough else "initial_generation",
+        "fallback_used": False,
     }
 
 
@@ -5787,6 +5811,79 @@ def _quality_pipeline_stage(before: dict[str, Any], after: dict[str, Any]) -> di
     )
 
 
+def _postprocess_debug_passthrough(
+    result: dict[str, Any],
+    pack: dict[str, Any],
+    input_stages: list[dict[str, Any]] | None = None,
+    compact: dict[str, Any] | None = None,
+    timing: PipelineTiming | None = None,
+    checkpoint_callback=None,
+) -> dict[str, Any]:
+    if input_stages is None:
+        input_stages, compact = _input_pipeline_stages(pack, timing)
+    staged = dict(result)
+    for stage in input_stages:
+        staged = _set_failure_stage(staged, stage)
+
+    provider_stage = staged.get("provider_stage") if isinstance(staged.get("provider_stage"), dict) else None
+    if provider_stage is None:
+        provider_stage = make_layer_result(
+            "provider",
+            status="ok",
+            input_value=compact or {"pack_id": str(pack.get("pack_id") or "")},
+            output_value={
+                "provider_run_id": str(staged.get("provider_run_id") or staged.get("workflow_run_id") or ""),
+                **_formal_body_stage_value(staged),
+            },
+        )
+    staged = _set_failure_stage(staged, provider_stage)
+
+    original_title = str(staged.get("report_title") or "")
+    original_markdown = str(staged.get("report_markdown") or "")
+    original_report_ir = staged.get("report_ir") if isinstance(staged.get("report_ir"), dict) else None
+    before_quality = dict(staged)
+    stage_timing = timing or PipelineTiming()
+    if checkpoint_callback is not None:
+        checkpoint_callback("repair", "started", before_quality, None)
+    staged = _set_failure_stage(
+        staged,
+        make_layer_result(
+            "cleanup",
+            status="skipped",
+            input_value=_formal_body_stage_value(staged),
+            output_value={"reason": "dify_debug_passthrough"},
+        ),
+    )
+    if checkpoint_callback is not None:
+        checkpoint_callback("repair", "completed", before_quality, staged)
+        checkpoint_callback("quality_gate", "started", staged, None)
+    with stage_timing.measure("quality_gate_ms"):
+        gated_result = QualityGate().run(
+            ReportGenerationResult.from_legacy_result(
+                staged,
+                provider=str(staged.get("provider") or "dify"),
+            ),
+            pack,
+        )
+        staged = gated_result.to_legacy_result()
+    staged["report_title"] = original_title
+    staged["report_markdown"] = original_markdown
+    staged["report_ir"] = original_report_ir
+    staged["dify_debug_passthrough"] = True
+    staged["candidate_source"] = (
+        "dify_debug_diagnostic"
+        if bool(staged.get("diagnostic_output_used"))
+        else "dify_raw_output"
+    )
+    staged["fallback_used"] = False
+    staged["fallback_provider"] = ""
+    staged["final_report_chars"] = len(original_markdown)
+    staged = _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
+    if checkpoint_callback is not None:
+        checkpoint_callback("quality_gate", "completed", before_quality, staged)
+    return staged
+
+
 def _postprocess_generation_with_stages(
     result: dict[str, Any],
     pack: dict[str, Any],
@@ -5796,6 +5893,15 @@ def _postprocess_generation_with_stages(
     checkpoint_callback=None,
     resume_after: str = "",
 ) -> dict[str, Any]:
+    if _dify_debug_passthrough_enabled():
+        return _postprocess_debug_passthrough(
+            result,
+            pack,
+            input_stages,
+            compact,
+            timing,
+            checkpoint_callback,
+        )
     if input_stages is None:
         input_stages, compact = _input_pipeline_stages(pack, timing)
     staged = dict(result)
@@ -5894,6 +6000,69 @@ def _postprocess_generation_with_stages(
     return staged
 
 
+def _dify_debug_diagnostic_result(
+    exc: DifyWorkflowError,
+    pack_id: str,
+) -> dict[str, Any]:
+    provider_code = canonical_provider_failure_code(exc.code)
+    provider_stage = exc.provider_stage or make_layer_result(
+        "provider",
+        status="blocked",
+        code=provider_code,
+        metrics={"error_type": exc.__class__.__name__},
+    )
+    message = _truncate(str(exc.message or "Dify 工作流未返回可渲染正文"), 500)
+    detail = _truncate(str(exc.detail or provider_code).replace("\r", " ").replace("\n", " "), 1200)
+    report_markdown = "\n\n".join(
+        [
+            "# Dify 调试诊断",
+            "Dify 工作流未返回可渲染的报告正文。本文件仅用于调试，不包含公告材料或证据包内容。",
+            "## 运行结果",
+            f"- 错误代码：`{provider_code}`",
+            f"- 错误信息：{message}",
+            f"- 错误详情：{detail}",
+        ]
+    )
+    issue = {
+        "issue_id": "Q_DIFY_DEBUG_DIAGNOSTIC",
+        "severity": "high",
+        "problem_type": provider_code,
+        "report_text": "",
+        "source_basis": "dify_provider_response",
+        "fix_instruction": "检查 Dify 工作流最终输出和节点错误后重新生成。",
+        "error_detail": detail,
+    }
+    return {
+        "workflow_run_id": "",
+        "status": "needs_manual_review",
+        "pack_id": pack_id,
+        "report_title": "Dify 调试诊断",
+        "report_markdown": report_markdown,
+        "version": 1,
+        "quality_check": {"passed": False, "issues": [issue]},
+        "quality_gate": {
+            "deliverable_status": "needs_manual_review",
+            "blocking_issue_codes": [provider_code],
+        },
+        "generation_warnings": [provider_code],
+        "warnings": [provider_code],
+        "remaining_issues": [issue],
+        "generation_failure_codes": [provider_code],
+        "dify_error_code": provider_code,
+        "dify_error_message": message,
+        "dify_error_detail": detail,
+        "provider": "dify",
+        "dify_debug_passthrough": True,
+        "candidate_source": "dify_debug_diagnostic",
+        "diagnostic_output_used": True,
+        "fallback_used": False,
+        "fallback_reason": "",
+        "fallback_provider": "",
+        "provider_stage": provider_stage,
+        "failure_stages": [provider_stage],
+    }
+
+
 def _fallback_result_from_dify_error(
     exc: DifyWorkflowError,
     pack: dict[str, Any],
@@ -5902,6 +6071,11 @@ def _fallback_result_from_dify_error(
     apply_quality_gate: bool = True,
     timing: PipelineTiming | None = None,
 ) -> dict[str, Any]:
+    if _dify_debug_passthrough_enabled():
+        result = _dify_debug_diagnostic_result(exc, pack_id)
+        if apply_quality_gate:
+            return _postprocess_generation_with_stages(result, pack, timing=timing)
+        return result
     provider_code = canonical_provider_failure_code(exc.code)
     provider_stage = exc.provider_stage or make_layer_result(
         "provider",
@@ -8588,7 +8762,9 @@ def download_analysis_run_report(run_id: str):
             return _analysis_error(404, "RUN_NOT_FOUND", "analysis run 不存在", str(exc.detail))
         return _analysis_error(exc.status_code, "RUN_READ_FAILED", "读取 analysis run 失败", str(exc.detail))
 
-    report_markdown = str(record.get("report_markdown") or "").strip()
+    debug_passthrough = bool(record.get("dify_debug_passthrough"))
+    stored_report_markdown = str(record.get("report_markdown") or "")
+    report_markdown = stored_report_markdown if debug_passthrough else stored_report_markdown.strip()
     report_ir_payload = record.get("report_ir") if isinstance(record.get("report_ir"), dict) else None
     if not report_markdown and not report_ir_payload:
         return _analysis_error(409, "REPORT_NOT_READY", "报告尚未生成完成")
@@ -8601,7 +8777,8 @@ def download_analysis_run_report(run_id: str):
     report_ir: ReportIR | None = None
     try:
         if report_markdown:
-            report_markdown = _safe_markdown_formal_body(report_markdown)
+            if not debug_passthrough:
+                report_markdown = _safe_markdown_formal_body(report_markdown)
             report_source = report_markdown
         else:
             report_ir = _prepare_report_for_export(
@@ -8626,9 +8803,17 @@ def download_analysis_run_report(run_id: str):
         if report_ir is not None:
             _publish_report_ir_docx(report_ir, target, title, word_timing)
         else:
-            _publish_markdown_docx(report_markdown, target, title, word_timing)
+            _publish_markdown_docx(
+                report_markdown,
+                target,
+                title,
+                word_timing,
+                enforce_body_safety=not debug_passthrough,
+            )
 
     def validate_word(target: Path) -> bool:
+        if debug_passthrough:
+            return target.is_file()
         with word_timing.measure("word_scan_ms"):
             return not bool(scan_docx(target))
 
@@ -10412,6 +10597,8 @@ def _publish_markdown_docx(
     path: Path,
     title: str,
     timing: PipelineTiming | None = None,
+    *,
+    enforce_body_safety: bool = True,
 ) -> None:
     def render(staging_path: Path) -> None:
         if timing is None:
@@ -10424,6 +10611,7 @@ def _publish_markdown_docx(
         path,
         render,
         timing_observer=timing.observe if timing is not None else None,
+        enforce_body_safety=enforce_body_safety,
     )
 
 

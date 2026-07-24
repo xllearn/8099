@@ -19,6 +19,7 @@ from app.attachment_fetcher import AttachmentDownloadResult, build_attachment_au
 import app.attachment_parser as attachment_parser_module
 from app.attachment_parser import parse_attachment_bytes
 from app.diagnostics import build_pack_diagnostics, build_run_diagnostics
+from app.formal_body_safety import FORBIDDEN_PHRASES
 
 
 def list_row(**overrides):
@@ -5023,6 +5024,190 @@ class RecordsApiTests(unittest.TestCase):
         self.assertEqual(status_body["dify_error_code"], "HTTP_ERROR")
         self.assertEqual(report_response.status_code, 200)
         self.assertGreater(len(report_response.json()["report_markdown"]), 100)
+
+    def test_dify_debug_passthrough_preserves_raw_report_markdown(self) -> None:
+        raw_markdown = "Dify 调试信息：保留本行\n\n- 原始列表\n"
+        response = {
+            "workflow_run_id": "wf-debug-raw",
+            "data": {
+                "status": "succeeded",
+                "outputs": {
+                    "status": "finished",
+                    "pack_id": "pack_debug_raw",
+                    "report_title": "调试报告",
+                    "report_markdown": raw_markdown,
+                    "version": 1,
+                    "quality_check": '{"passed": true, "issues": []}',
+                    "generation_warnings": "[]",
+                    "remaining_issues": "[]",
+                },
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {"ENABLE_DIFY_DEBUG_PASSTHROUGH": "true"},
+            clear=False,
+        ):
+            result = main_module._normalize_dify_result(response, "pack_debug_raw")
+
+        self.assertEqual(result["report_markdown"], raw_markdown)
+        self.assertTrue(result["dify_debug_passthrough"])
+        self.assertEqual(result["candidate_source"], "dify_raw_output")
+
+    def test_dify_debug_passthrough_keeps_body_while_quality_gate_records_issues(self) -> None:
+        raw_markdown = "Dify 调试信息：该正文必须原样保留。\n\n- 原始列表"
+        pack = {
+            "pack_id": "pack_debug_quality",
+            "primary_materials": [
+                {
+                    "title": "调试公告",
+                    "content_text": "公告正文中不存在调试输出内容。",
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        result = {
+            "workflow_run_id": "wf-debug-quality",
+            "status": "finished",
+            "pack_id": "pack_debug_quality",
+            "report_title": "Dify 原始标题",
+            "report_markdown": raw_markdown,
+            "version": 1,
+            "quality_check": {"passed": True, "issues": []},
+            "generation_warnings": [],
+            "warnings": [],
+            "remaining_issues": [],
+            "provider": "dify",
+        }
+
+        with patch.dict(
+            os.environ,
+            {"ENABLE_DIFY_DEBUG_PASSTHROUGH": "true"},
+            clear=False,
+        ):
+            processed = main_module._postprocess_generation_with_stages(
+                result,
+                pack,
+                input_stages=[],
+                compact={"pack_id": "pack_debug_quality"},
+            )
+
+        self.assertEqual(processed["report_title"], result["report_title"])
+        self.assertEqual(processed["report_markdown"], raw_markdown)
+        self.assertEqual(processed["candidate_source"], "dify_raw_output")
+        self.assertFalse(processed["fallback_used"])
+        self.assertTrue(processed["dify_debug_passthrough"])
+        self.assertIn("quality_gate", processed)
+
+    def test_dify_debug_passthrough_error_uses_diagnostic_without_pack_material(self) -> None:
+        pack = {
+            "pack_id": "pack_debug_error",
+            "primary_materials": [
+                {
+                    "title": "UNIQUE_EVIDENCE_SENTINEL",
+                    "content_text": "UNIQUE_EVIDENCE_SENTINEL",
+                    "attachments": [],
+                }
+            ],
+            "auxiliary_materials": [],
+        }
+        error = main_module.DifyWorkflowError(
+            "OUTPUT_EMPTY",
+            "Dify 未返回正文",
+            "OUTPUT_EMPTY",
+        )
+
+        with patch.dict(
+            os.environ,
+            {"ENABLE_DIFY_DEBUG_PASSTHROUGH": "true"},
+            clear=False,
+        ):
+            diagnostic = main_module._fallback_result_from_dify_error(
+                error,
+                pack,
+                "pack_debug_error",
+                apply_quality_gate=False,
+            )
+
+        self.assertEqual(diagnostic["candidate_source"], "dify_debug_diagnostic")
+        self.assertTrue(diagnostic["diagnostic_output_used"])
+        self.assertTrue(diagnostic["dify_debug_passthrough"])
+        self.assertFalse(diagnostic["fallback_used"])
+        self.assertNotIn("UNIQUE_EVIDENCE_SENTINEL", diagnostic["report_markdown"])
+        self.assertIn("OUTPUT_EMPTY", diagnostic["report_markdown"])
+
+    def test_dify_debug_passthrough_downloads_unchanged_unsafe_markdown(self) -> None:
+        raw_markdown = f"# Dify 调试报告\n\n{FORBIDDEN_PHRASES[0]}"
+        rendered: list[str] = []
+
+        def fake_publish(
+            markdown: str,
+            path: main_module.Path,
+            title: str,
+            timing=None,
+            *,
+            enforce_body_safety: bool = True,
+        ) -> None:
+            self.assertFalse(enforce_body_safety)
+            rendered.append(markdown)
+            document = Document()
+            document.add_paragraph(markdown)
+            document.save(path)
+
+        with patch.dict(
+            os.environ,
+            {
+                "ENABLE_DIFY_DEBUG_PASSTHROUGH": "true",
+                "ENABLE_WORD_EXPORT": "true",
+            },
+            clear=False,
+        ), tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = main_module.Path(tmpdir) / "runs"
+            report_dir = main_module.Path(tmpdir) / "reports"
+            run_dir.mkdir()
+            with patch.object(
+                main_module,
+                "_analysis_run_dir",
+                return_value=run_dir,
+                create=True,
+            ):
+                main_module._write_analysis_run(
+                    {
+                        "success": True,
+                        "run_id": "run_debug_word",
+                        "pack_id": "pack_debug_word",
+                        "status": "needs_manual_review",
+                        "report_title": "Dify 调试报告",
+                        "report_markdown": raw_markdown,
+                        "version": 1,
+                        "quality_check": {
+                            "passed": False,
+                            "issues": [{"issue_id": "Q_DEBUG"}],
+                        },
+                        "dify_debug_passthrough": True,
+                        "candidate_source": "dify_raw_output",
+                    }
+                )
+            with patch.object(
+                main_module,
+                "_analysis_run_dir",
+                return_value=run_dir,
+                create=True,
+            ), patch.object(
+                main_module,
+                "REPORT_DIR",
+                report_dir,
+            ), patch.object(
+                main_module,
+                "_publish_markdown_docx",
+                side_effect=fake_publish,
+            ):
+                response = self.client.get("/analysis/runs/run_debug_word/download")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(rendered, [raw_markdown])
 
 
 if __name__ == "__main__":
