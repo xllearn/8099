@@ -44,6 +44,7 @@ from app.attachment_cache import cleanup_cache, load_cached_result, store_cached
 from app.attachment_fetcher import fetch_attachment_bytes
 from app.attachment_parser import parse_attachment_bytes
 from app.evidence_summary_llm import enrich_evidence_pack_summaries
+from app.generation_payload import prepare_generation_payload
 from app.attachment_task_process import (
     AttachmentTaskProcessError,
     AttachmentTaskProcessTimeout,
@@ -3913,6 +3914,9 @@ def _compact_cache_version_context(pack: dict[str, Any], target_max_chars: int) 
 
 
 def _compact_evidence_pack_for_dify(pack: dict[str, Any], max_chars: int | None = None) -> dict[str, Any]:
+    generation_payload = pack.get("generation_payload")
+    if max_chars is None and isinstance(generation_payload, dict):
+        return copy.deepcopy(generation_payload)
     if not compact_cache_enabled():
         return _compact_evidence_pack_for_dify_uncached(pack, max_chars)
     target_max_chars = max_chars or _dify_input_thresholds()["hard_limit"]
@@ -5052,6 +5056,11 @@ def _dify_workflow_url(config: dict[str, Any]) -> str:
 def _dify_input_strategy_from_pack(pack: dict[str, Any] | None) -> str:
     if not isinstance(pack, dict):
         return ""
+    generation_payload = pack.get("generation_payload")
+    if isinstance(generation_payload, dict):
+        strategy = str(generation_payload.get("input_strategy") or "").strip()
+        if strategy:
+            return strategy
     guidance = pack.get("generation_guidance") if isinstance(pack.get("generation_guidance"), dict) else {}
     strategy = str(pack.get("input_strategy") or guidance.get("input_strategy") or "").strip()
     if strategy:
@@ -5301,7 +5310,18 @@ def _dify_report_validation_code(markdown: Any, pack: dict[str, Any]) -> str:
             for position, title in markdown_headings
         )
     )
-    has_report_structure = has_natural_body_heading or (
+    bold_headings = [
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^\s*\*\*([^*\n]{2,80})\*\*\s*$", text)
+    ]
+    has_independent_bold_sections = len(bold_headings) >= 2
+    substantial_paragraphs = [
+        paragraph
+        for paragraph in re.split(r"\n\s*\n", text)
+        if len(re.sub(r"\s+", "", paragraph)) >= 80
+    ]
+    has_plain_paragraph_structure = len(text) >= 700 and len(substantial_paragraphs) >= 3
+    has_report_structure = has_natural_body_heading or has_independent_bold_sections or has_plain_paragraph_structure or (
         has_first_section and has_later_body_section
     )
     if not has_report_structure:
@@ -5395,7 +5415,16 @@ def _fallback_report_from_pack(pack: dict[str, Any]) -> tuple[str, str, list[str
             if summary_text:
                 lines.append(f"- {filename}：{_fallback_text_snippet(summary_text, 900)}")
                 attachment_detail_added = True
-            key_facts = [str(item).strip() for item in attachment.get("key_facts") or [] if str(item).strip()]
+            key_facts = []
+            for item in attachment.get("key_facts") or []:
+                if isinstance(item, dict):
+                    name = _clean_inline_text(item.get("name") or item.get("field") or "")
+                    value = _clean_inline_text(item.get("value") or item.get("text") or "")
+                    fact = f"{name}：{value}" if name and value else value or name
+                else:
+                    fact = _clean_inline_text(item)
+                if fact:
+                    key_facts.append(fact)
             if key_facts:
                 lines.append("  其中可关注事实包括：")
                 lines.extend([f"  - {fact}" for fact in key_facts[:10]])
@@ -5640,7 +5669,10 @@ def _input_pipeline_stages(
         hard_limit = _safe_int_value(compact.get("hard_limit_chars") or 80_000, 80_000)
         provenance_preserved = True
         retention: dict[str, Any] | None = None
-        if pack.get("evidence_schema_version") == 2 and pack.get("source_evidence_schema_version") != 1:
+        if compact.get("pack_variant") == "generation_payload":
+            provenance_preserved = True
+            retention = {"full_evidence_retained_backend": True}
+        elif pack.get("evidence_schema_version") == 2 and pack.get("source_evidence_schema_version") != 1:
             if _env_bool("ENABLE_VBP_COMPACT_PRESERVATION", False) and compact.get("secondary_compression"):
                 validate_evidence_pack(compact)
                 retention = mandatory_evidence_retention(pack, compact)
@@ -5816,6 +5848,46 @@ def _postprocess_generation_with_stages(
         checkpoint_callback("quality_gate", "started", before_quality, None)
     with stage_timing.measure("quality_gate_ms"):
         staged = _apply_local_quality_gate_to_dify_result(staged, pack)
+        generation_payload = pack.get("generation_payload")
+        if isinstance(generation_payload, dict) and generation_payload.get("compression_degraded"):
+            quality_gate = (
+                dict(staged.get("quality_gate"))
+                if isinstance(staged.get("quality_gate"), dict)
+                else {}
+            )
+            blocking_codes = list(quality_gate.get("blocking_issue_codes") or [])
+            if "LONG_EVIDENCE_LLM_UNAVAILABLE" not in blocking_codes:
+                blocking_codes.append("LONG_EVIDENCE_LLM_UNAVAILABLE")
+            quality_gate["deliverable_status"] = "needs_manual_review"
+            quality_gate["blocking_issue_codes"] = blocking_codes
+            staged["quality_gate"] = quality_gate
+            quality_check = (
+                dict(staged.get("quality_check"))
+                if isinstance(staged.get("quality_check"), dict)
+                else {}
+            )
+            issues = list(quality_check.get("issues") or [])
+            issues.append(
+                {
+                    "issue_id": "Q_LONG_EVIDENCE_LLM_UNAVAILABLE",
+                    "severity": "high",
+                    "problem_type": "LONG_EVIDENCE_LLM_UNAVAILABLE",
+                    "report_text": "",
+                    "source_basis": "generation_payload",
+                    "fix_instruction": "长材料模型压缩不可用，当前报告基于规则降级输入生成，需人工复核。",
+                }
+            )
+            quality_check["passed"] = False
+            quality_check["issues"] = issues
+            staged["quality_check"] = quality_check
+            staged["status"] = "needs_manual_review"
+            staged["needs_manual_review"] = True
+            staged["generation_warnings"] = _dedupe_strings(
+                [
+                    *list(staged.get("generation_warnings") or []),
+                    "LONG_EVIDENCE_LLM_UNAVAILABLE",
+                ]
+            )
     staged = _set_failure_stage(staged, _quality_pipeline_stage(before_quality, staged))
     if checkpoint_callback is not None:
         checkpoint_callback("quality_gate", "completed", before_quality, staged)
@@ -7120,6 +7192,9 @@ def _build_database_evidence_pack_impl(
     pack = enrich_evidence_pack_summaries(pack)
     if vbp_fact_extraction_enabled():
         pack = enrich_vbp_facts(pack)
+    pack["generation_payload"] = prepare_generation_payload(pack)
+    if pack["generation_payload"].get("compression_degraded"):
+        pack.setdefault("warnings", []).append("LONG_EVIDENCE_LLM_UNAVAILABLE")
     pack.pop("source_evidence_schema_version", None)
     timing.add_elapsed("evidence_build_ms", evidence_started_ns)
     logger.info("analysis_prepare_materials_loaded pack_id=%s attachment_count=%s warnings=%s", pack_id, attachment_count, len(warnings))
