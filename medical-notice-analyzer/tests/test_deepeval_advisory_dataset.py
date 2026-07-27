@@ -7,9 +7,11 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
+from app.deepeval_advisory import datasets as dataset_module
 from app.deepeval_advisory.datasets import (
     MAX_DATASET_JSON_BYTES,
     DatasetCase,
@@ -160,6 +162,19 @@ def _metric_labels() -> dict[str, str]:
         "attachment_state_consistency_v1": "not_applicable",
         "answer_relevancy_v1": "inconsistent",
     }
+
+
+def _golden_value() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "8099.deepeval-golden/v1",
+        "case_ref": CASE_REF,
+        "sample_ref": None,
+        "human_review_refs": [REVIEW_REF],
+        "human_adjudication_refs": [],
+        "metric_labels": _metric_labels(),
+    }
+    payload["golden_sha256"] = canonical_sha256(payload)
+    return payload
 
 
 def _write_tree(root: Path) -> tuple[dict[str, object], dict[str, object]]:
@@ -366,6 +381,104 @@ class DatasetSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValidationError, "manifest integrity"):
             DatasetManifest.model_validate(changed)
 
+    def test_self_hashed_models_require_every_raw_defaulted_field(self) -> None:
+        contracts = (
+            (
+                DatasetCase,
+                _case_value(),
+                ("schema_version", "risk_tags"),
+            ),
+            (
+                DatasetManifest,
+                _manifest_value(
+                    [_entry_value(canonical_json_bytes(_case_value()))]
+                ),
+                ("schema_version", "projection_version"),
+            ),
+            (
+                GoldenLabel,
+                _golden_value(),
+                (
+                    "schema_version",
+                    "sample_ref",
+                    "human_adjudication_refs",
+                ),
+            ),
+        )
+        for model_type, full_value, fields in contracts:
+            for field in fields:
+                with (
+                    self.subTest(model=model_type.__name__, field=field),
+                    self.assertRaises(ValidationError),
+                ):
+                    omitted = copy.deepcopy(full_value)
+                    del omitted[field]
+                    model_type.model_validate(omitted)
+
+        for field in ("schema_version", "projection_version"):
+            with self.subTest(projection_field=field), self.assertRaises(
+                ValidationError
+            ):
+                omitted_projection_field = _case_value()
+                del omitted_projection_field["projection"][field]
+                DatasetCase.model_validate(omitted_projection_field)
+
+    def test_loaders_reject_default_synthesis_before_raw_self_hashing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            case_value, manifest_value = _write_tree(root)
+            manifest_path = root / "manifest.json"
+            case_path = root / "cases" / f"{CASE_REF}.json"
+
+            omitted_manifest = copy.deepcopy(manifest_value)
+            del omitted_manifest["schema_version"]
+            manifest_path.write_bytes(canonical_json_bytes(omitted_manifest))
+            with self.assertRaisesRegex(DatasetError, "manifest_invalid"):
+                load_dataset_manifest(manifest_path)
+
+            manifest_path.write_bytes(canonical_json_bytes(manifest_value))
+            manifest = load_dataset_manifest(manifest_path)
+            omitted_case = copy.deepcopy(case_value)
+            del omitted_case["projection"]["projection_version"]
+            omitted_case_bytes = canonical_json_bytes(omitted_case)
+            case_path.write_bytes(omitted_case_bytes)
+            entry = manifest.entries[0].model_copy(
+                update={
+                    "file_sha256": hashlib.sha256(
+                        omitted_case_bytes
+                    ).hexdigest()
+                }
+            )
+            with self.assertRaisesRegex(DatasetError, "case_invalid"):
+                load_dataset_case(root, entry)
+
+    def test_self_hashed_model_json_rejects_duplicate_object_keys(self) -> None:
+        contracts = (
+            (DatasetCase, _case_value(), "schema_version"),
+            (
+                DatasetManifest,
+                _manifest_value(
+                    [_entry_value(canonical_json_bytes(_case_value()))]
+                ),
+                "projection_version",
+            ),
+            (GoldenLabel, _golden_value(), "schema_version"),
+        )
+        for model_type, value, duplicated_field in contracts:
+            serialized = canonical_json_bytes(value).decode("utf-8")
+            duplicate = json.dumps(
+                {duplicated_field: value[duplicated_field]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )[1:-1]
+            payload = "{" + duplicate + "," + serialized[1:]
+            with self.subTest(model=model_type.__name__), self.assertRaises(
+                (ValidationError, ValueError)
+            ):
+                model_type.model_validate_json(payload)
+
     def test_manifest_rejects_duplicates_paths_and_inconsistent_counts(self) -> None:
         case_bytes = canonical_json_bytes(_case_value())
         entry = _entry_value(case_bytes)
@@ -552,6 +665,54 @@ class DatasetSchemaTests(unittest.TestCase):
         self.assertFalse(validation.labeling_ready)
         self.assertIsNone(validation.release_decision)
 
+    def test_tree_inventory_rejects_every_unexpected_member_kind(self) -> None:
+        def add_file(root: Path) -> None:
+            (root / "unreferenced.json").write_text("{}", encoding="utf-8")
+
+        def add_directory(root: Path) -> None:
+            (root / "unexpected").mkdir()
+
+        def add_symlink(root: Path) -> None:
+            (root / "unreferenced-link").symlink_to(root / "manifest.json")
+
+        def add_fifo(root: Path) -> None:
+            os.mkfifo(root / "unreferenced-fifo")
+
+        def add_oversize(root: Path) -> None:
+            (root / "unreferenced.bin").write_bytes(
+                b"x" * (MAX_DATASET_JSON_BYTES + 1)
+            )
+
+        mutations = (
+            ("file", add_file),
+            ("directory", add_directory),
+            ("symlink", add_symlink),
+            ("fifo", add_fifo),
+            ("oversize", add_oversize),
+        )
+        for name, mutate in mutations:
+            with self.subTest(member=name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                _write_tree(root)
+                mutate(root)
+
+                validation = validate_dataset_tree(root)
+
+                self.assertFalse(validation.valid)
+                self.assertIn("tree_unexpected", validation.error_categories)
+
+    def test_tree_inventory_rejects_oversize_referenced_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_tree(root)
+            case_path = root / "cases" / f"{CASE_REF}.json"
+            case_path.write_bytes(b"{" + b" " * MAX_DATASET_JSON_BYTES + b"}")
+
+            validation = validate_dataset_tree(root)
+
+        self.assertFalse(validation.valid)
+        self.assertIn("file_size", validation.error_categories)
+
     def test_manifest_reader_rejects_utf8_json_size_and_hash_errors(self) -> None:
         invalid_payloads = (
             b"\xff",
@@ -643,6 +804,174 @@ class DatasetSchemaTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(DatasetError, "path_invalid"):
                 load_dataset_case(root, nested_entry)
+
+    def test_anchored_reader_rejects_symlinked_root_and_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            real_parent = base / "real-parent"
+            root = real_parent / "dataset"
+            root.mkdir(parents=True)
+            _write_tree(root)
+            manifest = load_dataset_manifest(root / "manifest.json")
+
+            root_link = base / "root-link"
+            root_link.symlink_to(root, target_is_directory=True)
+            with self.assertRaisesRegex(DatasetError, "root_invalid"):
+                load_dataset_case(root_link, manifest.entries[0])
+            with self.assertRaises(DatasetError):
+                load_dataset_manifest(root_link / "manifest.json")
+
+            ancestor_link = base / "ancestor-link"
+            ancestor_link.symlink_to(real_parent, target_is_directory=True)
+            linked_root = ancestor_link / "dataset"
+            with self.assertRaisesRegex(DatasetError, "root_invalid"):
+                load_dataset_case(linked_root, manifest.entries[0])
+            with self.assertRaises(DatasetError):
+                load_dataset_manifest(linked_root / "manifest.json")
+
+    def test_reader_fails_closed_without_required_nofollow_primitives(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_tree(root)
+            manifest = load_dataset_manifest(root / "manifest.json")
+            for primitive in ("O_NOFOLLOW", "O_DIRECTORY"):
+                with (
+                    self.subTest(primitive=primitive),
+                    patch.object(dataset_module.os, primitive, 0),
+                    self.assertRaisesRegex(DatasetError, "root_invalid"),
+                ):
+                    load_dataset_case(root, manifest.entries[0])
+
+    def test_intermediate_directory_swap_never_accepts_outside_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            root = base / "dataset"
+            root.mkdir()
+            _write_tree(root)
+            manifest = load_dataset_manifest(root / "manifest.json")
+            entry = manifest.entries[0]
+            case_path = root / entry.relative_path
+
+            outside_cases = base / "outside" / "cases"
+            outside_cases.mkdir(parents=True)
+            os.link(case_path, outside_cases / case_path.name)
+            original_open = os.open
+            swapped = False
+
+            def racing_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal swapped
+                path_text = os.fspath(path)
+                final_path_open = (
+                    dir_fd is None
+                    and Path(path_text) == case_path
+                )
+                anchored_parent_open = (
+                    dir_fd is not None and path_text == "cases"
+                )
+                if not swapped and (final_path_open or anchored_parent_open):
+                    (root / "cases").rename(root / "cases-original")
+                    (root / "cases").symlink_to(
+                        outside_cases,
+                        target_is_directory=True,
+                    )
+                    swapped = True
+                if dir_fd is None:
+                    return original_open(path, flags, mode)
+                return original_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+
+            with patch.object(dataset_module.os, "open", side_effect=racing_open):
+                with self.assertRaises(DatasetError):
+                    load_dataset_case(root, entry)
+            self.assertTrue(swapped)
+
+    def test_root_path_swap_cannot_redirect_an_opened_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            root = base / "dataset"
+            root.mkdir()
+            _write_tree(root)
+            manifest = load_dataset_manifest(root / "manifest.json")
+            entry = manifest.entries[0]
+            case_path = root / entry.relative_path
+
+            outside_cases = base / "outside" / "cases"
+            outside_cases.mkdir(parents=True)
+            (outside_cases / case_path.name).write_bytes(b"{}")
+            original_open = os.open
+            swapped = False
+
+            def racing_open(
+                path: object,
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal swapped
+                path_text = os.fspath(path)
+                final_path_open = (
+                    dir_fd is None
+                    and Path(path_text) == case_path
+                )
+                anchored_parent_open = (
+                    dir_fd is not None and path_text == "cases"
+                )
+                if not swapped and (final_path_open or anchored_parent_open):
+                    root.rename(base / "dataset-original")
+                    root.symlink_to(
+                        base / "outside",
+                        target_is_directory=True,
+                    )
+                    swapped = True
+                if dir_fd is None:
+                    return original_open(path, flags, mode)
+                return original_open(
+                    path,
+                    flags,
+                    mode,
+                    dir_fd=dir_fd,
+                )
+
+            with patch.object(dataset_module.os, "open", side_effect=racing_open):
+                loaded = load_dataset_case(root, entry)
+
+            self.assertTrue(swapped)
+            self.assertEqual(loaded.case_ref, CASE_REF)
+
+    def test_anchored_readers_close_descriptors_on_success_and_failure(
+        self,
+    ) -> None:
+        fd_directory = Path("/proc/self/fd")
+        if not fd_directory.is_dir():
+            self.skipTest("Linux file descriptor inventory is unavailable")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_tree(root)
+            manifest = load_dataset_manifest(root / "manifest.json")
+            entry = manifest.entries[0]
+            bad_entry = entry.model_copy(update={"file_sha256": "0" * 64})
+            baseline = len(tuple(fd_directory.iterdir()))
+
+            for _ in range(20):
+                load_dataset_case(root, entry)
+                with self.assertRaises(DatasetError):
+                    load_dataset_case(root, bad_entry)
+
+            after = len(tuple(fd_directory.iterdir()))
+        self.assertEqual(after, baseline)
 
     def test_jsonl_validates_each_line_and_rejects_bad_lines_and_symlinks(
         self,

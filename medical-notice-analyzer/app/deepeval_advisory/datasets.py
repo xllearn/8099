@@ -7,9 +7,10 @@ import re
 import stat
 import unicodedata
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, BinaryIO, Literal, Self
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -133,6 +134,7 @@ IntegrityErrorCategory = Literal[
     "json_invalid",
     "manifest_invalid",
     "path_invalid",
+    "tree_unexpected",
     "file_hash_mismatch",
     "case_invalid",
     "entry_metadata_mismatch",
@@ -152,6 +154,7 @@ _ERROR_ORDER = {
             "json_invalid",
             "manifest_invalid",
             "path_invalid",
+            "tree_unexpected",
             "file_hash_mismatch",
             "case_invalid",
             "entry_metadata_mismatch",
@@ -251,19 +254,111 @@ class MetricLabels(StrictModel):
     answer_relevancy_v1: MetricObservation
 
 
-class DatasetCase(StrictModel):
-    schema_version: Literal["8099.deepeval-case/v1"] = (
-        "8099.deepeval-case/v1"
-    )
+class _RawSelfHashedModel(StrictModel):
+    _self_hash_field: ClassVar[str]
+    _integrity_label: ClassVar[str]
+
+    @classmethod
+    def _validate_raw_content(cls, value: dict[str, Any]) -> None:
+        return None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_raw_self_hash(cls, value: Any) -> Any:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("self-hashed contract requires a raw object")
+        missing = set(cls.model_fields).difference(value)
+        if missing:
+            raise ValueError("self-hashed contract omits required fields")
+        cls._validate_raw_content(value)
+        digest = value.get(cls._self_hash_field)
+        payload = dict(value)
+        payload.pop(cls._self_hash_field, None)
+        try:
+            expected = canonical_sha256(payload)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"{cls._integrity_label} integrity hash is invalid"
+            ) from None
+        if not isinstance(digest, str) or digest != expected:
+            raise ValueError(
+                f"{cls._integrity_label} integrity hash is inconsistent"
+            )
+        return value
+
+    @classmethod
+    def model_validate_json(
+        cls,
+        json_data: str | bytes | bytearray,
+        *,
+        strict: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        try:
+            if isinstance(json_data, str):
+                decoded = json_data
+            else:
+                decoded = bytes(json_data).decode("utf-8", errors="strict")
+            value = json.loads(
+                decoded,
+                parse_constant=_reject_nonfinite_json,
+                object_pairs_hook=_unique_json_object,
+            )
+        except (
+            UnicodeError,
+            json.JSONDecodeError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            raise ValueError("self-hashed JSON is invalid") from None
+        if not isinstance(value, dict):
+            raise ValueError("self-hashed JSON must be an object")
+        return cls.model_validate(
+            value,
+            strict=strict,
+            context=context,
+            by_alias=by_alias,
+            by_name=by_name,
+        )
+
+
+class DatasetCase(_RawSelfHashedModel):
+    _self_hash_field = "case_sha256"
+    _integrity_label = "case"
+
+    schema_version: Literal["8099.deepeval-case/v1"]
     case_ref: str = Field(pattern=_CASE_REF_PATTERN)
     source_group_ref: str = Field(pattern=_SOURCE_GROUP_REF_PATTERN)
     split: DatasetSplit
     risk_tier: Literal["high", "standard"]
-    risk_tags: tuple[RiskTag, ...] = Field(default=(), max_length=8)
+    risk_tags: tuple[RiskTag, ...] = Field(max_length=8)
     material_identity_sha256: str = Field(pattern=_HASH_PATTERN)
     source_content_sha256: str = Field(pattern=_HASH_PATTERN)
     projection: AdvisoryProjection
     case_sha256: str = Field(pattern=_HASH_PATTERN)
+
+    @classmethod
+    def _validate_raw_content(cls, value: dict[str, Any]) -> None:
+        _walk_raw_case_boundary(value)
+        projection = value.get("projection")
+        if not isinstance(projection, dict):
+            raise ValueError("raw projection must be an object")
+        if set(AdvisoryProjection.model_fields).difference(projection):
+            raise ValueError("raw projection omits required fields")
+        digest = projection.get("projection_sha256")
+        payload = dict(projection)
+        payload.pop("projection_sha256", None)
+        try:
+            expected = canonical_sha256(payload)
+        except (TypeError, ValueError):
+            raise ValueError("raw projection integrity hash is invalid") from None
+        if not isinstance(digest, str) or digest != expected:
+            raise ValueError("raw projection integrity hash is inconsistent")
 
     @model_validator(mode="after")
     def validate_case_contract(self) -> Self:
@@ -312,13 +407,14 @@ class DatasetEntry(StrictModel):
         return value
 
 
-class DatasetManifest(StrictModel):
-    schema_version: Literal["8099.deepeval-dataset-manifest/v1"] = (
-        "8099.deepeval-dataset-manifest/v1"
-    )
+class DatasetManifest(_RawSelfHashedModel):
+    _self_hash_field = "manifest_sha256"
+    _integrity_label = "manifest"
+
+    schema_version: Literal["8099.deepeval-dataset-manifest/v1"]
     dataset_id: str = Field(pattern=_SAFE_SLUG_PATTERN)
     dataset_version: Literal["fixed10/v1", "calibration100/v1"]
-    projection_version: Literal["claim-ab-v1"] = "claim-ab-v1"
+    projection_version: Literal["claim-ab-v1"]
     rubric_version: str = Field(pattern=_VERSION_TOKEN_PATTERN)
     entries: tuple[DatasetEntry, ...] = Field(min_length=1)
     subsets: dict[str, tuple[str, ...]]
@@ -456,14 +552,15 @@ class HumanAdjudication(_BoundedReasonModel):
         return _canonical_timestamp(value)
 
 
-class GoldenLabel(StrictModel):
-    schema_version: Literal["8099.deepeval-golden/v1"] = (
-        "8099.deepeval-golden/v1"
-    )
+class GoldenLabel(_RawSelfHashedModel):
+    _self_hash_field = "golden_sha256"
+    _integrity_label = "golden"
+
+    schema_version: Literal["8099.deepeval-golden/v1"]
     case_ref: str = Field(pattern=_CASE_REF_PATTERN)
-    sample_ref: str | None = Field(default=None, pattern=_SAMPLE_REF_PATTERN)
+    sample_ref: str | None = Field(pattern=_SAMPLE_REF_PATTERN)
     human_review_refs: tuple[str, ...] = Field(min_length=1)
-    human_adjudication_refs: tuple[str, ...] = ()
+    human_adjudication_refs: tuple[str, ...]
     metric_labels: MetricLabels
     golden_sha256: str = Field(pattern=_HASH_PATTERN)
 
@@ -537,67 +634,248 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def _open_binary_source(path: Path) -> BinaryIO:
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
+def _supports_function(
+    functions: set[Any],
+    expected_name: str,
+) -> bool:
+    return any(
+        getattr(function, "__name__", None) == expected_name
+        for function in functions
+    )
+
+
+def _require_anchored_io() -> None:
+    if (
+        os.name != "posix"
+        or not getattr(os, "O_NOFOLLOW", 0)
+        or not getattr(os, "O_DIRECTORY", 0)
+        or not _supports_function(os.supports_dir_fd, "open")
+        or not _supports_function(os.supports_dir_fd, "stat")
+        or not _supports_function(os.supports_follow_symlinks, "stat")
+        or not _supports_function(os.supports_fd, "scandir")
+    ):
+        raise DatasetError("root_invalid")
+
+
+def _directory_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _file_flags() -> int:
+    return (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_BINARY", 0)
+    )
+
+
+def _close_descriptors(descriptors: list[int]) -> None:
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+    return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
+
+
+@contextmanager
+def _open_directory_path(path: Path) -> Iterator[int]:
+    _require_anchored_io()
+    candidate = Path(path)
     try:
-        return os.fdopen(descriptor, "rb")
-    except Exception:
-        os.close(descriptor)
+        absolute = Path(os.path.abspath(os.fspath(candidate)))
+        components = absolute.parts
+    except (OSError, TypeError, ValueError):
+        raise DatasetError("root_invalid") from None
+    if not components or components[0] != os.path.sep:
+        raise DatasetError("root_invalid")
+
+    descriptors: list[int] = []
+    try:
+        anchor = os.open(os.path.sep, _directory_flags())
+        descriptors.append(anchor)
+        opened = os.fstat(anchor)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise DatasetError("root_invalid")
+
+        current = anchor
+        for component in components[1:]:
+            if component in {"", ".", ".."}:
+                raise DatasetError("root_invalid")
+            before = os.stat(
+                component,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise DatasetError("root_invalid")
+            child = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=current,
+            )
+            descriptors.append(child)
+            after = os.fstat(child)
+            if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
+                raise DatasetError("root_invalid")
+            current = child
+        yield current
+    except DatasetError:
         raise
+    except (OSError, TypeError, ValueError):
+        raise DatasetError("root_invalid") from None
+    finally:
+        _close_descriptors(descriptors)
 
 
-def _read_regular_bytes(path: Path, *, max_bytes: int) -> bytes:
+def _validated_relative_parts(relative_path: str) -> tuple[str, ...]:
+    try:
+        validated = DatasetEntry.validate_relative_path(relative_path)
+    except (TypeError, ValueError):
+        raise DatasetError("path_invalid") from None
+    parts = PurePosixPath(validated).parts
+    if not parts:
+        raise DatasetError("path_invalid")
+    return parts
+
+
+@contextmanager
+def _open_relative_parent(
+    root_descriptor: int,
+    relative_path: str,
+) -> Iterator[tuple[int, str]]:
+    _require_anchored_io()
+    parts = _validated_relative_parts(relative_path)
+    descriptors: list[int] = []
+    current = root_descriptor
+    try:
+        for component in parts[:-1]:
+            before = os.stat(
+                component,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise DatasetError("path_invalid")
+            child = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=current,
+            )
+            descriptors.append(child)
+            after = os.fstat(child)
+            if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
+                raise DatasetError("path_invalid")
+            current = child
+        yield current, parts[-1]
+    except DatasetError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise DatasetError("path_invalid") from None
+    finally:
+        _close_descriptors(descriptors)
+
+
+def _read_regular_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> bytes:
     if (
         isinstance(max_bytes, bool)
         or not isinstance(max_bytes, int)
         or max_bytes <= 0
     ):
         raise DatasetError("file_size")
-    candidate = Path(path)
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+    ):
+        raise DatasetError("path_invalid")
     try:
-        before = candidate.lstat()
-    except (OSError, TypeError, ValueError):
+        before = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
         raise DatasetError("file_unavailable") from None
+    except (OSError, TypeError, ValueError):
+        raise DatasetError("file_changed") from None
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise DatasetError("file_type")
     if before.st_size <= 0 or before.st_size > max_bytes:
         raise DatasetError("file_size")
 
+    descriptor: int | None = None
     try:
-        with _open_binary_source(candidate) as source:
-            opened = os.fstat(source.fileno())
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or (before.st_dev, before.st_ino)
-                != (opened.st_dev, opened.st_ino)
-            ):
-                raise DatasetError("file_changed")
-            if opened.st_size <= 0 or opened.st_size > max_bytes:
-                raise DatasetError("file_size")
-            payload = source.read(max_bytes + 1)
-            after_open = os.fstat(source.fileno())
-            after_path = candidate.lstat()
+        descriptor = os.open(
+            name,
+            _file_flags(),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not _same_file(before, opened):
+            raise DatasetError("file_changed")
+        if opened.st_size <= 0 or opened.st_size > max_bytes:
+            raise DatasetError("file_size")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= max_bytes:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, max_bytes + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        payload = b"".join(chunks)
+        after_open = os.fstat(descriptor)
     except DatasetError:
         raise
     except (OSError, TypeError, ValueError):
         raise DatasetError("file_changed") from None
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
     if (
         len(payload) != opened.st_size
         or len(payload) > max_bytes
         or after_open.st_size != opened.st_size
         or after_open.st_mtime_ns != opened.st_mtime_ns
-        or stat.S_ISLNK(after_path.st_mode)
-        or not stat.S_ISREG(after_path.st_mode)
-        or (after_path.st_dev, after_path.st_ino)
-        != (opened.st_dev, opened.st_ino)
-        or after_path.st_size != opened.st_size
-        or after_path.st_mtime_ns != opened.st_mtime_ns
+        or not _same_file(opened, after_open)
     ):
         raise DatasetError("file_changed")
     return payload
+
+
+def _read_path_bytes(path: Path, *, max_bytes: int) -> bytes:
+    candidate = Path(path)
+    if not candidate.name:
+        raise DatasetError("path_invalid")
+    with _open_directory_path(candidate.parent) as parent_descriptor:
+        return _read_regular_at(
+            parent_descriptor,
+            candidate.name,
+            max_bytes=max_bytes,
+        )
 
 
 def _decode_json_object(payload: bytes) -> dict[str, Any]:
@@ -621,37 +899,7 @@ def _decode_json_object(payload: bytes) -> dict[str, Any]:
     return value
 
 
-def _require_safe_root(root: Path) -> Path:
-    candidate = Path(root)
-    try:
-        info = candidate.lstat()
-    except (OSError, TypeError, ValueError):
-        raise DatasetError("root_invalid") from None
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise DatasetError("root_invalid")
-    return candidate
-
-
-def _case_path(root: Path, relative_path: str) -> Path:
-    try:
-        validated = DatasetEntry.validate_relative_path(relative_path)
-    except (TypeError, ValueError):
-        raise DatasetError("path_invalid") from None
-    current = root
-    parts = PurePosixPath(validated).parts
-    for part in parts[:-1]:
-        current = current / part
-        try:
-            info = current.lstat()
-        except (OSError, TypeError, ValueError):
-            raise DatasetError("path_invalid") from None
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-            raise DatasetError("path_invalid")
-    return current / parts[-1]
-
-
-def load_dataset_manifest(path: Path) -> DatasetManifest:
-    payload = _read_regular_bytes(Path(path), max_bytes=MAX_DATASET_JSON_BYTES)
+def _parse_manifest_payload(payload: bytes) -> DatasetManifest:
     value = _decode_json_object(payload)
     try:
         return DatasetManifest.model_validate(value)
@@ -659,12 +907,21 @@ def load_dataset_manifest(path: Path) -> DatasetManifest:
         raise DatasetError("manifest_invalid") from None
 
 
-def load_dataset_case(root: Path, entry: DatasetEntry) -> DatasetCase:
-    safe_root = _require_safe_root(Path(root))
-    if not isinstance(entry, DatasetEntry):
-        raise DatasetError("path_invalid")
-    path = _case_path(safe_root, entry.relative_path)
-    payload = _read_regular_bytes(path, max_bytes=MAX_DATASET_JSON_BYTES)
+def _load_manifest_at(root_descriptor: int) -> DatasetManifest:
+    payload = _read_regular_at(
+        root_descriptor,
+        "manifest.json",
+        max_bytes=MAX_DATASET_JSON_BYTES,
+    )
+    return _parse_manifest_payload(payload)
+
+
+def load_dataset_manifest(path: Path) -> DatasetManifest:
+    payload = _read_path_bytes(Path(path), max_bytes=MAX_DATASET_JSON_BYTES)
+    return _parse_manifest_payload(payload)
+
+
+def _parse_case_payload(payload: bytes, entry: DatasetEntry) -> DatasetCase:
     value = _decode_json_object(payload)
     try:
         _walk_raw_case_boundary(value)
@@ -686,6 +943,29 @@ def load_dataset_case(root: Path, entry: DatasetEntry) -> DatasetCase:
     return case
 
 
+def _load_dataset_case_at(
+    root_descriptor: int,
+    entry: DatasetEntry,
+) -> DatasetCase:
+    with _open_relative_parent(
+        root_descriptor,
+        entry.relative_path,
+    ) as (parent_descriptor, name):
+        payload = _read_regular_at(
+            parent_descriptor,
+            name,
+            max_bytes=MAX_DATASET_JSON_BYTES,
+        )
+    return _parse_case_payload(payload, entry)
+
+
+def load_dataset_case(root: Path, entry: DatasetEntry) -> DatasetCase:
+    if not isinstance(entry, DatasetEntry):
+        raise DatasetError("path_invalid")
+    with _open_directory_path(Path(root)) as root_descriptor:
+        return _load_dataset_case_at(root_descriptor, entry)
+
+
 def iter_jsonl(
     path: Path,
     model_type: type[StrictModel],
@@ -695,7 +975,7 @@ def iter_jsonl(
         or not issubclass(model_type, StrictModel)
     ):
         raise DatasetError("jsonl_model_invalid")
-    payload = _read_regular_bytes(Path(path), max_bytes=MAX_DATASET_JSONL_BYTES)
+    payload = _read_path_bytes(Path(path), max_bytes=MAX_DATASET_JSONL_BYTES)
     try:
         decoded = payload.decode("utf-8", errors="strict")
     except UnicodeError:
@@ -730,26 +1010,176 @@ def iter_jsonl(
             raise DatasetError("jsonl_model_invalid") from None
 
 
-def validate_dataset_tree(root: Path) -> DatasetValidation:
-    try:
-        safe_root = _require_safe_root(Path(root))
-        manifest = load_dataset_manifest(safe_root / "manifest.json")
-    except DatasetError as exc:
-        return DatasetValidation(
-            valid=False,
-            error_categories=(exc.category,),
-            checked_entry_count=0,
-        )
+TreeSnapshotEntry = tuple[str, int, int, int, int, int]
 
+
+def _expected_tree_members(
+    manifest: DatasetManifest,
+) -> tuple[set[str], set[str]]:
+    expected_files = {"manifest.json"}
+    expected_directories: set[str] = set()
+    for entry in manifest.entries:
+        parts = _validated_relative_parts(entry.relative_path)
+        expected_files.add("/".join(parts))
+        for length in range(1, len(parts)):
+            expected_directories.add("/".join(parts[:length]))
+    return expected_files, expected_directories
+
+
+def _inventory_directory(
+    directory_descriptor: int,
+    *,
+    prefix: tuple[str, ...],
+    expected_files: set[str],
+    expected_directories: set[str],
+    categories: set[IntegrityErrorCategory],
+    snapshot: list[TreeSnapshotEntry],
+) -> None:
+    try:
+        with os.scandir(directory_descriptor) as iterator:
+            names = sorted(entry.name for entry in iterator)
+    except (OSError, TypeError, ValueError):
+        categories.add("tree_unexpected")
+        return
+
+    for name in names:
+        if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
+            categories.add("tree_unexpected")
+            continue
+        relative_parts = (*prefix, name)
+        relative_path = "/".join(relative_parts)
+        try:
+            before = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except (OSError, TypeError, ValueError):
+            categories.add("tree_unexpected")
+            continue
+
+        file_type = stat.S_IFMT(before.st_mode)
+        snapshot.append(
+            (
+                relative_path,
+                file_type,
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            )
+        )
+        if stat.S_ISLNK(before.st_mode):
+            categories.add("tree_unexpected")
+            continue
+        if stat.S_ISREG(before.st_mode):
+            if relative_path not in expected_files:
+                categories.add("tree_unexpected")
+            if (
+                before.st_size <= 0
+                or before.st_size > MAX_DATASET_JSON_BYTES
+            ):
+                categories.add("file_size")
+            continue
+        if not stat.S_ISDIR(before.st_mode):
+            categories.add("tree_unexpected")
+            continue
+
+        if relative_path not in expected_directories:
+            categories.add("tree_unexpected")
+        child_descriptor: int | None = None
+        try:
+            child_descriptor = os.open(
+                name,
+                _directory_flags(),
+                dir_fd=directory_descriptor,
+            )
+            opened = os.fstat(child_descriptor)
+            if not stat.S_ISDIR(opened.st_mode) or not _same_file(
+                before,
+                opened,
+            ):
+                categories.add("tree_unexpected")
+                continue
+            _inventory_directory(
+                child_descriptor,
+                prefix=relative_parts,
+                expected_files=expected_files,
+                expected_directories=expected_directories,
+                categories=categories,
+                snapshot=snapshot,
+            )
+        except (OSError, TypeError, ValueError):
+            categories.add("tree_unexpected")
+        finally:
+            if child_descriptor is not None:
+                try:
+                    os.close(child_descriptor)
+                except OSError:
+                    pass
+
+
+def _inventory_tree(
+    root_descriptor: int,
+    manifest: DatasetManifest,
+) -> tuple[set[IntegrityErrorCategory], tuple[TreeSnapshotEntry, ...]]:
+    expected_files, expected_directories = _expected_tree_members(manifest)
+    categories: set[IntegrityErrorCategory] = set()
+    snapshot: list[TreeSnapshotEntry] = []
+    _inventory_directory(
+        root_descriptor,
+        prefix=(),
+        expected_files=expected_files,
+        expected_directories=expected_directories,
+        categories=categories,
+        snapshot=snapshot,
+    )
+    observed_files = {
+        path
+        for path, file_type, *_rest in snapshot
+        if file_type == stat.S_IFREG
+    }
+    observed_directories = {
+        path
+        for path, file_type, *_rest in snapshot
+        if file_type == stat.S_IFDIR
+    }
+    if (
+        not expected_files.issubset(observed_files)
+        or not expected_directories.issubset(observed_directories)
+    ):
+        categories.add("tree_unexpected")
+    return categories, tuple(snapshot)
+
+
+def validate_dataset_tree(root: Path) -> DatasetValidation:
     categories: set[IntegrityErrorCategory] = set()
     checked_entry_count = 0
-    for entry in manifest.entries:
-        try:
-            load_dataset_case(safe_root, entry)
-        except DatasetError as exc:
-            categories.add(exc.category)
-        else:
-            checked_entry_count += 1
+    try:
+        with _open_directory_path(Path(root)) as root_descriptor:
+            manifest = _load_manifest_at(root_descriptor)
+            inventory_categories, before_snapshot = _inventory_tree(
+                root_descriptor,
+                manifest,
+            )
+            categories.update(inventory_categories)
+            for entry in manifest.entries:
+                try:
+                    _load_dataset_case_at(root_descriptor, entry)
+                except DatasetError as exc:
+                    categories.add(exc.category)
+                else:
+                    checked_entry_count += 1
+            inventory_categories, after_snapshot = _inventory_tree(
+                root_descriptor,
+                manifest,
+            )
+            categories.update(inventory_categories)
+            if before_snapshot != after_snapshot:
+                categories.add("file_changed")
+    except DatasetError as exc:
+        categories.add(exc.category)
+
     ordered = tuple(sorted(categories, key=_ERROR_ORDER.__getitem__))
     return DatasetValidation(
         valid=not ordered,
