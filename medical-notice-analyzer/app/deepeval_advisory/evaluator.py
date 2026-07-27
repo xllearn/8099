@@ -59,10 +59,10 @@ CRITICAL_COVERAGE_EVALUATION_STEPS = (
     "依据关键事实遗漏、矛盾或不准确的数量和重要性，按照固定量表评分。",
 )
 CRITICAL_COVERAGE_RUBRIC = (
-    ((0, 2), "关键要求大部分缺失、不准确或相互矛盾。"),
-    ((3, 5), "覆盖部分关键要求，但存在明显遗漏或不准确表述。"),
-    ((6, 8), "覆盖主要关键要求，仅有有限遗漏或轻微不准确。"),
-    ((9, 10), "完整、准确且无矛盾地覆盖全部关键要求。"),
+    ((0, 2), "关键要求大部分缺失或相互矛盾。"),
+    ((3, 5), "覆盖部分关键要求，但存在明显遗漏。"),
+    ((6, 8), "覆盖主要关键要求，仅有有限遗漏。"),
+    ((9, 10), "完整、准确覆盖全部关键要求。"),
 )
 
 ATTACHMENT_CONSISTENCY_EVALUATION_STEPS = (
@@ -729,3 +729,7 @@ async def evaluate_projection(
         output_fingerprint=output_fingerprint,
         created_at=utc_now_iso(),
     )
+
+
+runtime_evaluate_projection = evaluate_projection
+scheduled_evaluate_projection = evaluate_projection

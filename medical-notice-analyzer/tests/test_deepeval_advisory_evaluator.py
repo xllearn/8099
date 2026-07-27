@@ -494,6 +494,42 @@ class AdvisoryEvaluatorDefinitionTests(unittest.TestCase):
             self.assertGreaterEqual(len(expected_outcome), 12)
             self.assertTrue(re.search(r"[\u4e00-\u9fff]", expected_outcome))
 
+    def test_critical_rubric_uses_approved_literal_constructor_args(
+        self,
+    ) -> None:
+        judge = NoCallJudge()
+        with (
+            patch.object(
+                evaluator_module,
+                "Rubric",
+                side_effect=lambda **_kwargs: object(),
+            ) as rubric_constructor,
+            patch.object(
+                evaluator_module,
+                "GEval",
+                return_value=object(),
+            ),
+        ):
+            _build_metrics(judge)
+
+        self.assertEqual(rubric_constructor.call_count, 8)
+        actual_critical_args = tuple(
+            (
+                constructor_call.kwargs["score_range"],
+                constructor_call.kwargs["expected_outcome"],
+            )
+            for constructor_call in rubric_constructor.call_args_list[:4]
+        )
+        self.assertEqual(
+            actual_critical_args,
+            (
+                ((0, 2), "关键要求大部分缺失或相互矛盾。"),
+                ((3, 5), "覆盖部分关键要求，但存在明显遗漏。"),
+                ((6, 8), "覆盖主要关键要求，仅有有限遗漏。"),
+                ((9, 10), "完整、准确覆盖全部关键要求。"),
+            ),
+        )
+
     def test_real_metric_types_keep_fixed_steps_and_verbose_disabled(
         self,
     ) -> None:
@@ -585,6 +621,46 @@ class AdvisoryEvaluatorDefinitionTests(unittest.TestCase):
         }
         self.assertNotIn("AdvisoryCache", imported_modules)
         self.assertNotIn("AdvisoryStore", imported_modules)
+
+    def test_runtime_and_scheduled_entrypoints_are_direct_aliases(
+        self,
+    ) -> None:
+        self.assertIs(
+            getattr(
+                evaluator_module,
+                "runtime_evaluate_projection",
+                None,
+            ),
+            evaluate_projection,
+        )
+        self.assertIs(
+            getattr(
+                evaluator_module,
+                "scheduled_evaluate_projection",
+                None,
+            ),
+            evaluate_projection,
+        )
+
+        source = Path(evaluator_module.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        async_implementations = [
+            node.name
+            for node in tree.body
+            if isinstance(node, ast.AsyncFunctionDef)
+        ]
+        self.assertEqual(
+            async_implementations.count("evaluate_projection"),
+            1,
+        )
+        self.assertNotIn(
+            "runtime_evaluate_projection",
+            async_implementations,
+        )
+        self.assertNotIn(
+            "scheduled_evaluate_projection",
+            async_implementations,
+        )
 
 
 class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
