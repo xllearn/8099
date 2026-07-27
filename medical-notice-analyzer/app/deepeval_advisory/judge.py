@@ -40,6 +40,7 @@ _METRIC_VERSION_PATTERN = re.compile(
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
+_MAX_FINITE_FLOAT = float.fromhex("0x1.fffffffffffffp+1023")
 
 
 class JudgeError(RuntimeError):
@@ -89,12 +90,40 @@ class JudgeResponse(StrictModel):
         return value
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class JudgeUsageSnapshot:
+    token_input: int = 0
+    token_output: int = 0
+    cost: float = 0.0
+    latency_ms: int = 0
+    response_count: int = 0
+    input_fingerprints: tuple[str, ...] = ()
+    output_fingerprints: tuple[str, ...] = ()
+
+
 class _BudgetState:
-    __slots__ = ("_lock", "_used")
+    __slots__ = (
+        "_lock",
+        "_used",
+        "_token_input",
+        "_token_output",
+        "_cost",
+        "_latency_ms",
+        "_response_count",
+        "_input_fingerprints",
+        "_output_fingerprints",
+    )
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._used = 0
+        self._token_input = 0
+        self._token_output = 0
+        self._cost = 0.0
+        self._latency_ms = 0
+        self._response_count = 0
+        self._input_fingerprints: list[str] = []
+        self._output_fingerprints: list[str] = []
 
     @property
     def used(self) -> int:
@@ -107,6 +136,31 @@ class _BudgetState:
                 return False
             self._used += 1
             return True
+
+    def record_response(self, response: JudgeResponse) -> None:
+        with self._lock:
+            cost = self._cost + response.cost
+            self._token_input += response.token_input
+            self._token_output += response.token_output
+            self._cost = (
+                cost if math.isfinite(cost) else _MAX_FINITE_FLOAT
+            )
+            self._latency_ms += response.latency_ms
+            self._response_count += 1
+            self._input_fingerprints.append(response.input_fingerprint)
+            self._output_fingerprints.append(response.output_fingerprint)
+
+    def usage_snapshot(self) -> JudgeUsageSnapshot:
+        with self._lock:
+            return JudgeUsageSnapshot(
+                token_input=self._token_input,
+                token_output=self._token_output,
+                cost=self._cost,
+                latency_ms=self._latency_ms,
+                response_count=self._response_count,
+                input_fingerprints=tuple(self._input_fingerprints),
+                output_fingerprints=tuple(self._output_fingerprints),
+            )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -172,6 +226,9 @@ class JudgeCallContext:
     @property
     def subcalls_used(self) -> int:
         return self._budget.used
+
+    def usage_snapshot(self) -> JudgeUsageSnapshot:
+        return self._budget.usage_snapshot()
 
     def _consume_subcall(self) -> None:
         if not self._budget.consume(self.max_subcalls):
@@ -515,14 +572,7 @@ def parse_judge_response(
             "unavailable",
             outcome="unknown",
         )
-    if (
-        expected_model_version is not None
-        and response.resolved_model_version != expected_model_version
-    ):
-        raise JudgeError(
-            "model_version_mismatch",
-            outcome="completed",
-        )
+    _verify_response_model_version(response, expected_model_version)
     if schema is None:
         return response.text
 
@@ -581,6 +631,27 @@ def _verify_response_integrity(
             retryable=False,
             outcome="completed",
         )
+
+
+def _verify_response_model_version(
+    response: JudgeResponse,
+    expected_model_version: str | None,
+) -> None:
+    if (
+        expected_model_version is not None
+        and response.resolved_model_version != expected_model_version
+    ):
+        raise JudgeError(
+            "model_version_mismatch",
+            outcome="completed",
+        )
+
+
+def _record_judge_usage(
+    context: JudgeCallContext,
+    response: JudgeResponse,
+) -> None:
+    context._budget.record_response(response)
 
 
 def _require_context_after_response(
@@ -702,10 +773,14 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
                 )
                 _require_context_after_response(context)
                 _verify_response_integrity(response, guarded_prompt)
+                _verify_response_model_version(
+                    response,
+                    self._profile_version,
+                )
+                _record_judge_usage(context, response)
                 result = parse_judge_response(
                     response,
                     schema,
-                    expected_model_version=self._profile_version,
                 )
             except JudgeError as error:
                 if _may_retry(error, attempt):
@@ -791,10 +866,14 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
                     ) from None
                 _require_context_after_response(context)
                 _verify_response_integrity(response, guarded_prompt)
+                _verify_response_model_version(
+                    response,
+                    self._profile_version,
+                )
+                _record_judge_usage(context, response)
                 result = parse_judge_response(
                     response,
                     schema,
-                    expected_model_version=self._profile_version,
                 )
             except JudgeError as error:
                 if _may_retry(error, attempt):

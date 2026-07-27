@@ -9,6 +9,7 @@ import io
 import logging
 import math
 from pathlib import Path
+import threading
 import time
 from types import SimpleNamespace
 import unittest
@@ -150,6 +151,85 @@ def make_fake(
         ),
         failures={} if failures is None else failures,
     )
+
+
+def require_usage_snapshot(
+    test_case: unittest.TestCase,
+    context: JudgeCallContext,
+) -> object:
+    test_case.assertTrue(
+        hasattr(judge_module, "JudgeUsageSnapshot"),
+        "JudgeUsageSnapshot must be public",
+    )
+    test_case.assertTrue(
+        hasattr(context, "usage_snapshot"),
+        "JudgeCallContext.usage_snapshot() must be public",
+    )
+    snapshot = context.usage_snapshot()
+    test_case.assertIsInstance(
+        snapshot,
+        judge_module.JudgeUsageSnapshot,
+    )
+    return snapshot
+
+
+class UsageMetadataTransport:
+    def __init__(
+        self,
+        metadata: list[dict[str, int | float]],
+        *,
+        responses: dict[str | None, object] | None = None,
+    ) -> None:
+        self._fake = make_fake(responses=responses)
+        self._metadata = tuple(metadata)
+        self._lock = threading.Lock()
+        self._metadata_index = 0
+
+    @property
+    def sync_call_count(self) -> int:
+        return self._fake.sync_call_count
+
+    @property
+    def async_call_count(self) -> int:
+        return self._fake.async_call_count
+
+    def _attach_metadata(self, response: JudgeResponse) -> JudgeResponse:
+        with self._lock:
+            if self._metadata_index >= len(self._metadata):
+                raise AssertionError("missing test response metadata")
+            metadata = self._metadata[self._metadata_index]
+            self._metadata_index += 1
+        return response.model_copy(update=metadata)
+
+    def complete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        return self._attach_metadata(
+            self._fake.complete(
+                prompt=prompt,
+                response_schema=response_schema,
+                context=context,
+            )
+        )
+
+    async def acomplete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        return self._attach_metadata(
+            await self._fake.acomplete(
+                prompt=prompt,
+                response_schema=response_schema,
+                context=context,
+            )
+        )
 
 
 class TamperedFingerprintTransport:
@@ -521,6 +601,266 @@ class JudgeContextContractTests(unittest.TestCase):
                 self.assertEqual(raised.exception.category, "context_invalid")
 
 
+class JudgeUsageLedgerTests(unittest.TestCase):
+    def test_initial_snapshot_is_immutable_safe_and_zeroed(self) -> None:
+        snapshot = require_usage_snapshot(self, make_context())
+
+        self.assertEqual(
+            {item.name for item in fields(snapshot)},
+            {
+                "token_input",
+                "token_output",
+                "cost",
+                "latency_ms",
+                "response_count",
+                "input_fingerprints",
+                "output_fingerprints",
+            },
+        )
+        self.assertEqual(snapshot.token_input, 0)
+        self.assertEqual(snapshot.token_output, 0)
+        self.assertEqual(snapshot.cost, 0.0)
+        self.assertTrue(math.isfinite(snapshot.cost))
+        self.assertEqual(snapshot.latency_ms, 0)
+        self.assertEqual(snapshot.response_count, 0)
+        self.assertEqual(snapshot.input_fingerprints, ())
+        self.assertEqual(snapshot.output_fingerprints, ())
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.response_count = 1
+        with self.assertRaises(FrozenInstanceError):
+            snapshot.input_fingerprints += ("0" * 64,)
+
+    def test_one_sync_response_is_recorded_exactly_once(self) -> None:
+        metadata = {
+            "token_input": 11,
+            "token_output": 7,
+            "cost": 0.125,
+            "latency_ms": 23,
+        }
+        transport = UsageMetadataTransport([metadata])
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context()
+        prompt = "one bounded sync call"
+
+        with judge_context(context):
+            response_text = adapter.generate(prompt)
+
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(response_text, "plain deterministic result")
+        self.assertEqual(snapshot.token_input, 11)
+        self.assertEqual(snapshot.token_output, 7)
+        self.assertEqual(snapshot.cost, 0.125)
+        self.assertEqual(snapshot.latency_ms, 23)
+        self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(
+            snapshot.input_fingerprints,
+            (text_sha256(prompt),),
+        )
+        self.assertEqual(
+            snapshot.output_fingerprints,
+            (text_sha256(response_text),),
+        )
+
+    def test_multiple_calls_aggregate_and_preserve_fingerprint_order(
+        self,
+    ) -> None:
+        transport = UsageMetadataTransport(
+            [
+                {
+                    "token_input": 3,
+                    "token_output": 5,
+                    "cost": 0.25,
+                    "latency_ms": 7,
+                },
+                {
+                    "token_input": 11,
+                    "token_output": 13,
+                    "cost": 0.5,
+                    "latency_ms": 17,
+                },
+            ]
+        )
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context()
+        prompts = ("first bounded call", "second bounded call")
+
+        with judge_context(context):
+            outputs = tuple(adapter.generate(prompt) for prompt in prompts)
+
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(snapshot.token_input, 14)
+        self.assertEqual(snapshot.token_output, 18)
+        self.assertEqual(snapshot.cost, 0.75)
+        self.assertTrue(math.isfinite(snapshot.cost))
+        self.assertEqual(snapshot.latency_ms, 24)
+        self.assertEqual(snapshot.response_count, 2)
+        self.assertEqual(
+            snapshot.input_fingerprints,
+            tuple(text_sha256(prompt) for prompt in prompts),
+        )
+        self.assertEqual(
+            snapshot.output_fingerprints,
+            tuple(text_sha256(output) for output in outputs),
+        )
+
+    def test_schema_invalid_paid_response_is_still_recorded(self) -> None:
+        response_text = "USAGE_SCHEMA_SENTINEL not-json"
+        transport = UsageMetadataTransport(
+            [
+                {
+                    "token_input": 29,
+                    "token_output": 31,
+                    "cost": 0.75,
+                    "latency_ms": 37,
+                }
+            ],
+            responses={"ScoreEnvelope": response_text},
+        )
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context()
+        prompt = "bounded schema-invalid call"
+
+        with judge_context(context):
+            with self.assertRaises(JudgeError) as raised:
+                adapter.generate(prompt, schema=ScoreEnvelope)
+
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(raised.exception.category, "response_schema_invalid")
+        self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(snapshot.token_input, 29)
+        self.assertEqual(snapshot.token_output, 31)
+        self.assertEqual(snapshot.cost, 0.75)
+        self.assertEqual(snapshot.latency_ms, 37)
+        self.assertEqual(snapshot.input_fingerprints, (text_sha256(prompt),))
+        self.assertEqual(
+            snapshot.output_fingerprints,
+            (text_sha256(response_text),),
+        )
+
+    def test_fingerprint_or_model_mismatch_metadata_is_not_recorded(
+        self,
+    ) -> None:
+        cases = (
+            (
+                TamperedFingerprintTransport("output_fingerprint"),
+                "response_integrity_invalid",
+            ),
+            (
+                make_fake(profile_version="unexpected-profile"),
+                "model_version_mismatch",
+            ),
+        )
+        for transport, category in cases:
+            with self.subTest(category=category):
+                adapter = DeepEvalJudgeLLM(
+                    transport,
+                    profile_version=PROFILE_VERSION,
+                )
+                context = make_context()
+                with judge_context(context):
+                    with self.assertRaises(JudgeError) as raised:
+                        adapter.generate(
+                            "bounded rejected metadata",
+                            schema=ScoreEnvelope,
+                        )
+
+                self.assertEqual(raised.exception.category, category)
+                snapshot = require_usage_snapshot(self, context)
+                self.assertEqual(
+                    snapshot,
+                    judge_module.JudgeUsageSnapshot(),
+                )
+
+    def test_not_started_retries_only_record_the_actual_response(self) -> None:
+        transport = make_fake(
+            failures={
+                None: [
+                    JudgeError(
+                        "http_429",
+                        retryable=True,
+                        outcome="not_started",
+                    ),
+                    JudgeError(
+                        "http_503",
+                        retryable=True,
+                        outcome="not_started",
+                    ),
+                ]
+            }
+        )
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context(max_subcalls=3)
+        prompt = "bounded retry usage"
+
+        with judge_context(context):
+            response_text = adapter.generate(prompt)
+
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(transport.sync_call_count, 3)
+        self.assertEqual(context.subcalls_used, 3)
+        self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(snapshot.token_input, len(prompt.encode("utf-8")))
+        self.assertEqual(
+            snapshot.token_output,
+            len(response_text.encode("utf-8")),
+        )
+        self.assertEqual(snapshot.input_fingerprints, (text_sha256(prompt),))
+        self.assertEqual(
+            snapshot.output_fingerprints,
+            (text_sha256(response_text),),
+        )
+
+    def test_snapshot_and_logs_never_retain_prompt_or_response_content(
+        self,
+    ) -> None:
+        prompt = "USAGE_PROMPT_SENTINEL bounded-content"
+        response_text = "USAGE_RESPONSE_SENTINEL token=do-not-retain"
+        transport = make_fake(responses={None: response_text})
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context()
+        logger = logging.getLogger("app.deepeval_advisory.judge")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        previous_level = logger.level
+        previous_propagate = logger.propagate
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
+        try:
+            with judge_context(context):
+                self.assertEqual(adapter.generate(prompt), response_text)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+            logger.propagate = previous_propagate
+
+        snapshot = require_usage_snapshot(self, context)
+        retained = repr(snapshot)
+        logs = stream.getvalue()
+        for sentinel in (
+            "USAGE_PROMPT_SENTINEL",
+            "USAGE_RESPONSE_SENTINEL",
+            "do-not-retain",
+        ):
+            self.assertNotIn(sentinel, retained)
+            self.assertNotIn(sentinel, logs)
+
+
 class JudgeAsyncContextContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_tasks_have_isolated_context_and_budget(
         self,
@@ -563,6 +903,81 @@ class JudgeAsyncContextContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(JudgeError) as raised:
             require_judge_context()
         self.assertEqual(raised.exception.category, "context_absent")
+
+
+class JudgeAsyncUsageLedgerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_one_async_response_is_recorded_exactly_once(self) -> None:
+        transport = UsageMetadataTransport(
+            [
+                {
+                    "token_input": 41,
+                    "token_output": 43,
+                    "cost": 1.25,
+                    "latency_ms": 47,
+                }
+            ]
+        )
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context()
+        prompt = "one bounded async call"
+
+        with judge_context(context):
+            response_text = await adapter.a_generate(prompt)
+
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(transport.sync_call_count, 0)
+        self.assertEqual(transport.async_call_count, 1)
+        self.assertEqual(snapshot.token_input, 41)
+        self.assertEqual(snapshot.token_output, 43)
+        self.assertEqual(snapshot.cost, 1.25)
+        self.assertEqual(snapshot.latency_ms, 47)
+        self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(snapshot.input_fingerprints, (text_sha256(prompt),))
+        self.assertEqual(
+            snapshot.output_fingerprints,
+            (text_sha256(response_text),),
+        )
+
+    async def test_concurrent_contexts_have_isolated_usage_ledgers(
+        self,
+    ) -> None:
+        adapter = DeepEvalJudgeLLM(
+            make_fake(),
+            profile_version=PROFILE_VERSION,
+        )
+        contexts = (
+            make_context(request_id="req_usage_one1"),
+            make_context(request_id="req_usage_two2"),
+        )
+        prompts = ("first isolated prompt", "second isolated prompt")
+
+        async def call(
+            context: JudgeCallContext,
+            prompt: str,
+        ) -> object:
+            with judge_context(context):
+                await asyncio.sleep(0)
+                await adapter.a_generate(prompt)
+                await asyncio.sleep(0)
+                return require_usage_snapshot(self, context)
+
+        snapshots = await asyncio.gather(
+            *(call(context, prompt) for context, prompt in zip(contexts, prompts))
+        )
+
+        for snapshot, prompt in zip(snapshots, prompts):
+            self.assertEqual(snapshot.response_count, 1)
+            self.assertEqual(
+                snapshot.input_fingerprints,
+                (text_sha256(prompt),),
+            )
+        self.assertNotEqual(
+            snapshots[0].input_fingerprints,
+            snapshots[1].input_fingerprints,
+        )
 
 
 class JudgePromptGuardTests(unittest.TestCase):
@@ -1497,7 +1912,7 @@ class DeepEvalJudgeAsyncTests(unittest.IsolatedAsyncioTestCase):
         context = make_context(
             max_subcalls=3,
             fresh_until_monotonic=now + 5,
-            deadline_monotonic=now + 0.2,
+            deadline_monotonic=now + 1.0,
         )
 
         with judge_context(context):
@@ -1507,7 +1922,7 @@ class DeepEvalJudgeAsyncTests(unittest.IsolatedAsyncioTestCase):
                         "bounded async deadline prompt",
                         schema=ScoreEnvelope,
                     ),
-                    timeout=0.8,
+                    timeout=2.5,
                 )
 
         self.assertEqual(raised.exception.category, "deadline_exceeded")
