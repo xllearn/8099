@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +42,10 @@ SECOND_REVIEW_REF = "review_" + "5" * 32
 ADJUDICATION_REF = "adjudication_" + "6" * 32
 REVIEWER_REF = "reviewer_" + "7" * 32
 SAMPLE_REF = "sample_" + "8" * 32
+FIXED10_SOURCE_SCHEMA_VERSION = "8099.deepeval-fixed10-source/v1"
+FIXED10_RUBRIC_VERSION = "advisory-rubric-v1"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FREEZE_SCRIPT = PROJECT_ROOT / "scripts" / "freeze_deepeval_dataset.py"
 
 
 def _projection_value() -> dict[str, object]:
@@ -192,6 +198,75 @@ def _golden_value() -> dict[str, object]:
     }
     payload["golden_sha256"] = canonical_sha256(payload)
     return payload
+
+
+def _fixed10_source_value(
+    index: int,
+    *,
+    fixed3_rank: int | None = None,
+) -> dict[str, object]:
+    projection = _projection_value()
+    projection["run_ref"] = f"runref_{index:032x}"
+    projection["report_sha256"] = hashlib.sha256(
+        f"report-{index}".encode("utf-8")
+    ).hexdigest()
+    projection["units"][0]["unit_id"] = f"unit_{index:016x}"
+    projection["units"][0]["text"] = f"合成案例 {index} 的采购范围明确。"
+    projection_payload = {
+        key: nested
+        for key, nested in projection.items()
+        if key != "projection_sha256"
+    }
+    projection["projection_sha256"] = canonical_sha256(projection_payload)
+    return {
+        "schema_version": FIXED10_SOURCE_SCHEMA_VERSION,
+        "case_ref": f"case_{index:032x}",
+        "source_group_ref": f"source_group_{index:032x}",
+        "risk_tier": "standard",
+        "risk_tags": [],
+        "material_identity_sha256": hashlib.sha256(
+            f"material-{index}".encode("utf-8")
+        ).hexdigest(),
+        "source_content_sha256": hashlib.sha256(
+            f"content-{index}".encode("utf-8")
+        ).hexdigest(),
+        "projection": projection,
+        "fixed3_rank": fixed3_rank,
+    }
+
+
+def _write_fixed10_sources(
+    root: Path,
+    *,
+    count: int = 10,
+    ranks: dict[int, int | None] | None = None,
+) -> list[dict[str, object]]:
+    root.mkdir()
+    rank_map = ranks or {1: 1, 2: 2, 3: 3}
+    values: list[dict[str, object]] = []
+    for index in range(1, count + 1):
+        value = _fixed10_source_value(
+            index,
+            fixed3_rank=rank_map.get(index),
+        )
+        values.append(value)
+        (root / f"export-{index:02d}.json").write_bytes(
+            canonical_json_bytes(value)
+        )
+    return values
+
+
+def _directory_snapshot(root: Path) -> dict[str, tuple[bytes, int, int]]:
+    snapshot: dict[str, tuple[bytes, int, int]] = {}
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            info = path.stat()
+            snapshot[path.relative_to(root).as_posix()] = (
+                path.read_bytes(),
+                info.st_ino,
+                info.st_mtime_ns,
+            )
+    return snapshot
 
 
 def _write_tree(root: Path) -> tuple[dict[str, object], dict[str, object]]:
@@ -1272,6 +1347,499 @@ class DatasetSchemaTests(unittest.TestCase):
         self.assertEqual(final_stat.st_mtime_ns, fixed_mtime_ns)
         self.assertFalse(validation.valid)
         self.assertIn("file_changed", validation.error_categories)
+
+
+class Fixed10FreezeTests(unittest.TestCase):
+    def freeze(self, source_dir: Path, output_dir: Path) -> str:
+        freeze = getattr(dataset_module, "freeze_fixed10_dataset")
+        return freeze(
+            source_dir,
+            output_dir,
+            lock_timeout_seconds=5.0,
+        )
+
+    def assert_freeze_rejected(
+        self,
+        source_dir: Path,
+        output_dir: Path,
+    ) -> None:
+        output_preexisted = output_dir.exists() or output_dir.is_symlink()
+        error_type = getattr(dataset_module, "Fixed10FreezeError")
+        with self.assertRaises(error_type):
+            self.freeze(source_dir, output_dir)
+        if not output_preexisted:
+            self.assertFalse(output_dir.exists())
+
+    def test_source_export_schema_is_strict_and_revalidates_projection(
+        self,
+    ) -> None:
+        model_type = getattr(dataset_module, "Fixed10SourceExport")
+        value = _fixed10_source_value(1, fixed3_rank=1)
+        model = model_type.model_validate(value)
+        self.assertEqual(model.fixed3_rank, 1)
+
+        for forbidden in (
+            "skip",
+            "exclusion",
+            "run_id",
+            "articleid",
+            "url",
+        ):
+            with self.subTest(forbidden=forbidden), self.assertRaises(
+                ValidationError
+            ):
+                model_type.model_validate({**value, forbidden: "forbidden"})
+
+        bad_hash = copy.deepcopy(value)
+        bad_hash["projection"]["projection_sha256"] = "0" * 64
+        with self.assertRaises(ValidationError):
+            model_type.model_validate(bad_hash)
+
+        evidence_c = copy.deepcopy(value)
+        evidence_c["projection"]["units"][0]["evidence"][0]["level"] = "C"
+        projection_payload = {
+            key: nested
+            for key, nested in evidence_c["projection"].items()
+            if key != "projection_sha256"
+        }
+        evidence_c["projection"]["projection_sha256"] = canonical_sha256(
+            projection_payload
+        )
+        with self.assertRaises(ValidationError):
+            model_type.model_validate(evidence_c)
+
+        unsafe = copy.deepcopy(value)
+        unsafe["projection"]["units"][0]["text"] = "来源 x:private"
+        projection_payload = {
+            key: nested
+            for key, nested in unsafe["projection"].items()
+            if key != "projection_sha256"
+        }
+        unsafe["projection"]["projection_sha256"] = canonical_sha256(
+            projection_payload
+        )
+        with self.assertRaises(ValidationError):
+            model_type.model_validate(unsafe)
+
+    def test_freeze_writes_exact_deterministic_fixed10_and_is_noop_on_repeat(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "fixed10" / "v1"
+            _write_fixed10_sources(source_dir)
+
+            first_status = self.freeze(source_dir, output_dir)
+            first_snapshot = _directory_snapshot(output_dir)
+            manifest = load_dataset_manifest(output_dir / "manifest.json")
+            validation = validate_dataset_tree(output_dir)
+            second_status = self.freeze(source_dir, output_dir)
+            second_snapshot = _directory_snapshot(output_dir)
+
+        self.assertEqual(first_status, "created")
+        self.assertEqual(second_status, "unchanged")
+        self.assertEqual(first_snapshot, second_snapshot)
+        self.assertEqual(manifest.dataset_id, "fixed10")
+        self.assertEqual(manifest.dataset_version, "fixed10/v1")
+        self.assertEqual(manifest.rubric_version, FIXED10_RUBRIC_VERSION)
+        self.assertEqual(manifest.declared_count, 10)
+        self.assertEqual(manifest.runnable_count, 10)
+        self.assertEqual(manifest.exclusion_count, 0)
+        self.assertEqual(len(manifest.entries), 10)
+        ordered_refs = tuple(entry.case_ref for entry in manifest.entries)
+        self.assertEqual(ordered_refs, tuple(sorted(ordered_refs)))
+        self.assertEqual(manifest.subsets["fixed10"], ordered_refs)
+        self.assertEqual(
+            manifest.subsets["fixed3"],
+            tuple(f"case_{index:032x}" for index in (1, 2, 3)),
+        )
+        self.assertTrue(validation.valid)
+        self.assertEqual(
+            set(first_snapshot),
+            {
+                "manifest.json",
+                *{
+                    f"cases/case_{index:032x}.json"
+                    for index in range(1, 11)
+                },
+            },
+        )
+        for payload, _inode, _mtime_ns in first_snapshot.values():
+            self.assertEqual(
+                payload,
+                canonical_json_bytes(json.loads(payload.decode("utf-8"))),
+            )
+
+    def test_normal_cli_freezes_synthetic_sources(self) -> None:
+        self.assertTrue(FREEZE_SCRIPT.is_file())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(FREEZE_SCRIPT),
+                    "fixed10",
+                    "--source-dir",
+                    str(source_dir),
+                    "--output-dir",
+                    str(output_dir),
+                    "--lock-timeout-seconds",
+                    "5",
+                ],
+                cwd=PROJECT_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "dataset_version": "fixed10/v1",
+                "status": "created",
+            },
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_freeze_rejects_wrong_counts_and_duplicate_identities(self) -> None:
+        mutations = (
+            ("nine", 9, None),
+            ("eleven", 11, None),
+            ("duplicate_case", 10, "case_ref"),
+            ("duplicate_material", 10, "material_identity_sha256"),
+            ("duplicate_content", 10, "source_content_sha256"),
+        )
+        for name, count, duplicate_field in mutations:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                values = _write_fixed10_sources(source_dir, count=count)
+                if duplicate_field is not None:
+                    changed = copy.deepcopy(values[-1])
+                    changed[duplicate_field] = values[0][duplicate_field]
+                    (source_dir / f"export-{count:02d}.json").write_bytes(
+                        canonical_json_bytes(changed)
+                    )
+
+                self.assert_freeze_rejected(source_dir, output_dir)
+
+    def test_freeze_requires_exact_fixed3_ranks(self) -> None:
+        rank_maps = (
+            {1: 1, 2: 2},
+            {1: 1, 2: 2, 3: 2},
+            {1: 1, 2: 2, 3: 3, 4: 3},
+        )
+        for rank_map in rank_maps:
+            with (
+                self.subTest(rank_map=rank_map),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                _write_fixed10_sources(source_dir, ranks=rank_map)
+
+                self.assert_freeze_rejected(source_dir, output_dir)
+
+    def test_freeze_rejects_unsafe_noncanonical_and_bad_hash_sources(
+        self,
+    ) -> None:
+        mutations = (
+            "bad_hash",
+            "evidence_c",
+            "raw_field",
+            "unsafe_url",
+            "noncanonical",
+        )
+        for mutation in mutations:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                values = _write_fixed10_sources(source_dir)
+                changed = copy.deepcopy(values[-1])
+                if mutation == "bad_hash":
+                    changed["projection"]["projection_sha256"] = "0" * 64
+                elif mutation == "evidence_c":
+                    changed["projection"]["units"][0]["evidence"][0]["level"] = "C"
+                elif mutation == "raw_field":
+                    changed["skip"] = {"code": "SOURCE_ATTACHMENT_UNAVAILABLE"}
+                elif mutation == "unsafe_url":
+                    changed["projection"]["units"][0]["text"] = (
+                        "来源 javascript:private"
+                    )
+                if mutation in {"evidence_c", "unsafe_url"}:
+                    projection_payload = {
+                        key: nested
+                        for key, nested in changed["projection"].items()
+                        if key != "projection_sha256"
+                    }
+                    changed["projection"]["projection_sha256"] = (
+                        canonical_sha256(projection_payload)
+                    )
+                path = source_dir / "export-10.json"
+                if mutation == "noncanonical":
+                    path.write_text(
+                        json.dumps(changed, ensure_ascii=True, indent=2),
+                        encoding="utf-8",
+                    )
+                else:
+                    path.write_bytes(canonical_json_bytes(changed))
+
+                self.assert_freeze_rejected(source_dir, output_dir)
+
+    def test_source_tree_rejects_extras_subdirs_symlinks_and_nonregulars(
+        self,
+    ) -> None:
+        def extra_file(source_dir: Path) -> None:
+            (source_dir / "extra.json").write_text("{}", encoding="utf-8")
+
+        def subdirectory(source_dir: Path) -> None:
+            (source_dir / "nested").mkdir()
+
+        def symlink(source_dir: Path) -> None:
+            (source_dir / "linked.json").symlink_to(
+                source_dir / "export-01.json"
+            )
+
+        def fifo(source_dir: Path) -> None:
+            os.mkfifo(source_dir / "source-fifo")
+
+        for name, mutate in (
+            ("extra", extra_file),
+            ("subdirectory", subdirectory),
+            ("symlink", symlink),
+            ("fifo", fifo),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                _write_fixed10_sources(source_dir)
+                mutate(source_dir)
+
+                self.assert_freeze_rejected(source_dir, output_dir)
+
+    def test_existing_different_or_unsafe_output_fails_unchanged(self) -> None:
+        for mutation in ("different", "extra", "symlink", "nonregular"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                _write_fixed10_sources(source_dir)
+                if mutation in {"different", "extra"}:
+                    self.freeze(source_dir, output_dir)
+                    if mutation == "different":
+                        manifest_path = output_dir / "manifest.json"
+                        manifest_path.write_bytes(
+                            manifest_path.read_bytes() + b" "
+                        )
+                    else:
+                        (output_dir / "extra").write_bytes(b"x")
+                    before = _directory_snapshot(output_dir)
+                    error_type = getattr(
+                        dataset_module,
+                        "Fixed10FreezeError",
+                    )
+                    with self.assertRaises(error_type):
+                        self.freeze(source_dir, output_dir)
+                    self.assertEqual(_directory_snapshot(output_dir), before)
+                elif mutation == "symlink":
+                    target = root / "target"
+                    target.mkdir()
+                    output_dir.symlink_to(target, target_is_directory=True)
+                    self.assert_freeze_rejected(source_dir, output_dir)
+                    self.assertTrue(output_dir.is_symlink())
+                else:
+                    output_dir.write_bytes(b"do-not-replace")
+                    self.assert_freeze_rejected(source_dir, output_dir)
+                    self.assertEqual(output_dir.read_bytes(), b"do-not-replace")
+
+    def test_concurrent_cli_calls_create_once_without_clobber(self) -> None:
+        self.assertTrue(FREEZE_SCRIPT.is_file())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+            command = [
+                sys.executable,
+                str(FREEZE_SCRIPT),
+                "fixed10",
+                "--source-dir",
+                str(source_dir),
+                "--output-dir",
+                str(output_dir),
+                "--lock-timeout-seconds",
+                "5",
+            ]
+            processes = [
+                subprocess.Popen(
+                    command,
+                    cwd=PROJECT_ROOT,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                for _ in range(2)
+            ]
+            completed = [
+                process.communicate(timeout=30)
+                for process in processes
+            ]
+            return_codes = [process.returncode for process in processes]
+            validation = validate_dataset_tree(output_dir)
+
+        self.assertEqual(return_codes, [0, 0], completed)
+        outputs = [json.loads(stdout) for stdout, _stderr in completed]
+        self.assertEqual(
+            {output["status"] for output in outputs},
+            {"created", "unchanged"},
+        )
+        self.assertTrue(validation.valid)
+        self.assertTrue(all(stderr == "" for _stdout, stderr in completed))
+
+    def test_failed_write_cleans_owned_staging_and_leaves_no_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+            original = getattr(dataset_module, "_write_exclusive_at")
+            call_count = 0
+
+            def fail_after_first(*args: object, **kwargs: object) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 2:
+                    raise OSError("synthetic write failure")
+                original(*args, **kwargs)
+
+            error_type = getattr(dataset_module, "Fixed10FreezeError")
+            with (
+                patch.object(
+                    dataset_module,
+                    "_write_exclusive_at",
+                    side_effect=fail_after_first,
+                ),
+                self.assertRaises(error_type),
+            ):
+                self.freeze(source_dir, output_dir)
+
+            self.assertFalse(output_dir.exists())
+            self.assertFalse(
+                any(
+                    "freeze-stage" in path.name
+                    for path in root.iterdir()
+                )
+            )
+            lock_path = root / ".output.freeze-lock"
+            self.assertTrue(lock_path.is_file())
+            self.assertFalse(lock_path.is_symlink())
+            self.assertEqual(lock_path.read_bytes(), b"")
+
+    def test_crashed_holder_releases_persistent_kernel_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            lock_path = root / ".output.freeze-lock"
+            _write_fixed10_sources(source_dir)
+            lock_path.touch(mode=0o600)
+            lock_path.chmod(0o600)
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl,os,sys;"
+                        "fd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW);"
+                        "fcntl.flock(fd,fcntl.LOCK_EX);"
+                        "print('locked',flush=True);"
+                        "os.read(0,1)"
+                    ),
+                    str(lock_path),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertIsNotNone(holder.stdout)
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            holder.kill()
+            holder.communicate(timeout=10)
+
+            status = self.freeze(source_dir, output_dir)
+
+        self.assertEqual(status, "created")
+
+    def test_unsafe_preexisting_lock_is_rejected_without_replacement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            target = root / "target"
+            lock_path = root / ".output.freeze-lock"
+            _write_fixed10_sources(source_dir)
+            target.write_bytes(b"do-not-follow")
+            lock_path.symlink_to(target)
+
+            self.assert_freeze_rejected(source_dir, output_dir)
+
+            self.assertTrue(lock_path.is_symlink())
+            self.assertEqual(target.read_bytes(), b"do-not-follow")
+
+    def test_legacy_declared10_selected9_manifest_cannot_be_source(self) -> None:
+        from app import regression_manifest
+
+        legacy_path = (
+            PROJECT_ROOT / "tests" / "fixtures" / "8099_regression_cases.json"
+        )
+        legacy = regression_manifest.load_manifest(legacy_path)
+        self.assertEqual(len(legacy["subsets"]["fixed10"]), 10)
+        self.assertEqual(
+            len(regression_manifest.select_cases(legacy, "fixed10")),
+            9,
+        )
+        self.assertEqual(
+            regression_manifest.excluded_cases(legacy, "fixed10"),
+            [
+                {
+                    "case_id": "fixed-4-guizhou-project-analysis",
+                    "menu_code": "project_analysis",
+                    "articleid": "4a2e0dbc-1a24-490e-b807-38374f8cd530",
+                    "code": "SOURCE_ATTACHMENT_UNAVAILABLE",
+                    "observed_at": "2026-07-14T16:00:00+08:00",
+                }
+            ],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+            (source_dir / "export-10.json").write_bytes(
+                canonical_json_bytes(legacy)
+            )
+
+            self.assert_freeze_rejected(source_dir, output_dir)
 
 
 if __name__ == "__main__":

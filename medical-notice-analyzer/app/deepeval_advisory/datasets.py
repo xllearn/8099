@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import re
 import stat
+import time
 import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -17,6 +20,7 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from app.deepeval_advisory.hashing import (
     BoundaryViolation,
     assert_safe_outbound_text,
+    canonical_json_bytes,
     canonical_sha256,
 )
 from app.deepeval_advisory.models import AdvisoryProjection, StrictModel
@@ -30,6 +34,8 @@ MAX_DATASET_MANIFEST_ENTRIES = 128
 MAX_DATASET_TREE_MEMBERS = (
     1 + MAX_DATASET_TREE_DEPTH * MAX_DATASET_MANIFEST_ENTRIES
 )
+FIXED10_SOURCE_SCHEMA_VERSION = "8099.deepeval-fixed10-source/v1"
+FIXED10_RUBRIC_VERSION = "advisory-rubric-v1"
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CASE_REF_PATTERN = r"^case_[0-9a-f]{32}$"
@@ -44,6 +50,7 @@ _CANONICAL_TIMESTAMP_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
 )
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
+_FIXED10_SOURCE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.json$")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
 _URI_LOCATOR = re.compile(
     r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:(?=\S)",
@@ -182,6 +189,14 @@ class DatasetError(ValueError):
         super().__init__(f"{category}: dataset integrity validation failed")
 
 
+class Fixed10FreezeError(ValueError):
+    """A bounded failure while freezing an immutable fixed10 dataset."""
+
+    def __init__(self, category: str):
+        self.category = category
+        super().__init__(f"{category}: fixed10 dataset freeze failed")
+
+
 def _canonical_timestamp(value: str) -> str:
     if not _CANONICAL_TIMESTAMP_PATTERN.fullmatch(value):
         raise ValueError("timestamp must be canonical UTC")
@@ -248,6 +263,22 @@ def _verify_projection_hash(projection: AdvisoryProjection) -> None:
     digest = payload.pop("projection_sha256")
     if canonical_sha256(payload) != digest:
         raise ValueError("projection integrity hash is inconsistent")
+
+
+def _validate_raw_projection(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("raw projection must be an object")
+    if set(AdvisoryProjection.model_fields).difference(value):
+        raise ValueError("raw projection omits required fields")
+    digest = value.get("projection_sha256")
+    payload = dict(value)
+    payload.pop("projection_sha256", None)
+    try:
+        expected = canonical_sha256(payload)
+    except (TypeError, ValueError):
+        raise ValueError("raw projection integrity hash is invalid") from None
+    if not isinstance(digest, str) or digest != expected:
+        raise ValueError("raw projection integrity hash is inconsistent")
 
 
 def _validate_unique(values: tuple[str, ...], field_name: str) -> tuple[str, ...]:
@@ -354,20 +385,7 @@ class DatasetCase(_RawSelfHashedModel):
     @classmethod
     def _validate_raw_content(cls, value: dict[str, Any]) -> None:
         _walk_raw_case_boundary(value)
-        projection = value.get("projection")
-        if not isinstance(projection, dict):
-            raise ValueError("raw projection must be an object")
-        if set(AdvisoryProjection.model_fields).difference(projection):
-            raise ValueError("raw projection omits required fields")
-        digest = projection.get("projection_sha256")
-        payload = dict(projection)
-        payload.pop("projection_sha256", None)
-        try:
-            expected = canonical_sha256(payload)
-        except (TypeError, ValueError):
-            raise ValueError("raw projection integrity hash is invalid") from None
-        if not isinstance(digest, str) or digest != expected:
-            raise ValueError("raw projection integrity hash is inconsistent")
+        _validate_raw_projection(value.get("projection"))
 
     @model_validator(mode="after")
     def validate_case_contract(self) -> Self:
@@ -380,6 +398,40 @@ class DatasetCase(_RawSelfHashedModel):
         digest = payload.pop("case_sha256")
         if canonical_sha256(payload) != digest:
             raise ValueError("case integrity hash is inconsistent")
+        return self
+
+
+class Fixed10SourceExport(StrictModel):
+    schema_version: Literal["8099.deepeval-fixed10-source/v1"]
+    case_ref: str = Field(pattern=_CASE_REF_PATTERN)
+    source_group_ref: str = Field(pattern=_SOURCE_GROUP_REF_PATTERN)
+    risk_tier: Literal["high", "standard"]
+    risk_tags: tuple[RiskTag, ...] = Field(max_length=8)
+    material_identity_sha256: str = Field(pattern=_HASH_PATTERN)
+    source_content_sha256: str = Field(pattern=_HASH_PATTERN)
+    projection: AdvisoryProjection
+    fixed3_rank: Literal[1, 2, 3] | None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_raw_export(cls, value: Any) -> Any:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict):
+            raise ValueError("fixed10 source export must be a raw object")
+        if set(cls.model_fields).difference(value):
+            raise ValueError("fixed10 source export omits required fields")
+        _walk_raw_case_boundary(value)
+        _validate_raw_projection(value.get("projection"))
+        return value
+
+    @model_validator(mode="after")
+    def validate_export_contract(self) -> Self:
+        _assert_projection_boundary(self.projection)
+        _verify_projection_hash(self.projection)
+        _validate_unique(self.risk_tags, "risk_tags")
+        if self.risk_tags and self.risk_tier != "high":
+            raise ValueError("nonempty risk_tags require risk_tier=high")
         return self
 
 
@@ -1349,6 +1401,891 @@ def validate_dataset_tree(root: Path) -> DatasetValidation:
     )
 
 
+class _Fixed10Tree(NamedTuple):
+    manifest: bytes
+    cases: dict[str, bytes]
+
+
+def _freeze_absolute_path(path: Path | os.PathLike[str] | str) -> Path:
+    try:
+        raw_path = os.fspath(path)
+        if (
+            not isinstance(raw_path, str)
+            or not raw_path
+            or "\x00" in raw_path
+            or any(part in {".", ".."} for part in Path(raw_path).parts)
+        ):
+            raise ValueError
+        absolute = Path(os.path.abspath(raw_path))
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("path_invalid") from None
+    if not absolute.is_absolute():
+        raise Fixed10FreezeError("path_invalid")
+    return absolute
+
+
+def _require_freeze_io() -> None:
+    try:
+        _require_anchored_io()
+    except DatasetError:
+        raise Fixed10FreezeError("platform_unsupported") from None
+    required_dir_fd_functions = ("mkdir", "rmdir", "unlink")
+    if any(
+        not _supports_function(os.supports_dir_fd, name)
+        for name in required_dir_fd_functions
+    ):
+        raise Fixed10FreezeError("platform_unsupported")
+
+
+@contextmanager
+def _open_or_create_directory_path(path: Path) -> Iterator[int]:
+    _require_freeze_io()
+    absolute = _freeze_absolute_path(path)
+    components = absolute.parts
+    if not components or components[0] != os.path.sep:
+        raise Fixed10FreezeError("path_invalid")
+
+    descriptors: list[int] = []
+    created: list[tuple[int, str, int, int]] = []
+    succeeded = False
+    try:
+        anchor = os.open(os.path.sep, _directory_flags())
+        descriptors.append(anchor)
+        current = anchor
+        for component in components[1:]:
+            if component in {"", ".", ".."}:
+                raise Fixed10FreezeError("path_invalid")
+            made_directory = False
+            try:
+                before = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current)
+                    os.fsync(current)
+                    made_directory = True
+                except FileExistsError:
+                    pass
+                before = os.stat(
+                    component,
+                    dir_fd=current,
+                    follow_symlinks=False,
+                )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise Fixed10FreezeError("path_invalid")
+            child = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=current,
+            )
+            descriptors.append(child)
+            opened = os.fstat(child)
+            if not stat.S_ISDIR(opened.st_mode) or not _same_stat_state(
+                before,
+                opened,
+            ):
+                raise Fixed10FreezeError("path_invalid")
+            if made_directory:
+                created.append(
+                    (current, component, opened.st_dev, opened.st_ino)
+                )
+            current = child
+        yield current
+        succeeded = True
+    except Fixed10FreezeError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("path_invalid") from None
+    finally:
+        if not succeeded:
+            for parent_descriptor, name, device, inode in reversed(created):
+                try:
+                    observed = os.stat(
+                        name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        stat.S_ISDIR(observed.st_mode)
+                        and observed.st_dev == device
+                        and observed.st_ino == inode
+                    ):
+                        os.rmdir(name, dir_fd=parent_descriptor)
+                        os.fsync(parent_descriptor)
+                except OSError:
+                    pass
+        _close_descriptors(descriptors)
+
+
+def _directory_names_at(
+    directory_descriptor: int,
+    *,
+    maximum: int,
+) -> tuple[str, ...]:
+    names: list[str] = []
+    try:
+        with os.scandir(directory_descriptor) as iterator:
+            for entry in iterator:
+                if not isinstance(entry.name, str):
+                    raise Fixed10FreezeError("tree_invalid")
+                names.append(entry.name)
+                if len(names) > maximum:
+                    raise Fixed10FreezeError("tree_invalid")
+    except Fixed10FreezeError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("tree_invalid") from None
+    return tuple(sorted(names))
+
+
+def _read_fixed10_source_exports(
+    source_dir: Path,
+) -> tuple[Fixed10SourceExport, ...]:
+    try:
+        with _open_directory_path(source_dir) as source_descriptor:
+            names = _directory_names_at(source_descriptor, maximum=10)
+            if len(names) != 10:
+                raise Fixed10FreezeError("source_count")
+
+            exports: list[Fixed10SourceExport] = []
+            first_reads: dict[str, _AnchoredRead] = {}
+            for name in names:
+                if (
+                    len(name) > 132
+                    or unicodedata.normalize("NFC", name) != name
+                    or _FIXED10_SOURCE_NAME.fullmatch(name) is None
+                ):
+                    raise Fixed10FreezeError("source_name")
+                anchored = _read_regular_at(
+                    source_descriptor,
+                    name,
+                    max_bytes=MAX_DATASET_JSON_BYTES,
+                )
+                value = _decode_json_object(anchored.payload)
+                if canonical_json_bytes(value) != anchored.payload:
+                    raise Fixed10FreezeError("source_noncanonical")
+                try:
+                    export = Fixed10SourceExport.model_validate(value)
+                except ValidationError:
+                    raise Fixed10FreezeError("source_invalid") from None
+                first_reads[name] = anchored
+                exports.append(export)
+
+            if _directory_names_at(source_descriptor, maximum=10) != names:
+                raise Fixed10FreezeError("source_changed")
+            for name in names:
+                repeated = _read_regular_at(
+                    source_descriptor,
+                    name,
+                    max_bytes=MAX_DATASET_JSON_BYTES,
+                )
+                initial = first_reads[name]
+                if (
+                    repeated.payload != initial.payload
+                    or not _same_stat_state(
+                        repeated.stat_result,
+                        initial.stat_result,
+                    )
+                ):
+                    raise Fixed10FreezeError("source_changed")
+    except Fixed10FreezeError:
+        raise
+    except DatasetError:
+        raise Fixed10FreezeError("source_invalid") from None
+
+    case_refs = tuple(export.case_ref for export in exports)
+    material_hashes = tuple(
+        export.material_identity_sha256 for export in exports
+    )
+    content_hashes = tuple(
+        export.source_content_sha256 for export in exports
+    )
+    if (
+        len(set(case_refs)) != 10
+        or len(set(material_hashes)) != 10
+        or len(set(content_hashes)) != 10
+    ):
+        raise Fixed10FreezeError("source_duplicate")
+    ranks = sorted(
+        export.fixed3_rank
+        for export in exports
+        if export.fixed3_rank is not None
+    )
+    if ranks != [1, 2, 3]:
+        raise Fixed10FreezeError("fixed3_invalid")
+    return tuple(sorted(exports, key=lambda export: export.case_ref))
+
+
+def _build_fixed10_tree(
+    exports: tuple[Fixed10SourceExport, ...],
+) -> _Fixed10Tree:
+    cases: dict[str, bytes] = {}
+    entries: list[dict[str, Any]] = []
+    ranks: dict[int, str] = {}
+    for export in exports:
+        case_payload: dict[str, Any] = {
+            "schema_version": "8099.deepeval-case/v1",
+            "case_ref": export.case_ref,
+            "source_group_ref": export.source_group_ref,
+            "split": "fixed",
+            "risk_tier": export.risk_tier,
+            "risk_tags": list(export.risk_tags),
+            "material_identity_sha256": export.material_identity_sha256,
+            "source_content_sha256": export.source_content_sha256,
+            "projection": export.projection.model_dump(mode="json"),
+        }
+        case_payload["case_sha256"] = canonical_sha256(case_payload)
+        try:
+            case = DatasetCase.model_validate(case_payload)
+        except ValidationError:
+            raise Fixed10FreezeError("case_invalid") from None
+        case_bytes = canonical_json_bytes(case.model_dump(mode="json"))
+        case_name = f"{case.case_ref}.json"
+        cases[case_name] = case_bytes
+        entries.append(
+            {
+                "case_ref": case.case_ref,
+                "relative_path": f"cases/{case_name}",
+                "file_sha256": hashlib.sha256(case_bytes).hexdigest(),
+                "source_group_ref": case.source_group_ref,
+                "split": "fixed",
+                "risk_tier": case.risk_tier,
+            }
+        )
+        if export.fixed3_rank is not None:
+            ranks[export.fixed3_rank] = export.case_ref
+
+    ordered_refs = [entry["case_ref"] for entry in entries]
+    manifest_payload: dict[str, Any] = {
+        "schema_version": "8099.deepeval-dataset-manifest/v1",
+        "dataset_id": "fixed10",
+        "dataset_version": "fixed10/v1",
+        "projection_version": "claim-ab-v1",
+        "rubric_version": FIXED10_RUBRIC_VERSION,
+        "entries": entries,
+        "subsets": {
+            "fixed10": ordered_refs,
+            "fixed3": [ranks[rank] for rank in (1, 2, 3)],
+        },
+        "declared_count": 10,
+        "runnable_count": 10,
+        "exclusion_count": 0,
+    }
+    manifest_payload["manifest_sha256"] = canonical_sha256(manifest_payload)
+    try:
+        manifest = DatasetManifest.model_validate(manifest_payload)
+    except (KeyError, ValidationError):
+        raise Fixed10FreezeError("manifest_invalid") from None
+    manifest_bytes = canonical_json_bytes(manifest.model_dump(mode="json"))
+    return _Fixed10Tree(manifest=manifest_bytes, cases=cases)
+
+
+@contextmanager
+def _fixed10_lock(
+    parent_descriptor: int,
+    lock_name: str,
+    *,
+    timeout_seconds: float,
+) -> Iterator[None]:
+    try:
+        import fcntl
+    except ImportError:
+        raise Fixed10FreezeError("platform_unsupported") from None
+
+    deadline = time.monotonic() + timeout_seconds
+    descriptor: int | None = None
+    locked = False
+    try:
+        flags = (
+            os.O_RDWR
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        created = False
+        try:
+            descriptor = os.open(
+                lock_name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=parent_descriptor,
+            )
+            created = True
+        except FileExistsError:
+            before = os.stat(
+                lock_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            descriptor = os.open(
+                lock_name,
+                flags,
+                dir_fd=parent_descriptor,
+            )
+            opened = os.fstat(descriptor)
+            if not _same_stat_state(before, opened):
+                raise Fixed10FreezeError("lock_invalid")
+
+        opened = os.fstat(descriptor)
+        observed = os.stat(
+            lock_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not _same_stat_state(opened, observed)
+            or opened.st_nlink != 1
+            or opened.st_size != 0
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) & 0o077
+        ):
+            raise Fixed10FreezeError("lock_invalid")
+        if created:
+            os.fsync(descriptor)
+            os.fsync(parent_descriptor)
+
+        while True:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                locked = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.monotonic() >= deadline:
+                    raise Fixed10FreezeError("lock_timeout") from None
+                time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+        yield
+    except Fixed10FreezeError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("lock_failed") from None
+    finally:
+        if descriptor is not None:
+            try:
+                if locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _write_exclusive_at(
+    parent_descriptor: int,
+    name: str,
+    payload: bytes,
+) -> None:
+    if (
+        not name
+        or name in {".", ".."}
+        or "/" in name
+        or "\x00" in name
+        or not isinstance(payload, bytes)
+        or not payload
+    ):
+        raise OSError(errno.EINVAL, "invalid exclusive write")
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0),
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise OSError(errno.EIO, "short exclusive write")
+            offset += written
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        observed = os.stat(
+            name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_size != len(payload)
+            or not _same_stat_state(opened, observed)
+        ):
+            raise OSError(errno.EIO, "exclusive write changed")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _open_child_directory_at(
+    parent_descriptor: int,
+    name: str,
+) -> tuple[int, os.stat_result]:
+    before = os.stat(
+        name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise Fixed10FreezeError("tree_invalid")
+    descriptor = os.open(
+        name,
+        _directory_flags(),
+        dir_fd=parent_descriptor,
+    )
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode) or not _same_stat_state(
+        before,
+        opened,
+    ):
+        os.close(descriptor)
+        raise Fixed10FreezeError("tree_invalid")
+    return descriptor, opened
+
+
+def _tree_matches_at(
+    root_descriptor: int,
+    expected: _Fixed10Tree,
+) -> bool:
+    cases_descriptor: int | None = None
+    try:
+        root_before = os.fstat(root_descriptor)
+        expected_root_names = (
+            "cases",
+            "manifest.json",
+        )
+        if (
+            _directory_names_at(root_descriptor, maximum=2)
+            != expected_root_names
+        ):
+            return False
+        manifest = _read_regular_at(
+            root_descriptor,
+            "manifest.json",
+            max_bytes=MAX_DATASET_JSON_BYTES,
+        )
+        if manifest.payload != expected.manifest:
+            return False
+        cases_descriptor, _cases_stat = _open_child_directory_at(
+            root_descriptor,
+            "cases",
+        )
+        expected_names = tuple(sorted(expected.cases))
+        if _directory_names_at(
+            cases_descriptor,
+            maximum=len(expected_names),
+        ) != expected_names:
+            return False
+        first_case_reads: dict[str, _AnchoredRead] = {}
+        for name in expected_names:
+            observed = _read_regular_at(
+                cases_descriptor,
+                name,
+                max_bytes=MAX_DATASET_JSON_BYTES,
+            )
+            if observed.payload != expected.cases[name]:
+                return False
+            first_case_reads[name] = observed
+        if _directory_names_at(
+            cases_descriptor,
+            maximum=len(expected_names),
+        ) != expected_names:
+            return False
+        for name in expected_names:
+            repeated = _read_regular_at(
+                cases_descriptor,
+                name,
+                max_bytes=MAX_DATASET_JSON_BYTES,
+            )
+            initial = first_case_reads[name]
+            if (
+                repeated.payload != initial.payload
+                or not _same_stat_state(
+                    repeated.stat_result,
+                    initial.stat_result,
+                )
+            ):
+                return False
+        cases_after = os.fstat(cases_descriptor)
+        if not _same_stat_state(_cases_stat, cases_after):
+            return False
+        repeated_manifest = _read_regular_at(
+            root_descriptor,
+            "manifest.json",
+            max_bytes=MAX_DATASET_JSON_BYTES,
+        )
+        if (
+            repeated_manifest.payload != manifest.payload
+            or not _same_stat_state(
+                repeated_manifest.stat_result,
+                manifest.stat_result,
+            )
+        ):
+            return False
+        if (
+            _directory_names_at(root_descriptor, maximum=2)
+            != expected_root_names
+        ):
+            return False
+        return _same_stat_state(root_before, os.fstat(root_descriptor))
+    except (DatasetError, Fixed10FreezeError, OSError, TypeError, ValueError):
+        return False
+    finally:
+        if cases_descriptor is not None:
+            try:
+                os.close(cases_descriptor)
+            except OSError:
+                pass
+
+
+def _existing_fixed10_status(
+    parent_descriptor: int,
+    output_name: str,
+    expected: _Fixed10Tree,
+) -> str | None:
+    try:
+        before = os.stat(
+            output_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("output_invalid") from None
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise Fixed10FreezeError("output_invalid")
+
+    output_descriptor: int | None = None
+    try:
+        output_descriptor = os.open(
+            output_name,
+            _directory_flags(),
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(output_descriptor)
+        if not stat.S_ISDIR(opened.st_mode) or not _same_stat_state(
+            before,
+            opened,
+        ):
+            raise Fixed10FreezeError("output_invalid")
+        if not _tree_matches_at(output_descriptor, expected):
+            raise Fixed10FreezeError("output_conflict")
+        after = os.stat(
+            output_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_stat_state(opened, after):
+            raise Fixed10FreezeError("output_changed")
+        return "unchanged"
+    except Fixed10FreezeError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("output_invalid") from None
+    finally:
+        if output_descriptor is not None:
+            try:
+                os.close(output_descriptor)
+            except OSError:
+                pass
+
+def _cleanup_owned_stage_at(
+    parent_descriptor: int,
+    stage_name: str,
+    stage_identity: os.stat_result | None,
+    case_names: tuple[str, ...],
+) -> None:
+    if stage_identity is None:
+        return
+    stage_descriptor: int | None = None
+    cases_descriptor: int | None = None
+    try:
+        observed = os.stat(
+            stage_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(observed.st_mode)
+            or not _same_file(observed, stage_identity)
+        ):
+            return
+        stage_descriptor = os.open(
+            stage_name,
+            _directory_flags(),
+            dir_fd=parent_descriptor,
+        )
+        if not _same_file(os.fstat(stage_descriptor), stage_identity):
+            return
+        root_names = _directory_names_at(stage_descriptor, maximum=2)
+        if any(name not in {"cases", "manifest.json"} for name in root_names):
+            return
+
+        if "cases" in root_names:
+            cases_descriptor, _cases_identity = _open_child_directory_at(
+                stage_descriptor,
+                "cases",
+            )
+            observed_case_names = _directory_names_at(
+                cases_descriptor,
+                maximum=len(case_names),
+            )
+            if any(name not in case_names for name in observed_case_names):
+                return
+            for name in observed_case_names:
+                os.unlink(name, dir_fd=cases_descriptor)
+            os.fsync(cases_descriptor)
+            os.close(cases_descriptor)
+            cases_descriptor = None
+            os.rmdir("cases", dir_fd=stage_descriptor)
+
+        if "manifest.json" in root_names:
+            os.unlink("manifest.json", dir_fd=stage_descriptor)
+        os.fsync(stage_descriptor)
+        os.close(stage_descriptor)
+        stage_descriptor = None
+        os.rmdir(stage_name, dir_fd=parent_descriptor)
+        os.fsync(parent_descriptor)
+    except (
+        DatasetError,
+        Fixed10FreezeError,
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+    ):
+        pass
+    finally:
+        for descriptor in (cases_descriptor, stage_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+
+def _rename_noreplace_at(
+    parent_descriptor: int,
+    source_name: str,
+    destination_name: str,
+) -> None:
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        result = renameat2(
+            parent_descriptor,
+            os.fsencode(source_name),
+            parent_descriptor,
+            os.fsencode(destination_name),
+            1,
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("platform_unsupported") from None
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise Fixed10FreezeError("output_conflict")
+    if error_number in {errno.ENOSYS, errno.EINVAL, errno.ENOTSUP}:
+        raise Fixed10FreezeError("platform_unsupported")
+    raise OSError(error_number, "atomic no-replace publication failed")
+
+
+def _publish_fixed10_tree(
+    parent_descriptor: int,
+    output_name: str,
+    expected: _Fixed10Tree,
+) -> str:
+    stage_name = ""
+    stage_identity: os.stat_result | None = None
+    stage_descriptor: int | None = None
+    cases_descriptor: int | None = None
+    published = False
+    case_names = tuple(sorted(expected.cases))
+    try:
+        for attempt in range(32):
+            candidate = (
+                f".{output_name}.freeze-stage-{os.getpid()}-{attempt}"
+            )
+            try:
+                os.mkdir(
+                    candidate,
+                    mode=0o700,
+                    dir_fd=parent_descriptor,
+                )
+            except FileExistsError:
+                continue
+            stage_name = candidate
+            stage_identity = os.stat(
+                stage_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            os.fsync(parent_descriptor)
+            break
+        if not stage_name or stage_identity is None:
+            raise Fixed10FreezeError("staging_unavailable")
+
+        before = stage_identity
+        stage_descriptor = os.open(
+            stage_name,
+            _directory_flags(),
+            dir_fd=parent_descriptor,
+        )
+        opened_stage = os.fstat(stage_descriptor)
+        if not stat.S_ISDIR(opened_stage.st_mode) or not _same_stat_state(
+            before,
+            opened_stage,
+        ):
+            raise Fixed10FreezeError("staging_changed")
+        stage_identity = opened_stage
+
+        os.mkdir("cases", mode=0o700, dir_fd=stage_descriptor)
+        cases_descriptor, _cases_identity = _open_child_directory_at(
+            stage_descriptor,
+            "cases",
+        )
+        for name in case_names:
+            _write_exclusive_at(
+                cases_descriptor,
+                name,
+                expected.cases[name],
+            )
+        os.fsync(cases_descriptor)
+        _write_exclusive_at(
+            stage_descriptor,
+            "manifest.json",
+            expected.manifest,
+        )
+        os.fsync(stage_descriptor)
+        if not _tree_matches_at(stage_descriptor, expected):
+            raise Fixed10FreezeError("staging_invalid")
+
+        observed = os.stat(
+            stage_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_file(observed, stage_identity):
+            raise Fixed10FreezeError("staging_changed")
+        os.fsync(parent_descriptor)
+        _rename_noreplace_at(
+            parent_descriptor,
+            stage_name,
+            output_name,
+        )
+        published = True
+        published_stat = os.stat(
+            output_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_file(published_stat, stage_identity):
+            raise Fixed10FreezeError("output_changed")
+        os.fsync(parent_descriptor)
+        return "created"
+    finally:
+        for descriptor in (cases_descriptor, stage_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if stage_name and not published:
+            _cleanup_owned_stage_at(
+                parent_descriptor,
+                stage_name,
+                stage_identity,
+                case_names,
+            )
+
+
+def freeze_fixed10_dataset(
+    source_dir: Path,
+    output_dir: Path,
+    *,
+    lock_timeout_seconds: float = 10.0,
+) -> str:
+    if (
+        isinstance(lock_timeout_seconds, bool)
+        or not isinstance(lock_timeout_seconds, (int, float))
+        or not (0.0 < float(lock_timeout_seconds) <= 300.0)
+    ):
+        raise Fixed10FreezeError("timeout_invalid")
+    timeout = float(lock_timeout_seconds)
+
+    source = _freeze_absolute_path(source_dir)
+    output = _freeze_absolute_path(output_dir)
+    output_name = output.name
+    if (
+        not output_name
+        or output_name in {".", ".."}
+        or len(output_name) > 64
+        or _SAFE_PATH_COMPONENT.fullmatch(output_name) is None
+    ):
+        raise Fixed10FreezeError("output_name")
+    try:
+        if Path(os.path.commonpath((source, output))) == source:
+            raise Fixed10FreezeError("path_overlap")
+    except ValueError:
+        raise Fixed10FreezeError("path_invalid") from None
+
+    try:
+        exports = _read_fixed10_source_exports(source)
+        expected = _build_fixed10_tree(exports)
+        with _open_or_create_directory_path(output.parent) as parent_descriptor:
+            lock_name = f".{output_name}.freeze-lock"
+            with _fixed10_lock(
+                parent_descriptor,
+                lock_name,
+                timeout_seconds=timeout,
+            ):
+                status = _existing_fixed10_status(
+                    parent_descriptor,
+                    output_name,
+                    expected,
+                )
+                if status is not None:
+                    return status
+                return _publish_fixed10_tree(
+                    parent_descriptor,
+                    output_name,
+                    expected,
+                )
+    except Fixed10FreezeError:
+        raise
+    except (
+        DatasetError,
+        ValidationError,
+        KeyError,
+        OSError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ):
+        raise Fixed10FreezeError("operation_failed") from None
+
+
 __all__ = [
     "MAX_DATASET_JSON_BYTES",
     "MAX_DATASET_JSONL_BYTES",
@@ -1356,16 +2293,21 @@ __all__ = [
     "MAX_DATASET_TREE_DEPTH",
     "MAX_DATASET_MANIFEST_ENTRIES",
     "MAX_DATASET_TREE_MEMBERS",
+    "FIXED10_RUBRIC_VERSION",
+    "FIXED10_SOURCE_SCHEMA_VERSION",
     "DatasetCase",
     "DatasetEntry",
     "DatasetError",
     "DatasetManifest",
     "DatasetValidation",
+    "Fixed10FreezeError",
+    "Fixed10SourceExport",
     "GoldenLabel",
     "HumanAdjudication",
     "HumanReview",
     "MetricLabels",
     "Prelabel",
+    "freeze_fixed10_dataset",
     "iter_jsonl",
     "load_dataset_case",
     "load_dataset_manifest",
