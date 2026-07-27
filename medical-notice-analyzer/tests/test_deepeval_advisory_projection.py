@@ -5,9 +5,11 @@ import hashlib
 import hmac
 import inspect
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from app.deepeval_advisory.hashing import (
     BoundaryViolation,
@@ -447,6 +449,46 @@ class AdvisoryHashingTests(unittest.TestCase):
 
 
 class AdvisoryProjectionTests(unittest.TestCase):
+    def create_symlink_or_skip(
+        self,
+        link: Path,
+        target: Path,
+    ) -> None:
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(
+                f"symlink creation is unavailable: {exc.__class__.__name__}"
+            )
+
+    def build_identity_projection(
+        self,
+        *,
+        menu_code: str,
+        visible_identity: str,
+    ):
+        text = f"采购服务期限为两年，内部代码 {visible_identity}"
+        item = create_evidence_item(
+            level="A",
+            kind="article_text",
+            value=text,
+            source_ref={
+                "menu_code": menu_code,
+                "articleid": "article-identity-source",
+                "quote": text,
+                "source_hash": text_source_hash(text),
+            },
+        )
+        return build_projection_from_values(
+            run_value=_run_value(report_markdown=text),
+            pack_value={
+                "pack_id": "pack_projection_fixture",
+                "evidence_schema_version": 2,
+                "evidence_items": [item],
+            },
+            hmac_key=HMAC_KEY,
+        )
+
     def test_finished_and_manual_review_fixtures_with_body_are_eligible(self) -> None:
         for name, expected_version in (
             ("run_finished.json", 1),
@@ -543,6 +585,28 @@ class AdvisoryProjectionTests(unittest.TestCase):
         for value in invalid_values:
             with self.subTest(value=value), self.assertRaises(ProjectionError):
                 build_run_snapshot_from_value(value, HMAC_KEY)
+
+    def test_future_nested_report_ir_schema_fails_closed(self) -> None:
+        secret = "REPORT_IR_FUTURE_SECRET"
+
+        with self.assertRaises(ProjectionError) as raised:
+            build_run_snapshot_from_value(
+                _run_value(
+                    report_markdown="",
+                    report_ir={
+                        "schema_version": 2,
+                        "lead_paragraphs": [secret],
+                        "sections": [],
+                    },
+                ),
+                HMAC_KEY,
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "report_ir schema is invalid or unsupported",
+        )
+        self.assertNotIn(secret, str(raised.exception))
 
     def test_report_hash_depends_only_on_normalized_markdown_and_report_ir(
         self,
@@ -648,10 +712,32 @@ class AdvisoryProjectionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             link = root / "run_finished.json"
-            link.symlink_to(target)
+            self.create_symlink_or_skip(link, target)
 
             with self.assertRaises(ProjectionError):
                 load_run_snapshot(link, HMAC_KEY)
+
+    @unittest.skipUnless(
+        hasattr(os, "O_NOFOLLOW"),
+        "O_NOFOLLOW is unavailable on this platform",
+    )
+    def test_file_loader_requests_o_nofollow_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run_finished.json"
+            path.write_text(
+                json.dumps(_run_value(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "app.deepeval_advisory.projection.os.open",
+                wraps=os.open,
+            ) as guarded_open:
+                load_run_snapshot(path, HMAC_KEY)
+
+            self.assertTrue(guarded_open.called)
+            flags = guarded_open.call_args.args[1]
+            self.assertEqual(flags & os.O_NOFOLLOW, os.O_NOFOLLOW)
 
     def test_projection_contains_only_matched_a_b_with_local_parent_ids(self) -> None:
         snapshot = load_run_snapshot(FIXTURES / "run_finished.json", HMAC_KEY)
@@ -739,6 +825,42 @@ class AdvisoryProjectionTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, serialized)
 
+    def test_attachment_text_with_table_position_is_not_labeled_table_cell(
+        self,
+    ) -> None:
+        text = "附件说明采购服务期限为两年"
+        item = create_evidence_item(
+            level="A",
+            kind="attachment_text",
+            value=text,
+            source_ref={
+                "menu_code": "attachment-menu",
+                "articleid": "attachment-article",
+                "attachment_id": "attachment-private-id",
+                "filename": "attachment-private.txt",
+                "table_index": 2,
+                "quote": text,
+                "source_hash": "b" * 64,
+            },
+        )
+
+        projection = build_projection_from_values(
+            run_value=_run_value(report_markdown=text),
+            pack_value={
+                "pack_id": "pack_projection_fixture",
+                "evidence_schema_version": 2,
+                "evidence_items": [item],
+            },
+            hmac_key=HMAC_KEY,
+        )
+
+        locator = projection.units[0].evidence[0].locator
+        self.assertIsNotNone(locator)
+        self.assertEqual(locator.kind, "article")
+        self.assertIsNone(locator.table_index)
+        self.assertIsNone(locator.row)
+        self.assertIsNone(locator.column)
+
     def test_projection_is_deterministic_across_dict_order_item_order_and_newlines(
         self,
     ) -> None:
@@ -823,7 +945,81 @@ class AdvisoryProjectionTests(unittest.TestCase):
                 hmac_key=HMAC_KEY,
             )
 
-    def test_evidence_file_loader_rejects_bad_symlink_nonregular_and_oversize_files(
+    def test_malformed_evidence_dependency_is_wrapped_without_echo(self) -> None:
+        secret = "MALFORMED_DEPENDENCY_SECRET"
+        pack = _pack_value()
+        pack["evidence_items"][1]["derived_from"] = 20260727
+        pack["private_diagnostic"] = secret
+
+        with self.assertRaises(ProjectionError) as raised:
+            build_projection_from_values(
+                run_value=_run_value(),
+                pack_value=pack,
+                hmac_key=HMAC_KEY,
+            )
+
+        self.assertEqual(
+            str(raised.exception),
+            "evidence pack schema is invalid or unsupported",
+        )
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_nested_nonfinite_pack_value_fails_closed_for_values_and_files(
+        self,
+    ) -> None:
+        snapshot = load_run_snapshot(FIXTURES / "run_finished.json", HMAC_KEY)
+        for label, value in (
+            ("NaN", float("nan")),
+            ("Infinity", float("inf")),
+            ("negative Infinity", float("-inf")),
+        ):
+            pack = _pack_value()
+            pack["private_diagnostic"] = {"score": value}
+
+            with self.subTest(source="value", constant=label):
+                with self.assertRaises(ProjectionError) as direct:
+                    build_projection_from_values(
+                        run_value=_run_value(),
+                        pack_value=pack,
+                        hmac_key=HMAC_KEY,
+                    )
+                self.assertNotIn(label.lower(), str(direct.exception).lower())
+
+            with self.subTest(source="file", constant=label):
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "pack.json"
+                    path.write_text(
+                        json.dumps(pack, ensure_ascii=False, allow_nan=True),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ProjectionError) as file_error:
+                        build_projection(snapshot, path)
+                self.assertNotIn(
+                    label.lower(),
+                    str(file_error.exception).lower(),
+                )
+
+    def test_index_key_error_is_wrapped_without_echo(self) -> None:
+        secret = "INDEX_KEY_ERROR_SECRET"
+
+        with patch(
+            "app.deepeval_advisory.projection.build_claim_evidence_index",
+            side_effect=KeyError(secret),
+        ):
+            with self.assertRaises(ProjectionError) as raised:
+                build_projection_from_values(
+                    run_value=_run_value(),
+                    pack_value=_pack_value(),
+                    hmac_key=HMAC_KEY,
+                )
+
+        self.assertEqual(
+            str(raised.exception),
+            "claim evidence indexing failed",
+        )
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_evidence_file_loader_rejects_bad_nonregular_and_oversize_files(
         self,
     ) -> None:
         snapshot = load_run_snapshot(FIXTURES / "run_finished.json", HMAC_KEY)
@@ -847,13 +1043,17 @@ class AdvisoryProjectionTests(unittest.TestCase):
             with self.assertRaises(ProjectionError):
                 build_projection(snapshot, root)
 
+    def test_evidence_file_loader_rejects_symlinks(self) -> None:
+        snapshot = load_run_snapshot(FIXTURES / "run_finished.json", HMAC_KEY)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
             target = root / "target.json"
             target.write_text(
                 json.dumps(_pack_value(), ensure_ascii=False),
                 encoding="utf-8",
             )
             link = root / "pack-link.json"
-            link.symlink_to(target)
+            self.create_symlink_or_skip(link, target)
             with self.assertRaises(ProjectionError):
                 build_projection(snapshot, link)
 
@@ -1010,6 +1210,33 @@ class AdvisoryProjectionTests(unittest.TestCase):
                 pack_value=pack,
                 hmac_key=HMAC_KEY,
             )
+
+    def test_short_and_nfkc_equivalent_identity_leaks_fail_closed(self) -> None:
+        cases = (
+            ("m123456", "ｍ１２３４５６"),
+            ("m", "m"),
+        )
+        for menu_code, visible_identity in cases:
+            with self.subTest(menu_code=menu_code), self.assertRaises(
+                ProjectionError
+            ):
+                self.build_identity_projection(
+                    menu_code=menu_code,
+                    visible_identity=visible_identity,
+                )
+
+    def test_identity_substring_inside_larger_ascii_token_is_allowed(self) -> None:
+        cases = (
+            ("m123456", "xm123456y"),
+            ("m", "minimum"),
+        )
+        for menu_code, visible_identity in cases:
+            with self.subTest(menu_code=menu_code):
+                projection = self.build_identity_projection(
+                    menu_code=menu_code,
+                    visible_identity=visible_identity,
+                )
+                self.assertEqual(len(projection.units), 1)
 
 
 if __name__ == "__main__":

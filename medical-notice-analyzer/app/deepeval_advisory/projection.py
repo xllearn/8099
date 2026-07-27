@@ -4,8 +4,9 @@ import json
 import os
 import re
 import stat
+import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from pydantic import ValidationError
 
@@ -27,7 +28,11 @@ from app.diagnostics import TECHNICAL_BODY_PHRASES
 from app.evidence_index import EvidenceIndexError, build_claim_evidence_index
 from app.evidence_schema import EvidenceValidationError, read_evidence_pack
 from app.formal_body import FormalBodyDocument
-from app.schema_migrations import SchemaMigrationError, upgrade_run_schema
+from app.schema_migrations import (
+    SchemaMigrationError,
+    upgrade_report_ir_schema,
+    upgrade_run_schema,
+)
 
 
 MAX_CLAIM_TEXT_CHARS = 6_000
@@ -54,6 +59,25 @@ class ProjectionError(ValueError):
     """Raised when a safe, bounded advisory projection cannot be built."""
 
 
+def _reject_nonfinite_json(_value: str) -> None:
+    raise ValueError("non-finite JSON constant")
+
+
+def _open_binary_source(path: Path) -> BinaryIO:
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    if no_follow is None:
+        return path.open("rb")
+
+    flags = os.O_RDONLY | no_follow
+    flags |= getattr(os, "O_BINARY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        return os.fdopen(descriptor, "rb")
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _load_json_object(path: Path, *, max_bytes: int) -> dict[str, Any]:
     if (
         isinstance(max_bytes, bool)
@@ -73,7 +97,7 @@ def _load_json_object(path: Path, *, max_bytes: int) -> dict[str, Any]:
         raise ProjectionError("projection source violates the byte budget")
 
     try:
-        with candidate.open("rb") as source:
+        with _open_binary_source(candidate) as source:
             opened = os.fstat(source.fileno())
             if not stat.S_ISREG(opened.st_mode):
                 raise ProjectionError("projection source must remain regular")
@@ -100,8 +124,11 @@ def _load_json_object(path: Path, *, max_bytes: int) -> dict[str, Any]:
         raise ProjectionError("projection source changed during read")
     try:
         decoded = payload.decode("utf-8", errors="strict")
-        value = json.loads(decoded)
-    except (UnicodeDecodeError, json.JSONDecodeError):
+        value = json.loads(
+            decoded,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         raise ProjectionError("projection source is not valid UTF-8 JSON") from None
     if not isinstance(value, dict):
         raise ProjectionError("projection source JSON must be an object")
@@ -131,7 +158,13 @@ def _canonical_report_ir(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise ProjectionError("report_ir must be an object or null")
     try:
-        normalized = _normalize_json_strings(value)
+        upgraded = upgrade_report_ir_schema(value)
+    except SchemaMigrationError:
+        raise ProjectionError(
+            "report_ir schema is invalid or unsupported"
+        ) from None
+    try:
+        normalized = _normalize_json_strings(upgraded)
         return json.loads(canonical_json_bytes(normalized).decode("utf-8"))
     except (TypeError, ValueError, json.JSONDecodeError):
         raise ProjectionError("report_ir is not canonical JSON data") from None
@@ -314,27 +347,43 @@ def _positive_location(value: Any) -> int | None:
     return value
 
 
-def _safe_locator(source_ref: dict[str, Any]) -> SafeLocator:
+def _safe_locator(
+    evidence_kind: str,
+    source_ref: dict[str, Any],
+) -> SafeLocator:
     page = _positive_location(source_ref.get("page_no"))
     table_index = _positive_location(source_ref.get("table_index"))
     row = _positive_location(source_ref.get("row"))
     column = _positive_location(source_ref.get("column"))
     try:
-        if table_index is not None:
-            return SafeLocator(
-                kind="table_cell",
-                table_index=table_index,
-                row=row,
-                column=column,
-            )
-        if source_ref.get("sheet_name") is not None or row is not None or column is not None:
-            return SafeLocator(
-                kind="sheet_cell",
-                row=row,
-                column=column,
-            )
-        if page is not None:
+        if evidence_kind == "table_cell":
+            if table_index is not None:
+                return SafeLocator(
+                    kind="table_cell",
+                    table_index=table_index,
+                    row=row,
+                    column=column,
+                )
+            if (
+                source_ref.get("sheet_name") is not None
+                and row is not None
+                and column is not None
+            ):
+                return SafeLocator(
+                    kind="sheet_cell",
+                    row=row,
+                    column=column,
+                )
+        if evidence_kind in {"attachment_text", "derived_fact", "table_cell"} and page is not None:
             return SafeLocator(kind="pdf_page", ordinal=page)
+        if evidence_kind not in {
+            "article_field",
+            "article_text",
+            "attachment_text",
+            "table_cell",
+            "derived_fact",
+        }:
+            raise ProjectionError("evidence locator kind is unsupported")
         return SafeLocator(kind="article")
     except ValidationError:
         raise ProjectionError("evidence locator validation failed") from None
@@ -347,8 +396,9 @@ def _validated_pack(
     if not isinstance(pack_value, dict):
         raise ProjectionError("evidence pack source must be an object")
     try:
+        canonical_json_bytes(pack_value)
         pack = read_evidence_pack(pack_value)
-    except EvidenceValidationError:
+    except (EvidenceValidationError, KeyError, TypeError, ValueError):
         raise ProjectionError("evidence pack schema is invalid or unsupported") from None
     pack_id = pack.get("pack_id")
     if (
@@ -404,7 +454,40 @@ def _raw_identity_tokens(
             value = source_ref.get(field)
             if isinstance(value, str):
                 tokens.add(value)
-    return {token for token in tokens if len(token) >= 8}
+    return {
+        normalized
+        for token in tokens
+        if (
+            normalized := unicodedata.normalize(
+                "NFKC",
+                _normalize_newlines(token),
+            ).strip()
+        )
+    }
+
+
+def _contains_raw_identity(
+    serialized_projection: str,
+    token: str,
+) -> bool:
+    normalized_projection = unicodedata.normalize(
+        "NFKC",
+        _normalize_newlines(serialized_projection),
+    )
+    normalized_token = unicodedata.normalize(
+        "NFKC",
+        _normalize_newlines(token),
+    ).strip()
+    if not normalized_token:
+        return False
+    encoded_token = json.dumps(
+        normalized_token,
+        ensure_ascii=False,
+    )[1:-1]
+    pattern = re.compile(
+        rf"(?<![\w-]){re.escape(encoded_token)}(?![\w-])"
+    )
+    return pattern.search(normalized_projection) is not None
 
 
 def _projection_from_snapshot_and_pack(
@@ -415,8 +498,16 @@ def _projection_from_snapshot_and_pack(
     pack = _validated_pack(snapshot, pack_value)
     try:
         claim_index = build_claim_evidence_index(document, pack)
-    except (EvidenceIndexError, EvidenceValidationError, TypeError, ValueError):
+    except (
+        EvidenceIndexError,
+        EvidenceValidationError,
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
         raise ProjectionError("claim evidence indexing failed") from None
+    if not isinstance(claim_index, dict):
+        raise ProjectionError("claim evidence index is invalid")
 
     raw_items = pack.get("evidence_items")
     if not isinstance(raw_items, list):
@@ -427,7 +518,10 @@ def _projection_from_snapshot_and_pack(
         if isinstance(item, dict) and item.get("level") in {"A", "B"}
     }
     claims = claim_index.get("claims")
-    if not isinstance(claims, list):
+    if not isinstance(claims, list) or not all(
+        isinstance(claim, dict)
+        for claim in claims
+    ):
         raise ProjectionError("claim evidence index is invalid")
     sorted_claims = sorted(
         claims,
@@ -532,7 +626,10 @@ def _projection_from_snapshot_and_pack(
                         kind=str(item.get("kind") or ""),
                         excerpt=excerpt,
                         parent_a_ids=parent_ids,
-                        locator=_safe_locator(source_ref),
+                        locator=_safe_locator(
+                            str(item.get("kind") or ""),
+                            source_ref,
+                        ),
                     )
                 )
             except ValidationError:
@@ -565,7 +662,7 @@ def _projection_from_snapshot_and_pack(
         [unit.model_dump(mode="json") for unit in units]
     ).decode("utf-8")
     if any(
-        token in serialized_units
+        _contains_raw_identity(serialized_units, token)
         for token in _raw_identity_tokens(snapshot, pack)
     ):
         raise ProjectionError("projection material contains a raw source identity")
