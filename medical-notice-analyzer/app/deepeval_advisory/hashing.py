@@ -60,7 +60,7 @@ def canonical_sha256(value: Any) -> str:
 
 
 def text_sha256(value: str) -> str:
-    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 

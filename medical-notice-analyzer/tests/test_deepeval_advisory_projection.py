@@ -78,6 +78,12 @@ class AdvisoryHashingTests(unittest.TestCase):
             expected,
         )
 
+    def test_text_hash_treats_none_as_empty_text(self) -> None:
+        self.assertEqual(
+            text_sha256(None),
+            hashlib.sha256(b"").hexdigest(),
+        )
+
     def test_hmac_reference_does_not_expose_source_identifier(self) -> None:
         source_id = "run_internal_123"
         ref = hmac_reference(b"k" * 32, "run", source_id)
