@@ -351,14 +351,19 @@ class DatasetSchemaTests(unittest.TestCase):
                 # Keep both hashes stale: boundary rejection must win.
                 DatasetCase.model_validate(_case_value(projection=projection))
 
-    def test_case_rejects_rehashed_generic_uri_schemes_after_nfkc(self) -> None:
+    def test_case_rejects_rehashed_uri_locators_after_nfkc(self) -> None:
         unsafe_values = (
             "来源 s3://private-bucket/object",
             "实时通道 ws://example.test/feed",
             "联系人 mailto:reviewer@example.test",
             "本地来源 file:/private/source",
             "内嵌内容 data:text/plain,private",
-            "全角 ｓ３：／／private-bucket/object",
+            "脚本 javascript:alert(1)",
+            "远程 ssh:user@private-host",
+            "仓库 git:private",
+            "自定义 x:foo",
+            r"Windows C:\private\source",
+            "全角 ｘ：ｆｏｏ",
         )
         for unsafe in unsafe_values:
             with self.subTest(unsafe=unsafe), self.assertRaisesRegex(
@@ -369,12 +374,19 @@ class DatasetSchemaTests(unittest.TestCase):
                 value["projection"]["units"][0]["text"] = unsafe
                 DatasetCase.model_validate(_rehash_case_value(value))
 
-        safe = _case_value()
-        safe["projection"]["units"][0]["text"] = (
-            "结论: 采购范围一致；Note: 人工复核完成。"
+        safe_values = (
+            "Note: review approved",
+            "结论: 通过",
+            "Protocol: review approved",
+            "时间 08:30；比例 3:2；版本 2:1",
+            "全角标签 Note： review approved",
         )
-        model = DatasetCase.model_validate(_rehash_case_value(safe))
-        self.assertIn("结论:", model.projection.units[0].text)
+        for safe_text in safe_values:
+            with self.subTest(safe=safe_text):
+                safe = _case_value()
+                safe["projection"]["units"][0]["text"] = safe_text
+                model = DatasetCase.model_validate(_rehash_case_value(safe))
+                self.assertEqual(model.projection.units[0].text, safe_text)
 
     def test_case_rejects_evidence_c_and_full_source_payload_fields(self) -> None:
         projection = _projection_value()

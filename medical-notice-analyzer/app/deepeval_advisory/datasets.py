@@ -45,14 +45,8 @@ _CANONICAL_TIMESTAMP_PATTERN = re.compile(
 )
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
-_HIERARCHICAL_URI = re.compile(
-    r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://",
-    re.IGNORECASE,
-)
-_LOCATOR_URI = re.compile(
-    r"(?<![A-Za-z0-9+.-])"
-    r"(?:mailto|file|data|urn|tel|sms|blob|magnet|jdbc|odbc|ipfs|cid):",
-    re.IGNORECASE,
+_URI_LOCATOR = re.compile(
+    r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:(?=\S)",
 )
 _RAW_IDENTITY_NAME = re.compile(
     r"(?<![A-Za-z0-9_])"
@@ -208,8 +202,7 @@ def _assert_safe_content(value: str, *, conclusion_only: bool = False) -> str:
     except BoundaryViolation:
         raise ValueError("content violates the dataset safety boundary") from None
     if (
-        _HIERARCHICAL_URI.search(scanned)
-        or _LOCATOR_URI.search(scanned)
+        _URI_LOCATOR.search(scanned)
         or _RAW_IDENTITY_NAME.search(scanned)
         or _RAW_RUN_OR_PACK_ID.search(scanned)
         or _RAW_UUID.search(scanned)
