@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+_CANONICAL_TIMESTAMP_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
+)
 
 
 def utc_now_iso() -> str:
@@ -13,8 +25,22 @@ def utc_now_iso() -> str:
     )
 
 
+def _canonical_timestamp(value: str) -> str:
+    if not _CANONICAL_TIMESTAMP_PATTERN.fullmatch(value):
+        raise ValueError("timestamp must be UTC with millisecond precision")
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError as exc:
+        raise ValueError("timestamp must contain a real UTC datetime") from exc
+    return value
+
+
 class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        allow_inf_nan=False,
+    )
 
 
 class RunSnapshot(StrictModel):
@@ -127,6 +153,17 @@ class AdvisoryJob(StrictModel):
     source_evaluation_id: str | None = None
     error_category: str | None = None
 
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        return _canonical_timestamp(value)
+
+    @model_validator(mode="after")
+    def validate_timestamp_order(self) -> Self:
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must be on or after created_at")
+        return self
+
 
 class MetricObservation(StrictModel):
     metric_id: str = Field(min_length=1, max_length=80)
@@ -137,6 +174,30 @@ class MetricObservation(StrictModel):
     evidence_references: tuple[str, ...] = ()
     unsupported_spans: tuple[tuple[int, int], ...] = ()
     error_category: str | None = None
+
+    @model_validator(mode="after")
+    def validate_status_fields(self) -> Self:
+        if self.status is MetricStatus.SCORED:
+            if self.score is None:
+                raise ValueError("scored metrics require a score")
+            if self.error_category is not None:
+                raise ValueError("scored metrics cannot have an error category")
+            return self
+
+        if self.score is not None:
+            raise ValueError(f"{self.status.value} metrics cannot have a score")
+        if (
+            self.status is MetricStatus.NOT_APPLICABLE
+            and self.error_category is not None
+        ):
+            raise ValueError(
+                "not_applicable metrics cannot have an error category"
+            )
+        if self.status is MetricStatus.ERROR and not (
+            self.error_category and self.error_category.strip()
+        ):
+            raise ValueError("error metrics require an error category")
+        return self
 
 
 class AdvisoryResult(StrictModel):
@@ -166,3 +227,59 @@ class AdvisoryResult(StrictModel):
     input_fingerprint: str = ""
     output_fingerprint: str = ""
     created_at: str = Field(default_factory=utc_now_iso)
+
+    @field_validator("created_at")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        return _canonical_timestamp(value)
+
+    @model_validator(mode="after")
+    def validate_terminal_invariants(self) -> Self:
+        terminal_statuses = {
+            JobStatus.COMPLETED,
+            JobStatus.CACHED,
+            JobStatus.PARTIAL,
+            JobStatus.UNAVAILABLE,
+            JobStatus.OVER_BUDGET,
+            JobStatus.INDETERMINATE,
+        }
+        if self.status not in terminal_statuses:
+            raise ValueError("advisory results require a terminal status")
+
+        metric_statuses = tuple(metric.status for metric in self.metrics)
+        if self.status in {JobStatus.COMPLETED, JobStatus.CACHED}:
+            if not self.metrics:
+                raise ValueError(
+                    "completed and cached results require metrics"
+                )
+            if any(
+                status
+                not in {MetricStatus.SCORED, MetricStatus.NOT_APPLICABLE}
+                for status in metric_statuses
+            ):
+                raise ValueError(
+                    "completed and cached metrics must be final observations"
+                )
+            self._require_judge_identity()
+        elif self.status is JobStatus.PARTIAL:
+            if MetricStatus.SCORED not in metric_statuses:
+                raise ValueError("partial results require a scored metric")
+            if not any(
+                status in {MetricStatus.UNAVAILABLE, MetricStatus.ERROR}
+                for status in metric_statuses
+            ):
+                raise ValueError(
+                    "partial results require an unavailable or error metric"
+                )
+            self._require_judge_identity()
+        elif MetricStatus.SCORED in metric_statuses:
+            raise ValueError(f"{self.status.value} results cannot be scored")
+        return self
+
+    def _require_judge_identity(self) -> None:
+        if not self.judge_provider.strip():
+            raise ValueError("judge_provider must be nonblank")
+        if not self.resolved_model_or_profile_version.strip():
+            raise ValueError(
+                "resolved_model_or_profile_version must be nonblank"
+            )

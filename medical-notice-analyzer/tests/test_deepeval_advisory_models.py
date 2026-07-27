@@ -28,6 +28,7 @@ REPORT_SHA256 = "a" * 64
 PROJECTION_SHA256 = "b" * 64
 ADVISORY_INPUT_SHA256 = "c" * 64
 METRIC_SET_SHA256 = "d" * 64
+CANONICAL_TIME = "2026-07-27T12:34:56.123Z"
 
 RUN_STATUSES = (
     "created",
@@ -66,6 +67,8 @@ def valid_result_payload() -> dict[str, object]:
         "advisory_input_sha256": ADVISORY_INPUT_SHA256,
         "metric_set_sha256": METRIC_SET_SHA256,
         "status": JobStatus.COMPLETED,
+        "judge_provider": "fake",
+        "resolved_model_or_profile_version": "judge-v1",
         "metrics": (
             MetricObservation(
                 metric_id="claim_faithfulness_v1",
@@ -77,7 +80,9 @@ def valid_result_payload() -> dict[str, object]:
     }
 
 
-def required_settings(root: Path | str = Path(".")) -> dict[str, str]:
+def required_settings(root: Path | str | None = None) -> dict[str, str]:
+    if root is None:
+        root = Path(tempfile.gettempdir()) / "deepeval-settings-contract"
     root_path = Path(root)
     return {
         "ANALYSIS_RUN_DIR": str(root_path / "runs"),
@@ -148,7 +153,7 @@ class AdvisoryModelTests(unittest.TestCase):
                         }
                     )
 
-    def test_job_rejects_invalid_transition_input(self) -> None:
+    def test_job_rejects_invalid_persisted_input(self) -> None:
         with self.assertRaises(ValidationError):
             AdvisoryJob(
                 job_id="job_12345678",
@@ -159,6 +164,282 @@ class AdvisoryModelTests(unittest.TestCase):
                 advisory_input_sha256="z",
                 status=JobStatus.PENDING,
             )
+
+    def test_metric_observation_enforces_status_specific_fields(self) -> None:
+        invalid_payloads = (
+            {
+                "status": MetricStatus.SCORED,
+                "score": None,
+            },
+            {
+                "status": MetricStatus.SCORED,
+                "score": 0.5,
+                "error_category": "provider_error",
+            },
+            {
+                "status": MetricStatus.NOT_APPLICABLE,
+                "score": 0.5,
+            },
+            {
+                "status": MetricStatus.NOT_APPLICABLE,
+                "error_category": "not_relevant",
+            },
+            {
+                "status": MetricStatus.UNAVAILABLE,
+                "score": 0.5,
+            },
+            {
+                "status": MetricStatus.ERROR,
+                "score": 0.5,
+                "error_category": "provider_error",
+            },
+            {
+                "status": MetricStatus.ERROR,
+                "error_category": None,
+            },
+            {
+                "status": MetricStatus.ERROR,
+                "error_category": "   ",
+            },
+        )
+        for overrides in invalid_payloads:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValidationError):
+                    MetricObservation(
+                        metric_id="claim_faithfulness_v1",
+                        metric_version="1",
+                        **overrides,
+                    )
+
+        valid_observations = (
+            MetricObservation(
+                metric_id="scored",
+                metric_version="1",
+                status=MetricStatus.SCORED,
+                score=0.5,
+                bounded_reason="Supported by bounded evidence.",
+                evidence_references=("e1",),
+            ),
+            MetricObservation(
+                metric_id="not_applicable",
+                metric_version="1",
+                status=MetricStatus.NOT_APPLICABLE,
+            ),
+            MetricObservation(
+                metric_id="unavailable",
+                metric_version="1",
+                status=MetricStatus.UNAVAILABLE,
+                error_category="provider_unavailable",
+            ),
+            MetricObservation(
+                metric_id="error",
+                metric_version="1",
+                status=MetricStatus.ERROR,
+                error_category="invalid_response",
+                unsupported_spans=((1, 2),),
+            ),
+        )
+        self.assertEqual(len(valid_observations), 4)
+
+    def test_result_enforces_terminal_status_and_terminal_invariants(self) -> None:
+        for status in (
+            JobStatus.DISCOVERED,
+            JobStatus.PENDING,
+            JobStatus.PAUSED,
+            JobStatus.RUNNING,
+            JobStatus.RETRYING,
+        ):
+            with self.subTest(nonterminal_status=status):
+                with self.assertRaises(ValidationError):
+                    AdvisoryResult(
+                        **{
+                            **valid_result_payload(),
+                            "status": status,
+                        }
+                    )
+
+        not_applicable = MetricObservation(
+            metric_id="attachment_coverage_v1",
+            metric_version="1",
+            status=MetricStatus.NOT_APPLICABLE,
+        )
+        unavailable = MetricObservation(
+            metric_id="unsupported_claim_v1",
+            metric_version="1",
+            status=MetricStatus.UNAVAILABLE,
+            error_category="provider_unavailable",
+        )
+        error = MetricObservation(
+            metric_id="reasoning_quality_v1",
+            metric_version="1",
+            status=MetricStatus.ERROR,
+            error_category="invalid_response",
+        )
+
+        for status in (JobStatus.COMPLETED, JobStatus.CACHED):
+            invalid_overrides = (
+                {"metrics": ()},
+                {"metrics": (unavailable,)},
+                {"judge_provider": "  "},
+                {"resolved_model_or_profile_version": ""},
+            )
+            for overrides in invalid_overrides:
+                with self.subTest(status=status, overrides=overrides):
+                    with self.assertRaises(ValidationError):
+                        AdvisoryResult(
+                            **{
+                                **valid_result_payload(),
+                                "status": status,
+                                **overrides,
+                            }
+                        )
+            result = AdvisoryResult(
+                **{
+                    **valid_result_payload(),
+                    "status": status,
+                    "metrics": (
+                        valid_result_payload()["metrics"][0],
+                        not_applicable,
+                    ),
+                }
+            )
+            self.assertEqual(result.status, status)
+
+        partial_metrics = (
+            valid_result_payload()["metrics"][0],
+            unavailable,
+            error,
+        )
+        for overrides in (
+            {"metrics": (unavailable,)},
+            {"metrics": valid_result_payload()["metrics"]},
+            {"judge_provider": " "},
+            {"resolved_model_or_profile_version": " "},
+        ):
+            with self.subTest(partial_overrides=overrides):
+                with self.assertRaises(ValidationError):
+                    AdvisoryResult(
+                        **{
+                            **valid_result_payload(),
+                            "status": JobStatus.PARTIAL,
+                            "metrics": partial_metrics,
+                            **overrides,
+                        }
+                    )
+        partial = AdvisoryResult(
+            **{
+                **valid_result_payload(),
+                "status": JobStatus.PARTIAL,
+                "metrics": partial_metrics,
+            }
+        )
+        self.assertEqual(partial.status, JobStatus.PARTIAL)
+
+        for status in (
+            JobStatus.UNAVAILABLE,
+            JobStatus.OVER_BUDGET,
+            JobStatus.INDETERMINATE,
+        ):
+            with self.subTest(no_scored_status=status):
+                with self.assertRaises(ValidationError):
+                    AdvisoryResult(
+                        **{
+                            **valid_result_payload(),
+                            "status": status,
+                        }
+                    )
+                result = AdvisoryResult(
+                    **{
+                        **valid_result_payload(),
+                        "status": status,
+                        "metrics": (unavailable,),
+                    }
+                )
+                self.assertEqual(result.status, status)
+
+    def test_float_contract_rejects_nan_and_infinity_on_round_trip(self) -> None:
+        self.assertFalse(
+            AdvisoryResult.model_config.get("allow_inf_nan", True)
+        )
+
+        observation_payload = MetricObservation(
+            metric_id="claim_faithfulness_v1",
+            metric_version="1",
+            status=MetricStatus.SCORED,
+            score=0.5,
+        ).model_dump(mode="json")
+        result_payload = AdvisoryResult(**valid_result_payload()).model_dump(
+            mode="json"
+        )
+        for invalid_float in (
+            float("inf"),
+            float("-inf"),
+            float("nan"),
+        ):
+            with self.subTest(field="score", value=invalid_float):
+                with self.assertRaises(ValidationError):
+                    MetricObservation.model_validate(
+                        {
+                            **observation_payload,
+                            "score": invalid_float,
+                        }
+                    )
+            with self.subTest(field="cost", value=invalid_float):
+                with self.assertRaises(ValidationError):
+                    AdvisoryResult.model_validate(
+                        {
+                            **result_payload,
+                            "cost": invalid_float,
+                        }
+                    )
+
+    def test_persisted_timestamps_are_canonical_and_monotonic(self) -> None:
+        valid_job = AdvisoryJob(
+            **{
+                **valid_job_payload(),
+                "created_at": CANONICAL_TIME,
+                "updated_at": CANONICAL_TIME,
+            }
+        )
+        self.assertEqual(valid_job.created_at, CANONICAL_TIME)
+
+        invalid_timestamps = (
+            "2026-07-27T12:34:56Z",
+            "2026-07-27T12:34:56.12Z",
+            "2026-07-27T12:34:56.123+00:00",
+            "2026-02-30T12:34:56.123Z",
+        )
+        for field in ("created_at", "updated_at"):
+            for timestamp in invalid_timestamps:
+                with self.subTest(model="job", field=field, value=timestamp):
+                    with self.assertRaises(ValidationError):
+                        AdvisoryJob(
+                            **{
+                                **valid_job_payload(),
+                                "created_at": CANONICAL_TIME,
+                                "updated_at": CANONICAL_TIME,
+                                field: timestamp,
+                            }
+                        )
+
+        with self.assertRaises(ValidationError):
+            AdvisoryJob(
+                **{
+                    **valid_job_payload(),
+                    "created_at": "2026-07-27T12:34:56.124Z",
+                    "updated_at": CANONICAL_TIME,
+                }
+            )
+
+        for timestamp in invalid_timestamps:
+            with self.subTest(model="result", value=timestamp):
+                with self.assertRaises(ValidationError):
+                    AdvisoryResult(
+                        **{
+                            **valid_result_payload(),
+                            "created_at": timestamp,
+                        }
+                    )
 
     def test_run_snapshot_accepts_exact_status_literals(self) -> None:
         for status in RUN_STATUSES:
@@ -382,6 +663,90 @@ class AdvisorySettingsTests(unittest.TestCase):
                     "ANALYSIS_RUN_DIR": " ",
                 }
             )
+
+    def test_settings_normalize_absolute_non_overlapping_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = AdvisorySettings.from_mapping(
+                {
+                    "ANALYSIS_RUN_DIR": str(root / "nested" / ".." / "runs"),
+                    "EVIDENCE_PACK_DIR": str(root / "packs"),
+                    "DEEPEVAL_ADVISORY_DIR": str(root / "advisory"),
+                }
+            )
+
+        self.assertEqual(settings.analysis_run_dir, (root / "runs").resolve())
+        self.assertEqual(settings.evidence_pack_dir, (root / "packs").resolve())
+        self.assertEqual(settings.advisory_dir, (root / "advisory").resolve())
+
+    def test_settings_reject_relative_or_overlapping_paths(self) -> None:
+        with self.assertRaises(SettingsError):
+            AdvisorySettings.from_mapping(
+                {
+                    **required_settings(),
+                    "ANALYSIS_RUN_DIR": "relative/runs",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overlapping_mappings = (
+                {
+                    "ANALYSIS_RUN_DIR": str(root / "shared"),
+                    "EVIDENCE_PACK_DIR": str(root / "shared"),
+                    "DEEPEVAL_ADVISORY_DIR": str(root / "advisory"),
+                },
+                {
+                    "ANALYSIS_RUN_DIR": str(root / "runs"),
+                    "EVIDENCE_PACK_DIR": str(root / "runs" / "packs"),
+                    "DEEPEVAL_ADVISORY_DIR": str(root / "advisory"),
+                },
+                {
+                    "ANALYSIS_RUN_DIR": str(root / "sources" / "runs"),
+                    "EVIDENCE_PACK_DIR": str(root / "sources" / "packs"),
+                    "DEEPEVAL_ADVISORY_DIR": str(root / "sources"),
+                },
+            )
+            for mapping in overlapping_mappings:
+                with self.subTest(mapping=mapping):
+                    with self.assertRaises(SettingsError):
+                        AdvisorySettings.from_mapping(mapping)
+
+    def test_settings_enforce_size_caps_and_lease_heartbeat_margin(self) -> None:
+        settings = AdvisorySettings.from_mapping(
+            {
+                **required_settings(),
+                "DEEPEVAL_LEASE_TTL_SECONDS": "600",
+                "DEEPEVAL_LEASE_HEARTBEAT_SECONDS": "200",
+                "DEEPEVAL_MAX_RUN_BYTES": str(64 * 1024 * 1024),
+                "DEEPEVAL_MAX_PACK_BYTES": str(256 * 1024 * 1024),
+            }
+        )
+        self.assertEqual(settings.lease_heartbeat_seconds, 200)
+        self.assertEqual(settings.max_run_bytes, 64 * 1024 * 1024)
+        self.assertEqual(settings.max_pack_bytes, 256 * 1024 * 1024)
+
+        invalid_overrides = (
+            {
+                "DEEPEVAL_LEASE_TTL_SECONDS": "600",
+                "DEEPEVAL_LEASE_HEARTBEAT_SECONDS": "201",
+            },
+            {
+                "DEEPEVAL_MAX_RUN_BYTES": str(64 * 1024 * 1024 + 1),
+            },
+            {
+                "DEEPEVAL_MAX_PACK_BYTES": str(256 * 1024 * 1024 + 1),
+            },
+        )
+        for overrides in invalid_overrides:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(SettingsError):
+                    AdvisorySettings.from_mapping(
+                        {
+                            **required_settings(),
+                            **overrides,
+                        }
+                    )
 
     def test_settings_are_frozen_and_reject_extra_model_fields(self) -> None:
         settings = AdvisorySettings.from_mapping(required_settings())
