@@ -1686,7 +1686,6 @@ def _build_fixed10_tree(
 @contextmanager
 def _fixed10_lock(
     parent_descriptor: int,
-    lock_name: str,
     *,
     timeout_seconds: float,
 ) -> Iterator[None]:
@@ -1699,54 +1698,15 @@ def _fixed10_lock(
     descriptor: int | None = None
     locked = False
     try:
-        flags = (
-            os.O_RDWR
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_BINARY", 0)
-        )
-        created = False
-        try:
-            descriptor = os.open(
-                lock_name,
-                flags | os.O_CREAT | os.O_EXCL,
-                0o600,
-                dir_fd=parent_descriptor,
-            )
-            created = True
-        except FileExistsError:
-            before = os.stat(
-                lock_name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            descriptor = os.open(
-                lock_name,
-                flags,
-                dir_fd=parent_descriptor,
-            )
-            opened = os.fstat(descriptor)
-            if not _same_stat_state(before, opened):
-                raise Fixed10FreezeError("lock_invalid")
-
-        opened = os.fstat(descriptor)
-        observed = os.stat(
-            lock_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
+        parent_identity = os.fstat(parent_descriptor)
+        descriptor = os.dup(parent_descriptor)
+        lock_identity = os.fstat(descriptor)
         if (
-            not stat.S_ISREG(opened.st_mode)
-            or not _same_stat_state(opened, observed)
-            or opened.st_nlink != 1
-            or opened.st_size != 0
-            or opened.st_uid != os.geteuid()
-            or stat.S_IMODE(opened.st_mode) & 0o077
+            not stat.S_ISDIR(parent_identity.st_mode)
+            or not stat.S_ISDIR(lock_identity.st_mode)
+            or not _same_file(parent_identity, lock_identity)
         ):
             raise Fixed10FreezeError("lock_invalid")
-        if created:
-            os.fsync(descriptor)
-            os.fsync(parent_descriptor)
 
         while True:
             try:
@@ -1875,7 +1835,10 @@ def _tree_matches_at(
             "manifest.json",
             max_bytes=MAX_DATASET_JSON_BYTES,
         )
-        if manifest.payload != expected.manifest:
+        if (
+            manifest.stat_result.st_nlink != 1
+            or manifest.payload != expected.manifest
+        ):
             return False
         cases_descriptor, _cases_stat = _open_child_directory_at(
             root_descriptor,
@@ -1894,7 +1857,10 @@ def _tree_matches_at(
                 name,
                 max_bytes=MAX_DATASET_JSON_BYTES,
             )
-            if observed.payload != expected.cases[name]:
+            if (
+                observed.stat_result.st_nlink != 1
+                or observed.payload != expected.cases[name]
+            ):
                 return False
             first_case_reads[name] = observed
         if _directory_names_at(
@@ -2254,10 +2220,8 @@ def freeze_fixed10_dataset(
         exports = _read_fixed10_source_exports(source)
         expected = _build_fixed10_tree(exports)
         with _open_or_create_directory_path(output.parent) as parent_descriptor:
-            lock_name = f".{output_name}.freeze-lock"
             with _fixed10_lock(
                 parent_descriptor,
-                lock_name,
                 timeout_seconds=timeout,
             ):
                 status = _existing_fixed10_status(

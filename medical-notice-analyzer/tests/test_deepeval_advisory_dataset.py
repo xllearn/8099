@@ -1668,6 +1668,102 @@ class Fixed10FreezeTests(unittest.TestCase):
                     self.assert_freeze_rejected(source_dir, output_dir)
                     self.assertEqual(output_dir.read_bytes(), b"do-not-replace")
 
+    def test_existing_hardlinked_manifest_or_case_is_rejected_unchanged(
+        self,
+    ) -> None:
+        for member in ("manifest", "case"):
+            with (
+                self.subTest(member=member),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                external = root / "external.json"
+                _write_fixed10_sources(source_dir)
+                self.freeze(source_dir, output_dir)
+                published = (
+                    output_dir / "manifest.json"
+                    if member == "manifest"
+                    else output_dir
+                    / "cases"
+                    / "case_00000000000000000000000000000001.json"
+                )
+                external.write_bytes(published.read_bytes())
+                published.unlink()
+                os.link(external, published)
+                before = external.stat()
+                before_bytes = external.read_bytes()
+
+                error_type = getattr(dataset_module, "Fixed10FreezeError")
+                with self.assertRaises(error_type):
+                    self.freeze(source_dir, output_dir)
+
+                after = external.stat()
+                self.assertEqual(external.read_bytes(), before_bytes)
+                self.assertEqual(after.st_ino, before.st_ino)
+                self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+                self.assertEqual(after.st_nlink, 2)
+                self.assertTrue(os.path.samefile(external, published))
+
+    def test_staged_hardlinked_manifest_or_case_is_never_published(
+        self,
+    ) -> None:
+        for member in ("manifest", "case"):
+            with (
+                self.subTest(member=member),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                external = root / f"external-{member}.json"
+                _write_fixed10_sources(source_dir)
+                original = getattr(dataset_module, "_write_exclusive_at")
+                linked_payload: bytes | None = None
+
+                def hardlink_written_file(
+                    parent_descriptor: int,
+                    name: str,
+                    payload: bytes,
+                ) -> None:
+                    nonlocal linked_payload
+                    original(parent_descriptor, name, payload)
+                    matches = (
+                        member == "manifest" and name == "manifest.json"
+                    ) or (
+                        member == "case"
+                        and name
+                        == "case_00000000000000000000000000000001.json"
+                    )
+                    if matches:
+                        os.link(
+                            name,
+                            external,
+                            src_dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                        linked_payload = payload
+
+                error_type = getattr(dataset_module, "Fixed10FreezeError")
+                with (
+                    patch.object(
+                        dataset_module,
+                        "_write_exclusive_at",
+                        side_effect=hardlink_written_file,
+                    ),
+                    self.assertRaises(error_type),
+                ):
+                    self.freeze(source_dir, output_dir)
+
+                self.assertIsNotNone(linked_payload)
+                self.assertFalse(output_dir.exists())
+                self.assertEqual(external.read_bytes(), linked_payload)
+                self.assertEqual(external.stat().st_nlink, 1)
+                self.assertFalse(
+                    any("freeze-stage" in path.name for path in root.iterdir())
+                )
+
     def test_concurrent_cli_calls_create_once_without_clobber(self) -> None:
         self.assertTrue(FREEZE_SCRIPT.is_file())
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1683,12 +1779,71 @@ class Fixed10FreezeTests(unittest.TestCase):
                 str(source_dir),
                 "--output-dir",
                 str(output_dir),
-                "--lock-timeout-seconds",
-                "5",
             ]
+            holder = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl,os,sys;"
+                        "fd=os.open(sys.argv[1],"
+                        "os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);"
+                        "fcntl.flock(fd,fcntl.LOCK_EX);"
+                        "print('locked',flush=True);"
+                        "os.read(0,1)"
+                    ),
+                    str(root),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertIsNotNone(holder.stdout)
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            try:
+                blocked_processes = [
+                    subprocess.Popen(
+                        [
+                            *command,
+                            "--lock-timeout-seconds",
+                            "0.2",
+                        ],
+                        cwd=PROJECT_ROOT,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    for _ in range(2)
+                ]
+                blocked = [
+                    process.communicate(timeout=30)
+                    for process in blocked_processes
+                ]
+                self.assertEqual(
+                    [process.returncode for process in blocked_processes],
+                    [2, 2],
+                    blocked,
+                )
+                self.assertFalse(output_dir.exists())
+                self.assertEqual(
+                    {
+                        json.loads(stderr)["category"]
+                        for _stdout, stderr in blocked
+                    },
+                    {"lock_timeout"},
+                )
+            finally:
+                holder.kill()
+                holder.communicate(timeout=10)
+
             processes = [
                 subprocess.Popen(
-                    command,
+                    [
+                        *command,
+                        "--lock-timeout-seconds",
+                        "5",
+                    ],
                     cwd=PROJECT_ROOT,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -1747,31 +1902,29 @@ class Fixed10FreezeTests(unittest.TestCase):
                 )
             )
             lock_path = root / ".output.freeze-lock"
-            self.assertTrue(lock_path.is_file())
-            self.assertFalse(lock_path.is_symlink())
-            self.assertEqual(lock_path.read_bytes(), b"")
+            self.assertFalse(lock_path.exists())
 
-    def test_crashed_holder_releases_persistent_kernel_lock(self) -> None:
+    def test_crashed_holder_releases_anchored_parent_directory_lock(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source_dir = root / "source"
             output_dir = root / "output"
-            lock_path = root / ".output.freeze-lock"
             _write_fixed10_sources(source_dir)
-            lock_path.touch(mode=0o600)
-            lock_path.chmod(0o600)
             holder = subprocess.Popen(
                 [
                     sys.executable,
                     "-c",
                     (
                         "import fcntl,os,sys;"
-                        "fd=os.open(sys.argv[1],os.O_RDWR|os.O_NOFOLLOW);"
+                        "fd=os.open(sys.argv[1],"
+                        "os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW);"
                         "fcntl.flock(fd,fcntl.LOCK_EX);"
                         "print('locked',flush=True);"
                         "os.read(0,1)"
                     ),
-                    str(lock_path),
+                    str(root),
                 ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -1780,14 +1933,25 @@ class Fixed10FreezeTests(unittest.TestCase):
             )
             self.assertIsNotNone(holder.stdout)
             self.assertEqual(holder.stdout.readline().strip(), "locked")
-            holder.kill()
-            holder.communicate(timeout=10)
+            freeze = getattr(dataset_module, "freeze_fixed10_dataset")
+            error_type = getattr(dataset_module, "Fixed10FreezeError")
+            try:
+                with self.assertRaises(error_type):
+                    freeze(
+                        source_dir,
+                        output_dir,
+                        lock_timeout_seconds=0.2,
+                    )
+                self.assertFalse(output_dir.exists())
+            finally:
+                holder.kill()
+                holder.communicate(timeout=10)
 
             status = self.freeze(source_dir, output_dir)
 
         self.assertEqual(status, "created")
 
-    def test_unsafe_preexisting_lock_is_rejected_without_replacement(
+    def test_decoy_lock_path_is_not_used_or_replaced(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1800,8 +1964,9 @@ class Fixed10FreezeTests(unittest.TestCase):
             target.write_bytes(b"do-not-follow")
             lock_path.symlink_to(target)
 
-            self.assert_freeze_rejected(source_dir, output_dir)
+            status = self.freeze(source_dir, output_dir)
 
+            self.assertEqual(status, "created")
             self.assertTrue(lock_path.is_symlink())
             self.assertEqual(target.read_bytes(), b"do-not-follow")
 
