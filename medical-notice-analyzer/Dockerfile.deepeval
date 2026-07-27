@@ -1,0 +1,22 @@
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/state \
+    DEEPEVAL_TELEMETRY_OPT_OUT=1 \
+    DEEPEVAL_DISABLE_DOTENV=1 \
+    DEEPEVAL_NO_INSPECT_PROMPT=1 \
+    ENABLE_DEEPEVAL_CACHE=0
+
+RUN groupadd --gid 10001 advisory \
+    && useradd --uid 10001 --gid 10001 --no-create-home \
+        --home-dir /state --shell /usr/sbin/nologin advisory \
+    && install -d -m 0700 -o 10001 -g 10001 /state
+
+COPY requirements-deepeval.lock /opt/advisory/requirements-deepeval.lock
+RUN python -m pip install --no-cache-dir --require-hashes \
+        --requirement /opt/advisory/requirements-deepeval.lock
+
+WORKDIR /work
+USER 10001:10001
+ENTRYPOINT ["python"]

@@ -5,8 +5,17 @@
 __pycache__
 *.pyc
 
+data
+data/**
 reports
+reports/**
 site-cache
+artifacts
+artifacts/**
+secrets
+secrets/**
+deepeval-advisory-data
+*.docx
 dify-db-backups
 
 *.log
