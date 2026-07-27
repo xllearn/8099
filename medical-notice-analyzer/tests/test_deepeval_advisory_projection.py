@@ -812,6 +812,17 @@ class AdvisoryProjectionTests(unittest.TestCase):
                 hmac_key=HMAC_KEY,
             )
 
+    def test_pack_identity_is_required(self) -> None:
+        pack = _pack_value()
+        pack.pop("pack_id")
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(),
+                pack_value=pack,
+                hmac_key=HMAC_KEY,
+            )
+
     def test_evidence_file_loader_rejects_bad_symlink_nonregular_and_oversize_files(
         self,
     ) -> None:

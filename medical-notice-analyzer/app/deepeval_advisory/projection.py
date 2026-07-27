@@ -351,8 +351,10 @@ def _validated_pack(
     except EvidenceValidationError:
         raise ProjectionError("evidence pack schema is invalid or unsupported") from None
     pack_id = pack.get("pack_id")
-    if pack_id is not None and (
-        not isinstance(pack_id, str) or pack_id != snapshot.pack_id
+    if (
+        not isinstance(pack_id, str)
+        or not pack_id.strip()
+        or pack_id != snapshot.pack_id
     ):
         raise ProjectionError("evidence pack identity does not match the run")
     return pack
