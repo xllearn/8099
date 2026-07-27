@@ -6,6 +6,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from decimal import Decimal
 import hmac
 import json
 import logging
@@ -40,7 +41,6 @@ _METRIC_VERSION_PATTERN = re.compile(
 )
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _SCHEMA_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
-_MAX_FINITE_FLOAT = float.fromhex("0x1.fffffffffffffp+1023")
 
 
 class JudgeError(RuntimeError):
@@ -91,14 +91,32 @@ class JudgeResponse(StrictModel):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class JudgeUsageRecord:
+    sequence: int
+    token_input: int
+    token_output: int
+    cost: float
+    latency_ms: int
+    input_fingerprint: str
+    output_fingerprint: str
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class JudgeUsageSnapshot:
     token_input: int = 0
     token_output: int = 0
     cost: float = 0.0
     latency_ms: int = 0
     response_count: int = 0
-    input_fingerprints: tuple[str, ...] = ()
-    output_fingerprints: tuple[str, ...] = ()
+    records: tuple[JudgeUsageRecord, ...] = ()
+
+    @property
+    def input_fingerprints(self) -> tuple[str, ...]:
+        return tuple(record.input_fingerprint for record in self.records)
+
+    @property
+    def output_fingerprints(self) -> tuple[str, ...]:
+        return tuple(record.output_fingerprint for record in self.records)
 
 
 class _BudgetState:
@@ -109,9 +127,7 @@ class _BudgetState:
         "_token_output",
         "_cost",
         "_latency_ms",
-        "_response_count",
-        "_input_fingerprints",
-        "_output_fingerprints",
+        "_records",
     )
 
     def __init__(self) -> None:
@@ -119,47 +135,65 @@ class _BudgetState:
         self._used = 0
         self._token_input = 0
         self._token_output = 0
-        self._cost = 0.0
+        self._cost = Decimal("0")
         self._latency_ms = 0
-        self._response_count = 0
-        self._input_fingerprints: list[str] = []
-        self._output_fingerprints: list[str] = []
+        self._records: dict[int, JudgeUsageRecord] = {}
 
     @property
     def used(self) -> int:
         with self._lock:
             return self._used
 
-    def consume(self, maximum: int) -> bool:
+    def reserve(self, maximum: int) -> int | None:
         with self._lock:
             if self._used >= maximum:
-                return False
+                return None
             self._used += 1
-            return True
+            return self._used
 
-    def record_response(self, response: JudgeResponse) -> None:
+    def record_response(
+        self,
+        sequence: int,
+        response: JudgeResponse,
+    ) -> None:
+        record = JudgeUsageRecord(
+            sequence=sequence,
+            token_input=response.token_input,
+            token_output=response.token_output,
+            cost=response.cost,
+            latency_ms=response.latency_ms,
+            input_fingerprint=response.input_fingerprint,
+            output_fingerprint=response.output_fingerprint,
+        )
         with self._lock:
-            cost = self._cost + response.cost
+            if sequence in self._records:
+                return
             self._token_input += response.token_input
             self._token_output += response.token_output
-            self._cost = (
-                cost if math.isfinite(cost) else _MAX_FINITE_FLOAT
-            )
+            self._cost += Decimal(str(response.cost))
             self._latency_ms += response.latency_ms
-            self._response_count += 1
-            self._input_fingerprints.append(response.input_fingerprint)
-            self._output_fingerprints.append(response.output_fingerprint)
+            self._records[sequence] = record
 
     def usage_snapshot(self) -> JudgeUsageSnapshot:
         with self._lock:
+            cost = float(self._cost)
+            if not math.isfinite(cost):
+                raise JudgeError(
+                    "usage_overflow",
+                    retryable=False,
+                    outcome="completed",
+                )
+            records = tuple(
+                self._records[sequence]
+                for sequence in sorted(self._records)
+            )
             return JudgeUsageSnapshot(
                 token_input=self._token_input,
                 token_output=self._token_output,
-                cost=self._cost,
+                cost=cost,
                 latency_ms=self._latency_ms,
-                response_count=self._response_count,
-                input_fingerprints=tuple(self._input_fingerprints),
-                output_fingerprints=tuple(self._output_fingerprints),
+                response_count=len(records),
+                records=records,
             )
 
 
@@ -230,9 +264,11 @@ class JudgeCallContext:
     def usage_snapshot(self) -> JudgeUsageSnapshot:
         return self._budget.usage_snapshot()
 
-    def _consume_subcall(self) -> None:
-        if not self._budget.consume(self.max_subcalls):
+    def _consume_subcall(self) -> int:
+        sequence = self._budget.reserve(self.max_subcalls)
+        if sequence is None:
             raise JudgeError("subcall_budget_exceeded")
+        return sequence
 
 
 _CURRENT_JUDGE_CONTEXT: ContextVar[JudgeCallContext | None] = ContextVar(
@@ -282,6 +318,20 @@ def validate_judge_prompt(
     *,
     response_schema: dict[str, Any] | None = None,
 ) -> str:
+    guarded_prompt, _sequence = _validate_judge_prompt_with_sequence(
+        prompt,
+        context,
+        response_schema=response_schema,
+    )
+    return guarded_prompt
+
+
+def _validate_judge_prompt_with_sequence(
+    prompt: str,
+    context: JudgeCallContext | None = None,
+    *,
+    response_schema: dict[str, Any] | None = None,
+) -> tuple[str, int]:
     active_context = require_judge_context()
     if context is not None and context is not active_context:
         raise JudgeError("context_mismatch")
@@ -305,14 +355,14 @@ def validate_judge_prompt(
         raise JudgeError("request_too_large")
 
     prompt_sha256 = text_sha256(prompt)
-    active_context._consume_subcall()
+    sequence = active_context._consume_subcall()
     _log_judge_call(
         active_context,
         prompt_sha256=prompt_sha256,
         status="validated",
-        attempt=active_context.subcalls_used,
+        attempt=sequence,
     )
-    return prompt
+    return prompt, sequence
 
 
 class JudgeTransport(Protocol):
@@ -649,9 +699,10 @@ def _verify_response_model_version(
 
 def _record_judge_usage(
     context: JudgeCallContext,
+    sequence: int,
     response: JudgeResponse,
 ) -> None:
-    context._budget.record_response(response)
+    context._budget.record_response(sequence, response)
 
 
 def _require_context_after_response(
@@ -753,7 +804,7 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
         response_schema = _response_schema_for(schema)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            guarded_prompt = validate_judge_prompt(
+            guarded_prompt, sequence = _validate_judge_prompt_with_sequence(
                 prompt,
                 context,
                 response_schema=response_schema,
@@ -771,13 +822,13 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
                     response_schema=response_schema,
                     context=context,
                 )
-                _require_context_after_response(context)
                 _verify_response_integrity(response, guarded_prompt)
                 _verify_response_model_version(
                     response,
                     self._profile_version,
                 )
-                _record_judge_usage(context, response)
+                _record_judge_usage(context, sequence, response)
+                _require_context_after_response(context)
                 result = parse_judge_response(
                     response,
                     schema,
@@ -829,7 +880,7 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
         response_schema = _response_schema_for(schema)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            guarded_prompt = validate_judge_prompt(
+            guarded_prompt, sequence = _validate_judge_prompt_with_sequence(
                 prompt,
                 context,
                 response_schema=response_schema,
@@ -864,13 +915,13 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
                         retryable=False,
                         outcome="unknown",
                     ) from None
-                _require_context_after_response(context)
                 _verify_response_integrity(response, guarded_prompt)
                 _verify_response_model_version(
                     response,
                     self._profile_version,
                 )
-                _record_judge_usage(context, response)
+                _record_judge_usage(context, sequence, response)
+                _require_context_after_response(context)
                 result = parse_judge_response(
                     response,
                     schema,

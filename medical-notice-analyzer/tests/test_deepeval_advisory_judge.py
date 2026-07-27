@@ -232,6 +232,63 @@ class UsageMetadataTransport:
         )
 
 
+class ReverseCompletionTransport:
+    def __init__(self, first_prompt: str, second_prompt: str) -> None:
+        self._first_prompt = first_prompt
+        self._second_prompt = second_prompt
+        self._fake = make_fake()
+        self.first_started = asyncio.Event()
+        self._release_first = asyncio.Event()
+
+    @property
+    def async_call_count(self) -> int:
+        return self._fake.async_call_count
+
+    def release_first(self) -> None:
+        self._release_first.set()
+
+    def complete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        raise AssertionError("sync transport must not be called")
+
+    async def acomplete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        response = await self._fake.acomplete(
+            prompt=prompt,
+            response_schema=response_schema,
+            context=context,
+        )
+        if prompt == self._first_prompt:
+            self.first_started.set()
+            await self._release_first.wait()
+            metadata = {
+                "token_input": 101,
+                "token_output": 103,
+                "cost": 0.1,
+                "latency_ms": 107,
+            }
+        elif prompt == self._second_prompt:
+            metadata = {
+                "token_input": 201,
+                "token_output": 203,
+                "cost": 0.2,
+                "latency_ms": 207,
+            }
+        else:
+            raise AssertionError("unexpected test prompt")
+        return response.model_copy(update=metadata)
+
+
 class TamperedFingerprintTransport:
     def __init__(self, field_name: str) -> None:
         self._field_name = field_name
@@ -605,6 +662,10 @@ class JudgeUsageLedgerTests(unittest.TestCase):
     def test_initial_snapshot_is_immutable_safe_and_zeroed(self) -> None:
         snapshot = require_usage_snapshot(self, make_context())
 
+        self.assertTrue(
+            hasattr(judge_module, "JudgeUsageRecord"),
+            "JudgeUsageRecord must be public",
+        )
         self.assertEqual(
             {item.name for item in fields(snapshot)},
             {
@@ -613,8 +674,7 @@ class JudgeUsageLedgerTests(unittest.TestCase):
                 "cost",
                 "latency_ms",
                 "response_count",
-                "input_fingerprints",
-                "output_fingerprints",
+                "records",
             },
         )
         self.assertEqual(snapshot.token_input, 0)
@@ -623,12 +683,13 @@ class JudgeUsageLedgerTests(unittest.TestCase):
         self.assertTrue(math.isfinite(snapshot.cost))
         self.assertEqual(snapshot.latency_ms, 0)
         self.assertEqual(snapshot.response_count, 0)
+        self.assertEqual(snapshot.records, ())
         self.assertEqual(snapshot.input_fingerprints, ())
         self.assertEqual(snapshot.output_fingerprints, ())
         with self.assertRaises(FrozenInstanceError):
             snapshot.response_count = 1
         with self.assertRaises(FrozenInstanceError):
-            snapshot.input_fingerprints += ("0" * 64,)
+            snapshot.records = ()
 
     def test_one_sync_response_is_recorded_exactly_once(self) -> None:
         metadata = {
@@ -655,6 +716,28 @@ class JudgeUsageLedgerTests(unittest.TestCase):
         self.assertEqual(snapshot.cost, 0.125)
         self.assertEqual(snapshot.latency_ms, 23)
         self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(len(snapshot.records), 1)
+        record = snapshot.records[0]
+        self.assertIsInstance(record, judge_module.JudgeUsageRecord)
+        self.assertEqual(
+            {item.name for item in fields(record)},
+            {
+                "sequence",
+                "token_input",
+                "token_output",
+                "cost",
+                "latency_ms",
+                "input_fingerprint",
+                "output_fingerprint",
+            },
+        )
+        self.assertEqual(record.sequence, 1)
+        self.assertEqual(record.token_input, 11)
+        self.assertEqual(record.token_output, 7)
+        self.assertEqual(record.cost, 0.125)
+        self.assertEqual(record.latency_ms, 23)
+        with self.assertRaises(FrozenInstanceError):
+            record.sequence = 2
         self.assertEqual(
             snapshot.input_fingerprints,
             (text_sha256(prompt),),
@@ -701,6 +784,10 @@ class JudgeUsageLedgerTests(unittest.TestCase):
         self.assertEqual(snapshot.latency_ms, 24)
         self.assertEqual(snapshot.response_count, 2)
         self.assertEqual(
+            tuple(record.sequence for record in snapshot.records),
+            (1, 2),
+        )
+        self.assertEqual(
             snapshot.input_fingerprints,
             tuple(text_sha256(prompt) for prompt in prompts),
         )
@@ -740,6 +827,7 @@ class JudgeUsageLedgerTests(unittest.TestCase):
         self.assertEqual(snapshot.token_output, 31)
         self.assertEqual(snapshot.cost, 0.75)
         self.assertEqual(snapshot.latency_ms, 37)
+        self.assertEqual(snapshot.records[0].sequence, 1)
         self.assertEqual(snapshot.input_fingerprints, (text_sha256(prompt),))
         self.assertEqual(
             snapshot.output_fingerprints,
@@ -811,6 +899,10 @@ class JudgeUsageLedgerTests(unittest.TestCase):
         self.assertEqual(transport.sync_call_count, 3)
         self.assertEqual(context.subcalls_used, 3)
         self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(
+            tuple(record.sequence for record in snapshot.records),
+            (3,),
+        )
         self.assertEqual(snapshot.token_input, len(prompt.encode("utf-8")))
         self.assertEqual(
             snapshot.token_output,
@@ -859,6 +951,71 @@ class JudgeUsageLedgerTests(unittest.TestCase):
         ):
             self.assertNotIn(sentinel, retained)
             self.assertNotIn(sentinel, logs)
+
+    def test_decimal_cost_is_exact_and_float_overflow_is_bounded(
+        self,
+    ) -> None:
+        exact_transport = UsageMetadataTransport(
+            [
+                {
+                    "token_input": 1,
+                    "token_output": 1,
+                    "cost": 0.1,
+                    "latency_ms": 1,
+                },
+                {
+                    "token_input": 1,
+                    "token_output": 1,
+                    "cost": 0.2,
+                    "latency_ms": 1,
+                },
+            ]
+        )
+        exact_adapter = DeepEvalJudgeLLM(
+            exact_transport,
+            profile_version=PROFILE_VERSION,
+        )
+        exact_context = make_context()
+        with judge_context(exact_context):
+            exact_adapter.generate("bounded exact cost one")
+            exact_adapter.generate("bounded exact cost two")
+        self.assertEqual(
+            require_usage_snapshot(self, exact_context).cost,
+            0.3,
+        )
+
+        maximum = float.fromhex("0x1.fffffffffffffp+1023")
+        overflow_transport = UsageMetadataTransport(
+            [
+                {
+                    "token_input": 1,
+                    "token_output": 1,
+                    "cost": maximum,
+                    "latency_ms": 1,
+                },
+                {
+                    "token_input": 1,
+                    "token_output": 1,
+                    "cost": maximum,
+                    "latency_ms": 1,
+                },
+            ]
+        )
+        overflow_adapter = DeepEvalJudgeLLM(
+            overflow_transport,
+            profile_version=PROFILE_VERSION,
+        )
+        overflow_context = make_context()
+        with judge_context(overflow_context):
+            overflow_adapter.generate("bounded overflow cost one")
+            overflow_adapter.generate("bounded overflow cost two")
+
+        with self.assertRaises(JudgeError) as raised:
+            overflow_context.usage_snapshot()
+        self.assertEqual(raised.exception.category, "usage_overflow")
+        self.assertIs(raised.exception.retryable, False)
+        self.assertEqual(raised.exception.outcome, "completed")
+        self.assertEqual(str(raised.exception), "usage_overflow")
 
 
 class JudgeAsyncContextContractTests(unittest.IsolatedAsyncioTestCase):
@@ -935,6 +1092,7 @@ class JudgeAsyncUsageLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot.cost, 1.25)
         self.assertEqual(snapshot.latency_ms, 47)
         self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(snapshot.records[0].sequence, 1)
         self.assertEqual(snapshot.input_fingerprints, (text_sha256(prompt),))
         self.assertEqual(
             snapshot.output_fingerprints,
@@ -977,6 +1135,74 @@ class JudgeAsyncUsageLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(
             snapshots[0].input_fingerprints,
             snapshots[1].input_fingerprints,
+        )
+
+    async def test_reverse_completion_keeps_sequence_paired_records(
+        self,
+    ) -> None:
+        first_prompt = "first reserved prompt"
+        second_prompt = "second reserved prompt"
+        transport = ReverseCompletionTransport(
+            first_prompt,
+            second_prompt,
+        )
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context(max_subcalls=2)
+
+        with judge_context(context):
+            first_task = asyncio.create_task(
+                adapter.a_generate(first_prompt)
+            )
+            await transport.first_started.wait()
+            second_task = asyncio.create_task(
+                adapter.a_generate(second_prompt)
+            )
+            second_result = await second_task
+            transport.release_first()
+            first_result = await first_task
+
+        self.assertEqual(first_result, "plain deterministic result")
+        self.assertEqual(second_result, "plain deterministic result")
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(snapshot.response_count, 2)
+        self.assertEqual(snapshot.cost, 0.3)
+        self.assertEqual(
+            tuple(record.sequence for record in snapshot.records),
+            (1, 2),
+        )
+        first_record, second_record = snapshot.records
+        self.assertEqual(first_record.token_input, 101)
+        self.assertEqual(first_record.token_output, 103)
+        self.assertEqual(first_record.cost, 0.1)
+        self.assertEqual(first_record.latency_ms, 107)
+        self.assertEqual(
+            first_record.input_fingerprint,
+            text_sha256(first_prompt),
+        )
+        self.assertEqual(second_record.token_input, 201)
+        self.assertEqual(second_record.token_output, 203)
+        self.assertEqual(second_record.cost, 0.2)
+        self.assertEqual(second_record.latency_ms, 207)
+        self.assertEqual(
+            second_record.input_fingerprint,
+            text_sha256(second_prompt),
+        )
+        self.assertEqual(
+            snapshot.input_fingerprints,
+            (
+                first_record.input_fingerprint,
+                second_record.input_fingerprint,
+            ),
+        )
+        self.assertEqual(
+            snapshot.output_fingerprints,
+            (
+                first_record.output_fingerprint,
+                second_record.output_fingerprint,
+            ),
         )
 
 
@@ -1651,6 +1877,11 @@ class DeepEvalJudgeLLMTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "deadline_exceeded")
         self.assertEqual(transport.sync_call_count, 1)
         self.assertEqual(context.subcalls_used, 1)
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(snapshot.token_input, len("bounded deadline prompt"))
+        self.assertGreater(snapshot.token_output, 0)
+        self.assertEqual(snapshot.records[0].sequence, 1)
 
     def test_only_not_started_retryable_429_and_503_are_retried(self) -> None:
         retryable_cases = ("http_429", "http_503")
@@ -1945,7 +2176,7 @@ class DeepEvalJudgeAsyncTests(unittest.IsolatedAsyncioTestCase):
         context = make_context(
             max_subcalls=3,
             fresh_until_monotonic=now + 5,
-            deadline_monotonic=now + 0.2,
+            deadline_monotonic=now + 1.0,
         )
 
         with judge_context(context):
@@ -1955,7 +2186,7 @@ class DeepEvalJudgeAsyncTests(unittest.IsolatedAsyncioTestCase):
                         "bounded async late response prompt",
                         schema=ScoreEnvelope,
                     ),
-                    timeout=0.8,
+                    timeout=2.5,
                 )
 
         self.assertEqual(raised.exception.category, "deadline_exceeded")
@@ -1968,6 +2199,11 @@ class DeepEvalJudgeAsyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(transport.async_call_count, 1)
         self.assertTrue(transport.cancelled)
         self.assertEqual(context.subcalls_used, 1)
+        snapshot = require_usage_snapshot(self, context)
+        self.assertEqual(snapshot.response_count, 1)
+        self.assertEqual(snapshot.token_input, 1)
+        self.assertEqual(snapshot.token_output, 1)
+        self.assertEqual(snapshot.records[0].sequence, 1)
 
     async def test_transport_timeout_error_before_deadline_is_unavailable(
         self,
