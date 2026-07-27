@@ -1004,6 +1004,18 @@ class AdvisoryStore:
             lease = self.read_lease(safe_key)
             if lease["owner"] != safe_owner:
                 raise StoreError("lease owner does not match")
+            if lease["request_phase"] == "indeterminate":
+                self._record_indeterminate_attempt(lease)
+                return False
+            if (
+                lease["request_phase"] == "issued"
+                and self._now_datetime()
+                >= _parse_canonical_timestamp(lease["expires_at"])
+            ):
+                self._record_indeterminate_attempt(lease)
+                lease["request_phase"] = "indeterminate"
+                _atomic_write_json(lease_path, lease)
+                return False
             try:
                 info = lease_path.lstat()
                 if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(

@@ -588,6 +588,76 @@ class AdvisoryLeaseTests(unittest.TestCase):
             )
             self.assertEqual(attempts[0].read_bytes(), first_attempt)
 
+    def test_release_expired_issued_lease_preserves_indeterminate_attempt(
+        self,
+    ) -> None:
+        clock = MutableClock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root, clock=clock)
+            self.assertTrue(
+                store.try_acquire_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    ttl_seconds=10,
+                )
+            )
+            store.mark_request_issued(
+                ADVISORY_KEY,
+                "worker-a",
+                "eval_release_12345678",
+                "attempt_release_12345678",
+            )
+            clock.advance(11)
+
+            with self.assertRaises(StoreError):
+                store.heartbeat_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    ttl_seconds=10,
+                )
+            with self.assertRaises(StoreError):
+                store.mark_request_issued(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    "eval_release_12345678",
+                    "attempt_release_12345678",
+                )
+            self.assertEqual(
+                store.read_lease(ADVISORY_KEY)["request_phase"],
+                "issued",
+            )
+
+            self.assertFalse(
+                store.release_lease(ADVISORY_KEY, "worker-a")
+            )
+            lease_path = root / "leases" / f"{ADVISORY_KEY}.json"
+            self.assertTrue(lease_path.is_file())
+            self.assertEqual(
+                store.read_lease(ADVISORY_KEY)["request_phase"],
+                "indeterminate",
+            )
+            attempts = list((root / "attempts").glob("*.json"))
+            self.assertEqual(len(attempts), 1)
+            first_attempt = attempts[0].read_bytes()
+
+            self.assertFalse(
+                store.release_lease(ADVISORY_KEY, "worker-a")
+            )
+            self.assertFalse(
+                store.try_acquire_lease(
+                    ADVISORY_KEY,
+                    "worker-b",
+                    ttl_seconds=10,
+                )
+            )
+            self.assertEqual(
+                list((root / "attempts").glob("*.json")),
+                attempts,
+            )
+            self.assertEqual(attempts[0].read_bytes(), first_attempt)
+            self.assertTrue(lease_path.is_file())
+
     def test_heartbeat_mark_issued_and_release_require_owner_match(self) -> None:
         clock = MutableClock()
         with tempfile.TemporaryDirectory() as directory:
@@ -843,6 +913,28 @@ class AdvisoryCacheTests(unittest.TestCase):
             envelope["result"]["status"] = "partial"
             envelope["result_sha256"] = canonical_sha256(envelope["result"])
             path.write_bytes(canonical_json_bytes(envelope))
+            with self.assertRaises(CacheError):
+                cache.read(ADVISORY_KEY)
+
+    def test_cache_hash_is_checked_against_raw_result_before_coercion(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cache = AdvisoryCache(root)
+            result_value = make_result().model_dump(mode="json")
+            result_value["cost"] = 0.0
+            original = AdvisoryResult.model_validate(result_value)
+            cache.write_completed(ADVISORY_KEY, original)
+            path = root / "cache" / f"{ADVISORY_KEY}.json"
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(envelope["result"]["cost"], 0.0)
+            original_hash = envelope["result_sha256"]
+
+            envelope["result"]["cost"] = 0
+            path.write_bytes(canonical_json_bytes(envelope))
+
+            self.assertEqual(envelope["result_sha256"], original_hash)
             with self.assertRaises(CacheError):
                 cache.read(ADVISORY_KEY)
 

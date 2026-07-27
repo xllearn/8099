@@ -89,12 +89,10 @@ class AdvisoryCache:
             result_value = envelope["result"]
             if not isinstance(result_value, dict):
                 raise CacheError("cache entry is invalid or unavailable")
+            if result_sha256 != canonical_sha256(result_value):
+                raise CacheError("cache entry is invalid or unavailable")
             result = self._completed_result(key, result_value)
             if source_evaluation_id != result.evaluation_id:
-                raise CacheError("cache entry is invalid or unavailable")
-            if result_sha256 != canonical_sha256(
-                result.model_dump(mode="json")
-            ):
                 raise CacheError("cache entry is invalid or unavailable")
             if envelope["created_at"] != result.created_at:
                 raise CacheError("cache entry is invalid or unavailable")
