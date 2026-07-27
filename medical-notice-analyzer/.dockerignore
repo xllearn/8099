@@ -5,7 +5,10 @@
 .cache
 .pytest_cache
 __pycache__
+**/__pycache__
+**/__pycache__/**
 *.pyc
+**/*.pyc
 
 data
 data/**

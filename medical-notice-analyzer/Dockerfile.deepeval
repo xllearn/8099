@@ -29,8 +29,10 @@ COPY app/diagnostics.py ./app/diagnostics.py
 COPY app/schema_migrations.py ./app/schema_migrations.py
 COPY app/report_rules ./app/report_rules
 COPY app/deepeval_advisory ./app/deepeval_advisory
-COPY tests ./tests
+COPY tests/__init__.py ./tests/__init__.py
+COPY tests/test_deepeval_advisory_image_contract.py ./tests/test_deepeval_advisory_image_contract.py
+COPY tests/test_deepeval_advisory_judge.py ./tests/test_deepeval_advisory_judge.py
+COPY tests/test_deepeval_advisory_evaluator.py ./tests/test_deepeval_advisory_evaluator.py
 
 USER 10001:10001
-ENTRYPOINT ["python"]
-CMD ["-m", "unittest", "tests.test_deepeval_advisory_deepeval_contract", "tests.test_deepeval_advisory_judge", "tests.test_deepeval_advisory_evaluator", "-v"]
+CMD ["python", "-m", "unittest", "tests.test_deepeval_advisory_image_contract", "tests.test_deepeval_advisory_judge", "tests.test_deepeval_advisory_evaluator", "-v"]

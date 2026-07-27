@@ -100,10 +100,6 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
         self.assertIn(WORKER_REQUIRED_MESSAGE, output)
         self.assertNotIn("OK (skipped=1)", output)
 
-    @unittest.skipUnless(
-        DOCKERFILE_PATH.is_file(),
-        "source-only Worker Dockerfile is not copied into the final image",
-    )
     def test_worker_base_image_is_digest_pinned_with_provenance(self) -> None:
         dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
 
@@ -120,11 +116,6 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
             dockerfile,
         )
 
-    @unittest.skipUnless(
-        MAIN_REQUIREMENTS_PATH.is_file()
-        and WORKER_REQUIREMENTS_INPUT_PATH.is_file(),
-        "source-only requirement inputs are not copied into the final image",
-    )
     def test_main_requirements_do_not_contain_deepeval(self) -> None:
         main = MAIN_REQUIREMENTS_PATH.read_text(
             encoding="utf-8"
@@ -143,20 +134,39 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
             ("deepeval==4.1.3",),
         )
 
-    @unittest.skipUnless(
-        DOCKERFILE_PATH.is_file(),
-        "source-only Worker Dockerfile is not copied into the final image",
-    )
     def test_worker_dockerfile_is_final_isolated_test_runner(self) -> None:
         dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
 
-        self.assertIn(
-            "COPY requirements-deepeval.lock "
-            "/opt/advisory/requirements-deepeval.lock",
-            dockerfile,
+        copy_lines = tuple(
+            line.strip()
+            for line in dockerfile.splitlines()
+            if line.strip().startswith("COPY ")
+        )
+        self.assertEqual(
+            copy_lines,
+            (
+                "COPY requirements-deepeval.lock "
+                "/opt/advisory/requirements-deepeval.lock",
+                "COPY app/__init__.py ./app/__init__.py",
+                "COPY app/evidence_schema.py ./app/evidence_schema.py",
+                "COPY app/evidence_index.py ./app/evidence_index.py",
+                "COPY app/formal_body.py ./app/formal_body.py",
+                "COPY app/diagnostics.py ./app/diagnostics.py",
+                "COPY app/schema_migrations.py ./app/schema_migrations.py",
+                "COPY app/report_rules ./app/report_rules",
+                "COPY app/deepeval_advisory ./app/deepeval_advisory",
+                "COPY tests/__init__.py ./tests/__init__.py",
+                "COPY tests/test_deepeval_advisory_image_contract.py "
+                "./tests/test_deepeval_advisory_image_contract.py",
+                "COPY tests/test_deepeval_advisory_judge.py "
+                "./tests/test_deepeval_advisory_judge.py",
+                "COPY tests/test_deepeval_advisory_evaluator.py "
+                "./tests/test_deepeval_advisory_evaluator.py",
+            ),
         )
         self.assertIn("--require-hashes", dockerfile)
         self.assertNotIn("COPY requirements.txt", dockerfile)
+        self.assertNotIn("COPY tests ./tests", dockerfile)
         self.assertIn("HOME=/state", dockerfile)
         self.assertIn(
             "--home-dir /state --shell /usr/sbin/nologin advisory",
@@ -167,24 +177,15 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("WORKDIR /app", dockerfile)
-        for required_copy in (
-            "COPY app/__init__.py ./app/__init__.py",
-            "COPY app/evidence_schema.py ./app/evidence_schema.py",
-            "COPY app/evidence_index.py ./app/evidence_index.py",
-            "COPY app/formal_body.py ./app/formal_body.py",
-            "COPY app/diagnostics.py ./app/diagnostics.py",
-            "COPY app/schema_migrations.py ./app/schema_migrations.py",
-            "COPY app/report_rules ./app/report_rules",
-            "COPY app/deepeval_advisory ./app/deepeval_advisory",
-            "COPY tests ./tests",
-        ):
-            with self.subTest(copy=required_copy):
-                self.assertIn(required_copy, dockerfile)
         self.assertIn("USER 10001:10001", dockerfile)
-        self.assertIn('ENTRYPOINT ["python"]', dockerfile)
+        self.assertNotIn("ENTRYPOINT", dockerfile)
+        self.assertNotIn(
+            '"tests.test_deepeval_advisory_deepeval_contract"',
+            dockerfile,
+        )
         self.assertIn(
-            'CMD ["-m", "unittest", '
-            '"tests.test_deepeval_advisory_deepeval_contract", '
+            'CMD ["python", "-m", "unittest", '
+            '"tests.test_deepeval_advisory_image_contract", '
             '"tests.test_deepeval_advisory_judge", '
             '"tests.test_deepeval_advisory_evaluator", "-v"]',
             dockerfile,
@@ -193,10 +194,6 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, dockerfile)
 
-    @unittest.skipUnless(
-        DOCKERIGNORE_PATH.is_file(),
-        "source-only .dockerignore is not copied into the final image",
-    )
     def test_dockerignore_excludes_all_env_files_except_safe_example(
         self,
     ) -> None:
@@ -211,10 +208,6 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
             ignore_lines.index("!.env.example"),
         )
 
-    @unittest.skipUnless(
-        DOCKERIGNORE_PATH.is_file(),
-        "source-only .dockerignore is not copied into the final image",
-    )
     def test_dockerignore_excludes_foundation_sensitive_paths(self) -> None:
         ignore_lines = set(
             DOCKERIGNORE_PATH.read_text(
@@ -235,6 +228,9 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
                 "secrets",
                 "secrets/**",
                 "*.docx",
+                "**/__pycache__",
+                "**/__pycache__/**",
+                "**/*.pyc",
             }
             <= ignore_lines
         )
