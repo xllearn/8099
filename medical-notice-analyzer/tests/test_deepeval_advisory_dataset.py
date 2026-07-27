@@ -1,0 +1,717 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from app.deepeval_advisory.datasets import (
+    MAX_DATASET_JSON_BYTES,
+    DatasetCase,
+    DatasetEntry,
+    DatasetError,
+    DatasetManifest,
+    DatasetValidation,
+    GoldenLabel,
+    HumanAdjudication,
+    HumanReview,
+    MetricLabels,
+    Prelabel,
+    iter_jsonl,
+    load_dataset_case,
+    load_dataset_manifest,
+    validate_dataset_tree,
+)
+from app.deepeval_advisory.hashing import canonical_json_bytes, canonical_sha256
+
+
+CASE_REF = "case_" + "1" * 32
+SECOND_CASE_REF = "case_" + "2" * 32
+SOURCE_GROUP_REF = "source_group_" + "3" * 32
+REVIEW_REF = "review_" + "4" * 32
+SECOND_REVIEW_REF = "review_" + "5" * 32
+ADJUDICATION_REF = "adjudication_" + "6" * 32
+REVIEWER_REF = "reviewer_" + "7" * 32
+SAMPLE_REF = "sample_" + "8" * 32
+
+
+def _projection_value() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "8099.deepeval-projection/v1",
+        "projection_version": "claim-ab-v1",
+        "run_ref": "runref_" + "9" * 32,
+        "report_version": 1,
+        "report_sha256": "a" * 64,
+        "units": [
+            {
+                "unit_id": "unit_" + "b" * 16,
+                "kind": "claim",
+                "text": "公告明确采购范围。",
+                "claim_count": 1,
+                "evidence": [
+                    {
+                        "local_id": "e1",
+                        "level": "A",
+                        "kind": "article_text",
+                        "excerpt": "采购范围包括一次性使用耗材。",
+                        "parent_a_ids": [],
+                        "locator": {
+                            "kind": "article",
+                            "ordinal": 1,
+                            "table_index": None,
+                            "row": None,
+                            "column": None,
+                        },
+                    }
+                ],
+                "expected_facts": ["采购范围已明确"],
+                "attachment_expectation": None,
+            }
+        ],
+    }
+    payload["projection_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def _case_value(
+    *,
+    case_ref: str = CASE_REF,
+    source_group_ref: str = SOURCE_GROUP_REF,
+    split: str = "fixed",
+    risk_tier: str = "standard",
+    risk_tags: list[str] | None = None,
+    projection: dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": "8099.deepeval-case/v1",
+        "case_ref": case_ref,
+        "source_group_ref": source_group_ref,
+        "split": split,
+        "risk_tier": risk_tier,
+        "risk_tags": risk_tags or [],
+        "material_identity_sha256": "c" * 64,
+        "source_content_sha256": "d" * 64,
+        "projection": projection or _projection_value(),
+    }
+    payload["case_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def _entry_value(
+    case_bytes: bytes,
+    *,
+    case_ref: str = CASE_REF,
+    source_group_ref: str = SOURCE_GROUP_REF,
+    relative_path: str | None = None,
+    split: str = "fixed",
+    risk_tier: str = "standard",
+) -> dict[str, object]:
+    return {
+        "case_ref": case_ref,
+        "relative_path": (
+            relative_path or f"cases/{case_ref}.json"
+        ),
+        "file_sha256": hashlib.sha256(case_bytes).hexdigest(),
+        "source_group_ref": source_group_ref,
+        "split": split,
+        "risk_tier": risk_tier,
+    }
+
+
+def _manifest_value(
+    entries: list[dict[str, object]],
+    *,
+    dataset_version: str = "fixed10/v1",
+    declared_count: int | None = None,
+    runnable_count: int | None = None,
+    exclusion_count: int = 0,
+) -> dict[str, object]:
+    runnable = len(entries) if runnable_count is None else runnable_count
+    declared = runnable + exclusion_count if declared_count is None else declared_count
+    payload: dict[str, object] = {
+        "schema_version": "8099.deepeval-dataset-manifest/v1",
+        "dataset_id": dataset_version.partition("/")[0],
+        "dataset_version": dataset_version,
+        "projection_version": "claim-ab-v1",
+        "rubric_version": "rubric-v1",
+        "entries": entries,
+        "subsets": {
+            "fixed3": list(
+                dict.fromkeys(entry["case_ref"] for entry in entries[:3])
+            )
+        },
+        "declared_count": declared,
+        "runnable_count": runnable,
+        "exclusion_count": exclusion_count,
+    }
+    payload["manifest_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def _metric_labels() -> dict[str, str]:
+    return {
+        "claim_faithfulness_v1": "consistent",
+        "critical_coverage_v1": "mixed",
+        "attachment_state_consistency_v1": "not_applicable",
+        "answer_relevancy_v1": "inconsistent",
+    }
+
+
+def _write_tree(root: Path) -> tuple[dict[str, object], dict[str, object]]:
+    case_value = _case_value()
+    case_bytes = canonical_json_bytes(case_value)
+    case_path = root / "cases" / f"{CASE_REF}.json"
+    case_path.parent.mkdir(parents=True)
+    case_path.write_bytes(case_bytes)
+    entry_value = _entry_value(case_bytes)
+    manifest_value = _manifest_value([entry_value])
+    (root / "manifest.json").write_bytes(canonical_json_bytes(manifest_value))
+    return case_value, manifest_value
+
+
+class DatasetSchemaTests(unittest.TestCase):
+    def test_dataset_models_are_frozen_and_reject_unknown_fields(self) -> None:
+        value = _case_value()
+        value["raw_run_id"] = "run_private_12345678"
+        with self.assertRaises(ValidationError):
+            DatasetCase.model_validate(value)
+
+        valid = DatasetCase.model_validate(_case_value())
+        with self.assertRaises(ValidationError):
+            valid.case_ref = SECOND_CASE_REF
+
+    def test_dataset_version_is_an_immutable_supported_version(self) -> None:
+        case_bytes = canonical_json_bytes(_case_value())
+        entry = _entry_value(case_bytes)
+        for version in ("fixed10", "v1", "fixed10/latest", "calibration100/v2"):
+            with self.subTest(version=version), self.assertRaises(ValidationError):
+                DatasetManifest.model_validate(
+                    _manifest_value([entry], dataset_version=version)
+                )
+
+        for version in ("fixed10/v1", "calibration100/v1"):
+            with self.subTest(version=version):
+                value = _manifest_value([entry], dataset_version=version)
+                value["manifest_sha256"] = canonical_sha256(
+                    {
+                        key: nested
+                        for key, nested in value.items()
+                        if key != "manifest_sha256"
+                    }
+                )
+                self.assertEqual(
+                    DatasetManifest.model_validate(value).dataset_version,
+                    version,
+                )
+
+    def test_reference_and_hash_formats_are_strict(self) -> None:
+        invalid_cases = (
+            ("case_ref", "case-visible-source-id"),
+            ("source_group_ref", "source_group_ABC"),
+            ("material_identity_sha256", "A" * 64),
+            ("source_content_sha256", "d" * 63),
+            ("case_sha256", "not-a-hash"),
+        )
+        for field, invalid in invalid_cases:
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                value = _case_value()
+                value[field] = invalid
+                DatasetCase.model_validate(value)
+
+        case_bytes = canonical_json_bytes(_case_value())
+        entry = _entry_value(case_bytes)
+        entry["file_sha256"] = "0" * 63
+        with self.assertRaises(ValidationError):
+            DatasetEntry.model_validate(entry)
+
+    def test_metric_labels_are_exact_per_metric_observations(self) -> None:
+        labels = MetricLabels.model_validate(_metric_labels())
+        self.assertEqual(labels.answer_relevancy_v1, "inconsistent")
+
+        invalid_values = (
+            {"pass": True},
+            {"aggregate": "pass"},
+            {"claim_faithfulness_v1": "pass"},
+            {"critical_coverage_v1": "failed"},
+        )
+        for mutation in invalid_values:
+            with self.subTest(mutation=mutation), self.assertRaises(ValidationError):
+                value = _metric_labels()
+                value.update(mutation)
+                MetricLabels.model_validate(value)
+
+        missing = _metric_labels()
+        del missing["answer_relevancy_v1"]
+        with self.assertRaises(ValidationError):
+            MetricLabels.model_validate(missing)
+
+    def test_risk_tags_are_exact_and_nonempty_tags_require_high_risk(self) -> None:
+        allowed = (
+            "date",
+            "amount",
+            "entity",
+            "procurement_scope",
+            "attachment_state",
+            "evidence_c_boundary",
+            "memory_boundary",
+            "unsupported_key_conclusion",
+        )
+        for tag in allowed:
+            with self.subTest(tag=tag):
+                value = _case_value(risk_tier="high", risk_tags=[tag])
+                self.assertEqual(
+                    DatasetCase.model_validate(value).risk_tags,
+                    (tag,),
+                )
+
+        with self.assertRaises(ValidationError):
+            DatasetCase.model_validate(
+                _case_value(risk_tier="standard", risk_tags=["date"])
+            )
+        with self.assertRaises(ValidationError):
+            DatasetCase.model_validate(
+                _case_value(risk_tier="high", risk_tags=["other"])
+            )
+        self.assertEqual(
+            DatasetCase.model_validate(_case_value()).risk_tags,
+            (),
+        )
+
+    def test_case_rejects_projection_hash_mismatch(self) -> None:
+        projection = _projection_value()
+        projection["projection_sha256"] = "0" * 64
+        value = _case_value(projection=projection)
+        value["case_sha256"] = canonical_sha256(
+            {key: nested for key, nested in value.items() if key != "case_sha256"}
+        )
+        with self.assertRaisesRegex(ValidationError, "projection integrity"):
+            DatasetCase.model_validate(value)
+
+    def test_case_rejects_raw_or_unsafe_projection_content_before_hash(self) -> None:
+        unsafe_values = (
+            "run_id=run_private_12345678",
+            "pack_id=pack_private_12345678",
+            "articleid=28296323-private",
+            "menu_code=project_information",
+            "原始编号 28296323-9aa5-4fa0-81c0-36f6c3e18adc",
+            "原始栏目 project_notice",
+            "ｒｕｎ＿ｉｄ＝ｒｕｎ＿ｐｒｉｖａｔｅ＿１２３４５６７８",
+            "附件名为采购文件.pdf",
+            r"来源在 C:\private\report.json",
+            "../private/report.json",
+            "来源为 https://example.com/private",
+            "完整报告 report_markdown 如下",
+            "完整 Evidence Pack evidence_items 如下",
+            "逐步推理：第一步分析原文",
+        )
+        for unsafe in unsafe_values:
+            with self.subTest(unsafe=unsafe), self.assertRaisesRegex(
+                ValidationError,
+                "safety boundary",
+            ):
+                projection = _projection_value()
+                projection["units"][0]["text"] = unsafe
+                # Keep both hashes stale: boundary rejection must win.
+                DatasetCase.model_validate(_case_value(projection=projection))
+
+    def test_case_rejects_evidence_c_and_full_source_payload_fields(self) -> None:
+        projection = _projection_value()
+        projection["units"][0]["evidence"][0]["level"] = "C"
+        with self.assertRaises(ValidationError):
+            DatasetCase.model_validate(_case_value(projection=projection))
+
+        for field in ("report_markdown", "report_ir", "evidence_pack"):
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                value = _case_value()
+                value[field] = (
+                    {"full": "source"}
+                    if field != "report_markdown"
+                    else "full"
+                )
+                DatasetCase.model_validate(value)
+
+    def test_case_hash_is_canonical_and_excludes_its_own_field(self) -> None:
+        value = _case_value()
+        expected = value["case_sha256"]
+        reordered = dict(reversed(list(value.items())))
+        model = DatasetCase.model_validate(reordered)
+        payload = model.model_dump(mode="json")
+        digest = payload.pop("case_sha256")
+        self.assertEqual(digest, expected)
+        self.assertEqual(digest, canonical_sha256(payload))
+
+        changed = copy.deepcopy(value)
+        changed["source_content_sha256"] = "e" * 64
+        with self.assertRaisesRegex(ValidationError, "case integrity"):
+            DatasetCase.model_validate(changed)
+
+    def test_manifest_hash_is_canonical_and_excludes_its_own_field(self) -> None:
+        case_bytes = canonical_json_bytes(_case_value())
+        value = _manifest_value([_entry_value(case_bytes)])
+        expected = value["manifest_sha256"]
+        reordered = dict(reversed(list(value.items())))
+        model = DatasetManifest.model_validate(reordered)
+        payload = model.model_dump(mode="json")
+        digest = payload.pop("manifest_sha256")
+        self.assertEqual(digest, expected)
+        self.assertEqual(digest, canonical_sha256(payload))
+
+        changed = copy.deepcopy(value)
+        changed["rubric_version"] = "rubric-v2"
+        with self.assertRaisesRegex(ValidationError, "manifest integrity"):
+            DatasetManifest.model_validate(changed)
+
+    def test_manifest_rejects_duplicates_paths_and_inconsistent_counts(self) -> None:
+        case_bytes = canonical_json_bytes(_case_value())
+        entry = _entry_value(case_bytes)
+        invalid_paths = (
+            "/absolute/case.json",
+            r"C:\private\case.json",
+            "../case.json",
+            "cases/../case.json",
+            r"cases\case.json",
+            "",
+        )
+        for relative_path in invalid_paths:
+            with self.subTest(relative_path=relative_path), self.assertRaises(
+                ValidationError
+            ):
+                DatasetEntry.model_validate(
+                    {**entry, "relative_path": relative_path}
+                )
+
+        with self.assertRaisesRegex(ValidationError, "duplicate case_ref"):
+            DatasetManifest.model_validate(_manifest_value([entry, entry]))
+        duplicate_path = _entry_value(
+            case_bytes,
+            case_ref=SECOND_CASE_REF,
+            relative_path=str(entry["relative_path"]),
+        )
+        with self.assertRaisesRegex(ValidationError, "duplicate relative_path"):
+            DatasetManifest.model_validate(
+                _manifest_value([entry, duplicate_path])
+            )
+        with self.assertRaises(ValidationError):
+            DatasetManifest.model_validate(
+                _manifest_value(
+                    [entry],
+                    declared_count=2,
+                    runnable_count=1,
+                    exclusion_count=0,
+                )
+            )
+
+    def test_prelabel_reason_is_bounded_conclusion_only_and_safe(self) -> None:
+        base = {
+            "schema_version": "8099.deepeval-prelabel/v1",
+            "case_ref": CASE_REF,
+            "sample_ref": SAMPLE_REF,
+            "agent_id": "agent-a",
+            "input_sha256": "1" * 64,
+            "rubric_sha256": "2" * 64,
+            "prompt_sha256": "3" * 64,
+            "metric_labels": _metric_labels(),
+            "bounded_reason": "关键结论与 A 级证据一致。",
+        }
+        self.assertEqual(
+            Prelabel.model_validate(base).bounded_reason,
+            "关键结论与 A 级证据一致。",
+        )
+        for invalid in (
+            "x" * 501,
+            "第一步逐步推理，然后给出结论",
+            "chain of thought: inspect every token",
+            "结论见 https://example.com/source",
+            r"结论见 C:\private\source.txt",
+            "line one\nline two",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                Prelabel.model_validate({**base, "bounded_reason": invalid})
+
+    def test_human_review_requires_explicit_human_provenance_and_canonical_time(
+        self,
+    ) -> None:
+        base = {
+            "schema_version": "8099.deepeval-human-review/v1",
+            "review_ref": REVIEW_REF,
+            "case_ref": CASE_REF,
+            "sample_ref": SAMPLE_REF,
+            "reviewer_ref": REVIEWER_REF,
+            "review_reason": ["disagreement", "high_risk", "validation"],
+            "metric_labels": _metric_labels(),
+            "bounded_reason": "人工复核后采用混合结论。",
+            "reviewed_at": "2026-07-28T01:02:03.004Z",
+            "provenance": "human_supplied",
+        }
+        review = HumanReview.model_validate(base)
+        self.assertEqual(review.provenance, "human_supplied")
+        self.assertEqual(
+            review.review_reason,
+            ("disagreement", "high_risk", "validation"),
+        )
+
+        for reason in ("agent_disagreement", "validation_split", "other"):
+            with self.subTest(reason=reason), self.assertRaises(ValidationError):
+                HumanReview.model_validate({**base, "review_reason": [reason]})
+        for timestamp in (
+            "2026-07-28T01:02:03Z",
+            "2026-07-28 01:02:03.004Z",
+            "2026-07-28T01:02:03.004+00:00",
+            "2026-02-30T01:02:03.004Z",
+        ):
+            with self.subTest(timestamp=timestamp), self.assertRaises(
+                ValidationError
+            ):
+                HumanReview.model_validate({**base, "reviewed_at": timestamp})
+        with self.assertRaises(ValidationError):
+            HumanReview.model_validate({**base, "provenance": "agent_generated"})
+
+    def test_human_adjudication_and_golden_reference_only_human_records(
+        self,
+    ) -> None:
+        adjudication_value = {
+            "schema_version": "8099.deepeval-human-adjudication/v1",
+            "adjudication_ref": ADJUDICATION_REF,
+            "case_ref": CASE_REF,
+            "sample_ref": SAMPLE_REF,
+            "human_review_refs": [REVIEW_REF, SECOND_REVIEW_REF],
+            "metric_labels": _metric_labels(),
+            "bounded_reason": "人工裁决采用经核对的证据边界。",
+            "adjudicated_at": "2026-07-28T01:02:03.004Z",
+            "provenance": "human_supplied",
+        }
+        adjudication = HumanAdjudication.model_validate(adjudication_value)
+        self.assertEqual(adjudication.provenance, "human_supplied")
+
+        golden_payload: dict[str, object] = {
+            "schema_version": "8099.deepeval-golden/v1",
+            "case_ref": CASE_REF,
+            "sample_ref": SAMPLE_REF,
+            "human_review_refs": [REVIEW_REF, SECOND_REVIEW_REF],
+            "human_adjudication_refs": [ADJUDICATION_REF],
+            "metric_labels": _metric_labels(),
+        }
+        golden_payload["golden_sha256"] = canonical_sha256(golden_payload)
+        golden = GoldenLabel.model_validate(golden_payload)
+        self.assertEqual(golden.human_adjudication_refs, (ADJUDICATION_REF,))
+
+        for forbidden in ("agent_id", "prelabel_ref", "judge_score", "release_pass"):
+            with self.subTest(forbidden=forbidden), self.assertRaises(
+                ValidationError
+            ):
+                GoldenLabel.model_validate({**golden_payload, forbidden: "agent-a"})
+        with self.assertRaises(ValidationError):
+            HumanAdjudication.model_validate(
+                {**adjudication_value, "provenance": "model_generated"}
+            )
+
+    def test_dataset_validation_has_non_gating_semantics(self) -> None:
+        valid = DatasetValidation(
+            valid=True,
+            error_categories=(),
+            checked_entry_count=1,
+        )
+        self.assertFalse(valid.labeling_ready)
+        self.assertIsNone(valid.release_decision)
+        with self.assertRaises(ValidationError):
+            DatasetValidation(
+                valid=True,
+                error_categories=(),
+                checked_entry_count=1,
+                labeling_ready=True,
+            )
+        with self.assertRaises(ValidationError):
+            DatasetValidation(
+                valid=True,
+                error_categories=(),
+                checked_entry_count=1,
+                release_decision="pass",
+            )
+
+    def test_canonical_manifest_and_case_readers_validate_complete_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            case_value, manifest_value = _write_tree(root)
+            manifest = load_dataset_manifest(root / "manifest.json")
+            case = load_dataset_case(root, manifest.entries[0])
+            validation = validate_dataset_tree(root)
+
+        self.assertEqual(
+            manifest.manifest_sha256,
+            manifest_value["manifest_sha256"],
+        )
+        self.assertEqual(case.case_sha256, case_value["case_sha256"])
+        self.assertTrue(validation.valid)
+        self.assertEqual(validation.error_categories, ())
+        self.assertEqual(validation.checked_entry_count, 1)
+        self.assertFalse(validation.labeling_ready)
+        self.assertIsNone(validation.release_decision)
+
+    def test_manifest_reader_rejects_utf8_json_size_and_hash_errors(self) -> None:
+        invalid_payloads = (
+            b"\xff",
+            b"{",
+            canonical_json_bytes({"not": "a manifest"}),
+            b"{" + b" " * MAX_DATASET_JSON_BYTES + b"}",
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "manifest.json"
+            for payload in invalid_payloads:
+                with self.subTest(size=len(payload)):
+                    path.write_bytes(payload)
+                    with self.assertRaises(DatasetError):
+                        load_dataset_manifest(path)
+
+            case_bytes = canonical_json_bytes(_case_value())
+            value = _manifest_value([_entry_value(case_bytes)])
+            value["manifest_sha256"] = "0" * 64
+            path.write_bytes(canonical_json_bytes(value))
+            with self.assertRaisesRegex(DatasetError, "manifest_invalid"):
+                load_dataset_manifest(path)
+
+    def test_case_reader_rejects_file_hash_case_hash_and_metadata_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            case_value, _ = _write_tree(root)
+            case_path = root / "cases" / f"{CASE_REF}.json"
+            case_bytes = case_path.read_bytes()
+            entry = DatasetEntry.model_validate(_entry_value(case_bytes))
+
+            wrong_file = entry.model_copy(update={"file_sha256": "0" * 64})
+            with self.assertRaisesRegex(DatasetError, "file_hash_mismatch"):
+                load_dataset_case(root, wrong_file)
+
+            changed = copy.deepcopy(case_value)
+            changed["source_content_sha256"] = "e" * 64
+            changed_bytes = canonical_json_bytes(changed)
+            case_path.write_bytes(changed_bytes)
+            changed_entry = DatasetEntry.model_validate(
+                _entry_value(changed_bytes)
+            )
+            with self.assertRaisesRegex(DatasetError, "case_invalid"):
+                load_dataset_case(root, changed_entry)
+
+            mismatch = _case_value(source_group_ref="source_group_" + "f" * 32)
+            mismatch_bytes = canonical_json_bytes(mismatch)
+            case_path.write_bytes(mismatch_bytes)
+            mismatch_entry = DatasetEntry.model_validate(
+                _entry_value(mismatch_bytes)
+            )
+            with self.assertRaisesRegex(DatasetError, "entry_metadata_mismatch"):
+                load_dataset_case(root, mismatch_entry)
+
+    def test_loaders_reject_absolute_escape_symlink_and_nonregular_files(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            case_value, _ = _write_tree(root)
+            case_bytes = canonical_json_bytes(case_value)
+            manifest_path = root / "manifest.json"
+
+            manifest_path.unlink()
+            manifest_path.mkdir()
+            with self.assertRaisesRegex(DatasetError, "file_type"):
+                load_dataset_manifest(manifest_path)
+
+            case_path = root / "cases" / f"{CASE_REF}.json"
+            outside = root / "outside.json"
+            outside.write_bytes(case_bytes)
+            case_path.unlink()
+            try:
+                case_path.symlink_to(outside)
+            except (NotImplementedError, OSError):
+                self.skipTest("symlinks are unavailable on this platform")
+            entry = DatasetEntry.model_validate(_entry_value(case_bytes))
+            with self.assertRaisesRegex(DatasetError, "file_type"):
+                load_dataset_case(root, entry)
+
+            linked_dir = root / "linked"
+            linked_dir.symlink_to(outside.parent, target_is_directory=True)
+            nested_entry = DatasetEntry.model_validate(
+                _entry_value(
+                    case_bytes,
+                    relative_path=f"linked/{outside.name}",
+                )
+            )
+            with self.assertRaisesRegex(DatasetError, "path_invalid"):
+                load_dataset_case(root, nested_entry)
+
+    def test_jsonl_validates_each_line_and_rejects_bad_lines_and_symlinks(
+        self,
+    ) -> None:
+        first = {
+            "schema_version": "8099.deepeval-prelabel/v1",
+            "case_ref": CASE_REF,
+            "sample_ref": SAMPLE_REF,
+            "agent_id": "agent-a",
+            "input_sha256": "1" * 64,
+            "rubric_sha256": "2" * 64,
+            "prompt_sha256": "3" * 64,
+            "metric_labels": _metric_labels(),
+            "bounded_reason": "结论一。",
+        }
+        second = {**first, "case_ref": SECOND_CASE_REF}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = root / "labels.jsonl"
+            path.write_bytes(
+                canonical_json_bytes(first)
+                + b"\n"
+                + canonical_json_bytes(second)
+                + b"\n"
+            )
+            labels = tuple(iter_jsonl(path, Prelabel))
+            self.assertEqual(
+                tuple(label.case_ref for label in labels),
+                (CASE_REF, SECOND_CASE_REF),
+            )
+
+            path.write_bytes(canonical_json_bytes(first) + b"\n{}\n")
+            with self.assertRaisesRegex(DatasetError, "jsonl_model_invalid"):
+                tuple(iter_jsonl(path, Prelabel))
+            path.write_bytes(canonical_json_bytes(first) + b"\n\n")
+            with self.assertRaisesRegex(DatasetError, "jsonl_invalid"):
+                tuple(iter_jsonl(path, Prelabel))
+            path.write_bytes(b"\xff\n")
+            with self.assertRaisesRegex(DatasetError, "json_invalid"):
+                tuple(iter_jsonl(path, Prelabel))
+
+            target = root / "target.jsonl"
+            target.write_bytes(canonical_json_bytes(first) + b"\n")
+            path.unlink()
+            try:
+                path.symlink_to(target)
+            except (NotImplementedError, OSError):
+                self.skipTest("symlinks are unavailable on this platform")
+            with self.assertRaisesRegex(DatasetError, "file_type"):
+                tuple(iter_jsonl(path, Prelabel))
+
+    def test_validate_tree_returns_deterministic_integrity_categories_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_tree(root)
+            case_path = root / "cases" / f"{CASE_REF}.json"
+            case_path.write_bytes(case_path.read_bytes() + b" ")
+
+            first = validate_dataset_tree(root)
+            second = validate_dataset_tree(root)
+
+        self.assertFalse(first.valid)
+        self.assertEqual(first, second)
+        self.assertEqual(first.error_categories, ("file_hash_mismatch",))
+        self.assertFalse(first.labeling_ready)
+        self.assertIsNone(first.release_decision)
+
+
+if __name__ == "__main__":
+    unittest.main()
