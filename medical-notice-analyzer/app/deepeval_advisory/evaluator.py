@@ -119,19 +119,25 @@ class _UsageLedger:
         self.accepted_response_count = 0
         self._records: list[dict[str, Any]] = []
 
-    def note_snapshot(
+    def note_context(
         self,
         *,
         context: JudgeCallContext,
         unit_ordinal: int,
-        snapshot: JudgeUsageSnapshot,
     ) -> None:
+        if not isinstance(context, JudgeCallContext):
+            raise _MetricEvaluationError("usage context is invalid")
+        snapshot = context.usage_snapshot()
+        subcalls_used = context.subcalls_used
         if (
             not isinstance(snapshot, JudgeUsageSnapshot)
             or type(snapshot.response_count) is not int
             or snapshot.response_count < 0
             or type(snapshot.records) is not tuple
             or snapshot.response_count != len(snapshot.records)
+            or type(subcalls_used) is not int
+            or subcalls_used < 0
+            or snapshot.response_count > subcalls_used
         ):
             raise _MetricEvaluationError("usage ledger is invalid")
 
@@ -179,6 +185,7 @@ class _UsageLedger:
                 or type(record.sequence) is not int
                 or record.sequence < 1
                 or record.sequence <= previous_sequence
+                or record.sequence > subcalls_used
                 or type(record.cost) is not float
                 or type(record.input_fingerprint) is not str
                 or type(record.output_fingerprint) is not str
@@ -723,11 +730,9 @@ async def evaluate_projection(
                     remaining_subcalls - context.subcalls_used,
                 )
                 try:
-                    snapshot = context.usage_snapshot()
-                    ledger.note_snapshot(
+                    ledger.note_context(
                         context=context,
                         unit_ordinal=unit_ordinal,
-                        snapshot=snapshot,
                     )
                 except JudgeError as error:
                     ledger.note_snapshot_failure(error)

@@ -357,6 +357,34 @@ def observations_by_id(result: object) -> dict[str, object]:
     }
 
 
+def make_ledger_context() -> JudgeCallContext:
+    now = evaluator_module.time.monotonic()
+    return JudgeCallContext(
+        request_id="req_atomic_12345678",
+        evaluation_id="eval_atomic_12345678",
+        run_ref=RUN_REF,
+        metric_id=METRIC_IDS[0],
+        metric_version="1",
+        projection_sha256=PROJECTION_SHA256,
+        max_subcalls=4,
+        fresh_until_monotonic=now + 30.0,
+        deadline_monotonic=now + 60.0,
+    )
+
+
+def make_usage_response() -> JudgeResponse:
+    return JudgeResponse(
+        text='{"score":1.0}',
+        resolved_model_version=PROFILE_VERSION,
+        token_input=2,
+        token_output=3,
+        cost=0.1,
+        latency_ms=4,
+        input_fingerprint="d" * 64,
+        output_fingerprint="e" * 64,
+    )
+
+
 class AdvisoryEvaluatorDefinitionTests(unittest.TestCase):
     def test_fixed_metric_and_contract_versions_and_hash_are_exact(
         self,
@@ -664,6 +692,28 @@ class AdvisoryEvaluatorDefinitionTests(unittest.TestCase):
             "scheduled_evaluate_projection",
             async_implementations,
         )
+
+    def test_usage_ingestion_api_is_bound_to_its_judge_context(
+        self,
+    ) -> None:
+        self.assertFalse(
+            hasattr(evaluator_module._UsageLedger, "note_snapshot")
+        )
+        note_context = getattr(
+            evaluator_module._UsageLedger,
+            "note_context",
+            None,
+        )
+        self.assertIsNotNone(note_context)
+        self.assertEqual(
+            tuple(inspect.signature(note_context).parameters),
+            ("self", "context", "unit_ordinal"),
+        )
+
+        source = inspect.getsource(evaluate_projection)
+        self.assertIn("ledger.note_context(", source)
+        self.assertNotIn("context.usage_snapshot()", source)
+        self.assertNotIn("ledger.note_snapshot(", source)
 
 
 class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
@@ -1431,21 +1481,98 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Evaluate the bounded advisory unit.", serialized)
         self.assertNotIn('{"score":1.0}', serialized)
 
+    def test_context_bound_usage_rejects_unreserved_response_atomically(
+        self,
+    ) -> None:
+        self.assertTrue(
+            hasattr(evaluator_module._UsageLedger, "note_context")
+        )
+        context = make_ledger_context()
+        context._budget.record_response(1, make_usage_response())
+        self.assertEqual(context.subcalls_used, 0)
+        self.assertEqual(context.usage_snapshot().response_count, 1)
+
+        ledger = evaluator_module._UsageLedger()
+        empty_fingerprints = ledger.fingerprints()
+        with self.assertRaises(evaluator_module._MetricEvaluationError):
+            ledger.note_context(
+                context=context,
+                unit_ordinal=1,
+            )
+
+        self.assertEqual(ledger.accepted_response_count, 0)
+        self.assertEqual(ledger.token_input, 0)
+        self.assertEqual(ledger.token_output, 0)
+        self.assertEqual(ledger.cost, 0)
+        self.assertEqual(ledger.latency_ms, 0)
+        self.assertEqual(ledger.fingerprints(), empty_fingerprints)
+
+    def test_context_bound_usage_rejects_sequence_beyond_used_atomically(
+        self,
+    ) -> None:
+        self.assertTrue(
+            hasattr(evaluator_module._UsageLedger, "note_context")
+        )
+        context = make_ledger_context()
+        self.assertEqual(context._consume_subcall(), 1)
+        context._budget.record_response(2, make_usage_response())
+        self.assertEqual(context.subcalls_used, 1)
+        self.assertEqual(
+            context.usage_snapshot().records[0].sequence,
+            2,
+        )
+
+        ledger = evaluator_module._UsageLedger()
+        empty_fingerprints = ledger.fingerprints()
+        with self.assertRaises(evaluator_module._MetricEvaluationError):
+            ledger.note_context(
+                context=context,
+                unit_ordinal=1,
+            )
+
+        self.assertEqual(ledger.accepted_response_count, 0)
+        self.assertEqual(ledger.token_input, 0)
+        self.assertEqual(ledger.token_output, 0)
+        self.assertEqual(ledger.cost, 0)
+        self.assertEqual(ledger.latency_ms, 0)
+        self.assertEqual(ledger.fingerprints(), empty_fingerprints)
+
+    def test_context_bound_usage_allows_failed_attempt_sequence_gap(
+        self,
+    ) -> None:
+        self.assertTrue(
+            hasattr(evaluator_module._UsageLedger, "note_context")
+        )
+        context = make_ledger_context()
+        self.assertEqual(context._consume_subcall(), 1)
+        self.assertEqual(context._consume_subcall(), 2)
+        context._budget.record_response(2, make_usage_response())
+        self.assertEqual(context.subcalls_used, 2)
+
+        ledger = evaluator_module._UsageLedger()
+        ledger.note_context(
+            context=context,
+            unit_ordinal=1,
+        )
+
+        self.assertEqual(ledger.accepted_response_count, 1)
+        self.assertEqual(ledger.token_input, 2)
+        self.assertEqual(ledger.token_output, 3)
+        self.assertEqual(ledger.cost_float(), 0.1)
+        self.assertEqual(ledger.latency_ms, 4)
+
     def test_malformed_usage_snapshot_rejection_is_atomic(
         self,
     ) -> None:
-        now = evaluator_module.time.monotonic()
-        context = JudgeCallContext(
-            request_id="req_atomic_12345678",
-            evaluation_id="eval_atomic_12345678",
-            run_ref=RUN_REF,
-            metric_id=METRIC_IDS[0],
-            metric_version="1",
-            projection_sha256=PROJECTION_SHA256,
-            max_subcalls=4,
-            fresh_until_monotonic=now + 30.0,
-            deadline_monotonic=now + 60.0,
+        self.assertTrue(
+            hasattr(evaluator_module._UsageLedger, "note_context")
         )
+        context = make_ledger_context()
+        for expected_sequence in range(1, 5):
+            self.assertEqual(
+                context._consume_subcall(),
+                expected_sequence,
+            )
         valid_record = JudgeUsageRecord(
             sequence=1,
             token_input=2,
@@ -1512,13 +1639,19 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
         for name, snapshot in malformed_snapshots.items():
             with self.subTest(name=name):
                 ledger = evaluator_module._UsageLedger()
-                with self.assertRaises(
-                    evaluator_module._MetricEvaluationError
+                with (
+                    patch.object(
+                        JudgeCallContext,
+                        "usage_snapshot",
+                        return_value=snapshot,
+                    ),
+                    self.assertRaises(
+                        evaluator_module._MetricEvaluationError
+                    ),
                 ):
-                    ledger.note_snapshot(
+                    ledger.note_context(
                         context=context,
                         unit_ordinal=1,
-                        snapshot=snapshot,
                     )
 
                 self.assertEqual(ledger.accepted_response_count, 0)
