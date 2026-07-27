@@ -10,6 +10,10 @@ CONTRACT_PATTERN = "test_deepeval_advisory_deepeval_contract.py"
 CONTRACT_REQUIRED_ENV = "DEEPEVAL_ADVISORY_CONTRACT_REQUIRED"
 DOCKERFILE_PATH = PROJECT_ROOT / "Dockerfile.deepeval"
 DOCKERIGNORE_PATH = PROJECT_ROOT / ".dockerignore"
+MAIN_REQUIREMENTS_PATH = PROJECT_ROOT / "requirements.txt"
+WORKER_REQUIREMENTS_INPUT_PATH = (
+    PROJECT_ROOT / "requirements-deepeval.in"
+)
 MAIN_SERVICE_SKIP_MESSAGE = (
     "DeepEval is intentionally absent from the main service"
 )
@@ -96,6 +100,10 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
         self.assertIn(WORKER_REQUIRED_MESSAGE, output)
         self.assertNotIn("OK (skipped=1)", output)
 
+    @unittest.skipUnless(
+        DOCKERFILE_PATH.is_file(),
+        "source-only Worker Dockerfile is not copied into the final image",
+    )
     def test_worker_base_image_is_digest_pinned_with_provenance(self) -> None:
         dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
 
@@ -112,6 +120,83 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
             dockerfile,
         )
 
+    @unittest.skipUnless(
+        MAIN_REQUIREMENTS_PATH.is_file()
+        and WORKER_REQUIREMENTS_INPUT_PATH.is_file(),
+        "source-only requirement inputs are not copied into the final image",
+    )
+    def test_main_requirements_do_not_contain_deepeval(self) -> None:
+        main = MAIN_REQUIREMENTS_PATH.read_text(
+            encoding="utf-8"
+        ).lower()
+        worker_lines = WORKER_REQUIREMENTS_INPUT_PATH.read_text(
+            encoding="utf-8"
+        ).lower().splitlines()
+
+        self.assertNotIn("deepeval", main)
+        self.assertEqual(
+            tuple(
+                line.strip()
+                for line in worker_lines
+                if line.strip().startswith("deepeval")
+            ),
+            ("deepeval==4.1.3",),
+        )
+
+    @unittest.skipUnless(
+        DOCKERFILE_PATH.is_file(),
+        "source-only Worker Dockerfile is not copied into the final image",
+    )
+    def test_worker_dockerfile_is_final_isolated_test_runner(self) -> None:
+        dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+        self.assertIn(
+            "COPY requirements-deepeval.lock "
+            "/opt/advisory/requirements-deepeval.lock",
+            dockerfile,
+        )
+        self.assertIn("--require-hashes", dockerfile)
+        self.assertNotIn("COPY requirements.txt", dockerfile)
+        self.assertIn("HOME=/state", dockerfile)
+        self.assertIn(
+            "--home-dir /state --shell /usr/sbin/nologin advisory",
+            dockerfile,
+        )
+        self.assertIn(
+            "install -d -m 0700 -o 10001 -g 10001 /state",
+            dockerfile,
+        )
+        self.assertIn("WORKDIR /app", dockerfile)
+        for required_copy in (
+            "COPY app/__init__.py ./app/__init__.py",
+            "COPY app/evidence_schema.py ./app/evidence_schema.py",
+            "COPY app/evidence_index.py ./app/evidence_index.py",
+            "COPY app/formal_body.py ./app/formal_body.py",
+            "COPY app/diagnostics.py ./app/diagnostics.py",
+            "COPY app/schema_migrations.py ./app/schema_migrations.py",
+            "COPY app/report_rules ./app/report_rules",
+            "COPY app/deepeval_advisory ./app/deepeval_advisory",
+            "COPY tests ./tests",
+        ):
+            with self.subTest(copy=required_copy):
+                self.assertIn(required_copy, dockerfile)
+        self.assertIn("USER 10001:10001", dockerfile)
+        self.assertIn('ENTRYPOINT ["python"]', dockerfile)
+        self.assertIn(
+            'CMD ["-m", "unittest", '
+            '"tests.test_deepeval_advisory_deepeval_contract", '
+            '"tests.test_deepeval_advisory_judge", '
+            '"tests.test_deepeval_advisory_evaluator", "-v"]',
+            dockerfile,
+        )
+        for forbidden in ("8099", "uvicorn", "app.main"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, dockerfile)
+
+    @unittest.skipUnless(
+        DOCKERIGNORE_PATH.is_file(),
+        "source-only .dockerignore is not copied into the final image",
+    )
     def test_dockerignore_excludes_all_env_files_except_safe_example(
         self,
     ) -> None:
@@ -124,6 +209,34 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
         self.assertLess(
             ignore_lines.index(".env*"),
             ignore_lines.index("!.env.example"),
+        )
+
+    @unittest.skipUnless(
+        DOCKERIGNORE_PATH.is_file(),
+        "source-only .dockerignore is not copied into the final image",
+    )
+    def test_dockerignore_excludes_foundation_sensitive_paths(self) -> None:
+        ignore_lines = set(
+            DOCKERIGNORE_PATH.read_text(
+                encoding="utf-8"
+            ).splitlines()
+        )
+
+        self.assertTrue(
+            {
+                "data",
+                "data/**",
+                "reports",
+                "reports/**",
+                "site-cache",
+                "deepeval-advisory-data",
+                "artifacts",
+                "artifacts/**",
+                "secrets",
+                "secrets/**",
+                "*.docx",
+            }
+            <= ignore_lines
         )
 
     def test_deepeval_version_is_exactly_4_1_3(self) -> None:

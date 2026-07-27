@@ -19,6 +19,18 @@ COPY requirements-deepeval.lock /opt/advisory/requirements-deepeval.lock
 RUN python -m pip install --no-cache-dir --require-hashes \
         --requirement /opt/advisory/requirements-deepeval.lock
 
-WORKDIR /work
+WORKDIR /app
+
+COPY app/__init__.py ./app/__init__.py
+COPY app/evidence_schema.py ./app/evidence_schema.py
+COPY app/evidence_index.py ./app/evidence_index.py
+COPY app/formal_body.py ./app/formal_body.py
+COPY app/diagnostics.py ./app/diagnostics.py
+COPY app/schema_migrations.py ./app/schema_migrations.py
+COPY app/report_rules ./app/report_rules
+COPY app/deepeval_advisory ./app/deepeval_advisory
+COPY tests ./tests
+
 USER 10001:10001
 ENTRYPOINT ["python"]
+CMD ["-m", "unittest", "tests.test_deepeval_advisory_deepeval_contract", "tests.test_deepeval_advisory_judge", "tests.test_deepeval_advisory_evaluator", "-v"]
