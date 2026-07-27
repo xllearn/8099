@@ -64,6 +64,35 @@ class AdvisoryHashingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             canonical_sha256({"score": float("nan")})
 
+    def test_canonical_json_rejects_non_string_keys_recursively(self) -> None:
+        invalid_values = (
+            {1: "integer key"},
+            {"outer": [{"valid": "value"}, {1: "nested integer key"}]},
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                canonical_json_bytes(value)
+
+        self.assertEqual(
+            canonical_json_bytes({"1": "string key"}),
+            b'{"1":"string key"}',
+        )
+
+    def test_canonical_json_rejects_non_json_container_values(self) -> None:
+        invalid_values = (
+            {"payload": b"not-json"},
+            {"payload": {"not", "json"}},
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises(TypeError):
+                canonical_json_bytes(value)
+
+    def test_canonical_json_keeps_tuples_as_json_arrays(self) -> None:
+        self.assertEqual(
+            canonical_json_bytes({"items": ("a", 1, {"ok": True})}),
+            b'{"items":["a",1,{"ok":true}]}',
+        )
+
     def test_text_hash_normalizes_crlf_and_cr_to_lf(self) -> None:
         expected = hashlib.sha256(
             "第一行\n第二行\n第三行\n".encode("utf-8")
@@ -167,6 +196,44 @@ class AdvisoryHashingTests(unittest.TestCase):
             ):
                 assert_safe_outbound_text(value)
 
+    def test_guard_rejects_named_secret_and_token_indicators(self) -> None:
+        blocked = (
+            "access_token=syntheticAccessToken123",
+            "refresh-token: syntheticRefreshToken123",
+            "client secret = syntheticClientSecret123",
+            "secret_key=syntheticSecretKey123",
+            "private-key: syntheticPrivateKey123",
+            "token=syntheticTokenValue123",
+            '"service_token": "syntheticServiceToken123"',
+            "credential: syntheticCredential123",
+        )
+        for value in blocked:
+            with self.subTest(value=value), self.assertRaises(
+                BoundaryViolation
+            ):
+                assert_safe_outbound_text(value)
+
+    def test_guard_rejects_pem_jwt_and_provider_token_forms(self) -> None:
+        blocked = (
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            (
+                "eyJhbGciOiJIUzI1NiJ9."
+                "eyJzdWIiOiJzeW50aGV0aWMifQ."
+                "c3ludGhldGljX3NpZ25hdHVyZQ"
+            ),
+            "sk-synthetic1234567890",
+            "ghp_synthetic1234567890",
+            "github_pat_synthetic1234567890",
+            "xoxb-synthetic-1234567890",
+            "xoxp-synthetic-1234567890",
+        )
+        for value in blocked:
+            with self.subTest(value=value), self.assertRaises(
+                BoundaryViolation
+            ):
+                assert_safe_outbound_text(value)
+
     def test_guard_rejects_bearer_tokens(self) -> None:
         with self.assertRaises(BoundaryViolation):
             assert_safe_outbound_text("Bearer abc.DEF-123_+/~")
@@ -181,8 +248,36 @@ class AdvisoryHashingTests(unittest.TestCase):
             ):
                 assert_safe_outbound_text(value)
 
+    def test_guard_rejects_windows_unc_device_and_extended_paths(self) -> None:
+        blocked = (
+            r"\\server\share\report.json",
+            r"\\?\C:\private\report.json",
+            r"\\.\PIPE\advisory",
+        )
+        for value in blocked:
+            with self.subTest(value=value), self.assertRaises(
+                BoundaryViolation
+            ):
+                assert_safe_outbound_text(value)
+
     def test_guard_rejects_sensitive_absolute_unix_paths(self) -> None:
-        for root in ("app", "opt", "var", "home", "root", "data"):
+        for root in (
+            "app",
+            "opt",
+            "var",
+            "home",
+            "root",
+            "data",
+            "etc",
+            "usr",
+            "srv",
+            "mnt",
+            "tmp",
+            "run",
+            "proc",
+            "sys",
+            "dev",
+        ):
             value = f"source=/{root}/private/report.json"
             with self.subTest(root=root), self.assertRaises(
                 BoundaryViolation
@@ -208,6 +303,33 @@ class AdvisoryHashingTests(unittest.TestCase):
             ):
                 assert_safe_outbound_text(value)
 
+    def test_guard_rejects_legacy_non_global_numeric_ipv4_hosts(self) -> None:
+        blocked = (
+            "http://127.1/admin",
+            "http://0177.0.0.1/admin",
+            "http://0x7f.0.0.1/admin",
+            "http://2130706433/admin",
+        )
+        for value in blocked:
+            with self.subTest(value=value), self.assertRaises(
+                BoundaryViolation
+            ):
+                assert_safe_outbound_text(value)
+
+    def test_guard_rejects_non_global_ipv6_and_dotted_localhost(self) -> None:
+        blocked = (
+            "http://localhost./admin",
+            "http://[::1]/admin",
+            "http://[::]/admin",
+            "http://[fc00::1]/admin",
+            "http://[fe80::1]/admin",
+        )
+        for value in blocked:
+            with self.subTest(value=value), self.assertRaises(
+                BoundaryViolation
+            ):
+                assert_safe_outbound_text(value)
+
     def test_guard_allows_benign_chinese_text_and_public_urls(self) -> None:
         allowed = (
             "本报告依据采购公告及附件形成，服务期为两年。",
@@ -219,6 +341,7 @@ class AdvisoryHashingTests(unittest.TestCase):
             "Public address: http://11.0.0.1/report",
             "Public address: http://192.167.1.1/report",
             "Public address: http://128.0.0.1/report",
+            "Public resolver: https://8.8.8.8/dns-query",
         )
         for value in allowed:
             with self.subTest(value=value):
@@ -227,6 +350,20 @@ class AdvisoryHashingTests(unittest.TestCase):
     def test_boundary_exception_is_generic_and_does_not_echo_text(self) -> None:
         secret = "UNIQUE_SECRET_VALUE_7f1d"
         offending = f"Authorization: Bearer {secret}"
+
+        with self.assertRaises(BoundaryViolation) as raised:
+            assert_safe_outbound_text(offending)
+
+        self.assertEqual(
+            str(raised.exception),
+            "outbound text violates the safety boundary",
+        )
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn(offending, str(raised.exception))
+
+    def test_new_secret_classes_are_not_echoed_in_exceptions(self) -> None:
+        secret = "UNIQUE_ACCESS_TOKEN_VALUE_8e2c"
+        offending = f"access_token={secret}"
 
         with self.assertRaises(BoundaryViolation) as raised:
             assert_safe_outbound_text(offending)
