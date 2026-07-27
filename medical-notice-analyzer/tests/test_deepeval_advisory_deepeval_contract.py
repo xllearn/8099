@@ -1,10 +1,29 @@
 import inspect
+import os
 import unittest
 
-import deepeval
-from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
-from deepeval.models import DeepEvalBaseLLM
-from deepeval.test_case import LLMTestCase, SingleTurnParams
+CONTRACT_REQUIRED_ENV = "DEEPEVAL_ADVISORY_CONTRACT_REQUIRED"
+
+try:
+    import deepeval
+    from deepeval.metrics import (
+        AnswerRelevancyMetric,
+        FaithfulnessMetric,
+        GEval,
+    )
+    from deepeval.models import DeepEvalBaseLLM
+    from deepeval.test_case import LLMTestCase, SingleTurnParams
+except ModuleNotFoundError as error:
+    if error.name != "deepeval":
+        raise
+    if os.environ.get(CONTRACT_REQUIRED_ENV) == "1":
+        raise RuntimeError(
+            "DeepEval advisory Worker contract requires deepeval==4.1.3"
+        ) from error
+    raise unittest.SkipTest(
+        "DeepEval is intentionally absent from the main service; "
+        f"set {CONTRACT_REQUIRED_ENV}=1 for the advisory Worker contract"
+    )
 
 
 class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
@@ -21,48 +40,67 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
                 self.assertTrue(callable(helper))
                 parameters = inspect.signature(helper).parameters
                 self.assertIn("schema", parameters)
+                schema_parameter = parameters["schema"]
+                self.assertEqual(
+                    schema_parameter.kind,
+                    inspect.Parameter.KEYWORD_ONLY,
+                )
+                self.assertIsNone(schema_parameter.default)
 
     def test_advisory_metric_constructors_keep_required_parameters(self) -> None:
-        expected_parameters = {
+        expected_parameters_and_defaults = {
             AnswerRelevancyMetric: {
-                "threshold",
-                "model",
-                "include_reason",
-                "async_mode",
-                "strict_mode",
-                "verbose_mode",
+                "threshold": 0.5,
+                "model": None,
+                "include_reason": True,
+                "async_mode": True,
+                "strict_mode": False,
+                "verbose_mode": False,
             },
             FaithfulnessMetric: {
-                "threshold",
-                "model",
-                "include_reason",
-                "async_mode",
-                "strict_mode",
-                "verbose_mode",
+                "threshold": 0.5,
+                "model": None,
+                "include_reason": True,
+                "async_mode": True,
+                "strict_mode": False,
+                "verbose_mode": False,
             },
             GEval: {
-                "name",
-                "evaluation_params",
-                "criteria",
-                "evaluation_steps",
-                "rubric",
-                "threshold",
-                "model",
-                "async_mode",
-                "strict_mode",
-                "verbose_mode",
+                "name": inspect.Parameter.empty,
+                "evaluation_params": None,
+                "criteria": None,
+                "evaluation_steps": None,
+                "rubric": None,
+                "threshold": 0.5,
+                "model": None,
+                "async_mode": True,
+                "strict_mode": False,
+                "verbose_mode": False,
             },
         }
 
-        for metric_class, required_parameters in expected_parameters.items():
+        for (
+            metric_class,
+            expected_parameters,
+        ) in expected_parameters_and_defaults.items():
             with self.subTest(metric=metric_class.__name__):
-                actual_parameters = set(
-                    inspect.signature(metric_class).parameters
-                )
-                self.assertTrue(
-                    required_parameters <= actual_parameters,
-                    required_parameters - actual_parameters,
-                )
+                actual_parameters = inspect.signature(
+                    metric_class
+                ).parameters
+                for parameter_name, expected_default in (
+                    expected_parameters.items()
+                ):
+                    with self.subTest(parameter=parameter_name):
+                        self.assertIn(parameter_name, actual_parameters)
+                        parameter = actual_parameters[parameter_name]
+                        self.assertEqual(
+                            parameter.kind,
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        )
+                        self.assertEqual(
+                            parameter.default,
+                            expected_default,
+                        )
 
     def test_llm_test_case_supports_advisory_fields(self) -> None:
         test_case = LLMTestCase(
