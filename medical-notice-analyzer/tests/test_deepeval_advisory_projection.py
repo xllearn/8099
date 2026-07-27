@@ -4,7 +4,10 @@ import copy
 import hashlib
 import hmac
 import inspect
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from app.deepeval_advisory.hashing import (
     BoundaryViolation,
@@ -15,6 +18,14 @@ from app.deepeval_advisory.hashing import (
     hmac_reference,
     text_sha256,
 )
+from app.deepeval_advisory.projection import (
+    ProjectionError,
+    build_projection,
+    build_projection_from_values,
+    build_run_snapshot_from_value,
+    load_run_snapshot,
+)
+from app.evidence_schema import create_evidence_item, text_source_hash
 
 
 ADVISORY_INPUT = {
@@ -30,6 +41,31 @@ ADVISORY_INPUT = {
     "safety_preamble_version": "safety-v1",
     "locale": "zh-CN",
 }
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "deepeval_advisory" / "unit"
+HMAC_KEY = b"h" * 32
+
+
+def _fixture_value(name: str) -> dict[str, object]:
+    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def _run_value(**changes: object) -> dict[str, object]:
+    value = _fixture_value("run_finished.json")
+    value.update(changes)
+    return value
+
+
+def _pack_value() -> dict[str, object]:
+    return _fixture_value("evidence_pack_v2.json")
+
+
+def _empty_pack(pack_id: str = "pack_projection_fixture") -> dict[str, object]:
+    return {
+        "pack_id": pack_id,
+        "evidence_schema_version": 2,
+        "evidence_items": [],
+    }
 
 
 class AdvisoryHashingTests(unittest.TestCase):
@@ -408,6 +444,561 @@ class AdvisoryHashingTests(unittest.TestCase):
         )
         self.assertNotIn(secret, str(raised.exception))
         self.assertNotIn(offending, str(raised.exception))
+
+
+class AdvisoryProjectionTests(unittest.TestCase):
+    def test_finished_and_manual_review_fixtures_with_body_are_eligible(self) -> None:
+        for name, expected_version in (
+            ("run_finished.json", 1),
+            ("run_manual_review.json", 2),
+        ):
+            with self.subTest(name=name):
+                snapshot = load_run_snapshot(FIXTURES / name, HMAC_KEY)
+                self.assertTrue(snapshot.eligible)
+                self.assertIsNone(snapshot.ineligible_reason)
+                self.assertEqual(snapshot.report_version, expected_version)
+
+    def test_body_presence_is_derived_instead_of_trusting_persisted_boolean(self) -> None:
+        with_body = build_run_snapshot_from_value(
+            _run_value(has_formal_body=False),
+            HMAC_KEY,
+        )
+        without_body = build_run_snapshot_from_value(
+            _run_value(report_markdown="", report_ir=None, has_formal_body=True),
+            HMAC_KEY,
+        )
+
+        self.assertTrue(with_body.eligible)
+        self.assertFalse(without_body.eligible)
+        self.assertEqual(without_body.ineligible_reason, "empty_body")
+
+    def test_nonterminal_failed_interrupted_empty_and_technical_bodies_are_excluded(
+        self,
+    ) -> None:
+        for status in (
+            "created",
+            "preparing",
+            "running",
+            "generating",
+            "generated",
+            "local_quality_checking",
+            "repairing",
+            "fallback_generating",
+            "export_checking",
+        ):
+            with self.subTest(status=status):
+                snapshot = build_run_snapshot_from_value(
+                    _run_value(status=status, run_status=status),
+                    HMAC_KEY,
+                )
+                self.assertFalse(snapshot.eligible)
+                self.assertEqual(snapshot.ineligible_reason, "not_ready")
+
+        for status in ("failed", "interrupted"):
+            with self.subTest(status=status):
+                snapshot = build_run_snapshot_from_value(
+                    _run_value(status=status, run_status=status),
+                    HMAC_KEY,
+                )
+                self.assertFalse(snapshot.eligible)
+
+        technical = build_run_snapshot_from_value(
+            _run_value(
+                report_markdown=(
+                    "由于本次自动生成结果未形成完整正文，仅供人工复核。"
+                    "Dify evidence_pack OCR"
+                )
+            ),
+            HMAC_KEY,
+        )
+        self.assertFalse(technical.eligible)
+        self.assertEqual(technical.ineligible_reason, "technical_body")
+
+    def test_a_substantive_report_that_mentions_ocr_is_not_technical_dominated(
+        self,
+    ) -> None:
+        snapshot = build_run_snapshot_from_value(
+            _run_value(
+                report_markdown=(
+                    "## 采购影响\n\n"
+                    "项目服务期限为两年，企业应在规定时间内提交采购材料。"
+                    "附件中的OCR文字已经人工核验，采购范围、申报条件和执行周期"
+                    "均以公告原文为准，企业还应持续核对后续通知。"
+                )
+            ),
+            HMAC_KEY,
+        )
+
+        self.assertTrue(snapshot.eligible)
+
+    def test_status_disagreement_future_schema_and_nonpositive_version_fail_closed(
+        self,
+    ) -> None:
+        invalid_values = (
+            _run_value(run_status="needs_manual_review"),
+            _run_value(schema_version=2),
+            _run_value(version=0),
+            _run_value(version=True),
+        )
+        for value in invalid_values:
+            with self.subTest(value=value), self.assertRaises(ProjectionError):
+                build_run_snapshot_from_value(value, HMAC_KEY)
+
+    def test_report_hash_depends_only_on_normalized_markdown_and_report_ir(
+        self,
+    ) -> None:
+        report_ir_one = {
+            "title": "采购报告",
+            "sections": [
+                {
+                    "heading": "影响",
+                    "paragraphs": ["企业应核对申报条件。\r\n服务期限为两年。"],
+                    "tables": [],
+                    "highlights": [],
+                }
+            ],
+        }
+        report_ir_two = {
+            "sections": [
+                {
+                    "tables": [],
+                    "highlights": [],
+                    "paragraphs": ["企业应核对申报条件。\n服务期限为两年。"],
+                    "heading": "影响",
+                }
+            ],
+            "title": "采购报告",
+        }
+        first = build_run_snapshot_from_value(
+            _run_value(
+                run_id="run_hash_first",
+                pack_id="pack_hash_first",
+                version=1,
+                report_markdown="## 报告\r\n\r\n项目服务期限为两年。\r\n",
+                report_ir=report_ir_one,
+                updated_at="2026-07-27T00:00:00.000Z",
+            ),
+            HMAC_KEY,
+        )
+        second = build_run_snapshot_from_value(
+            _run_value(
+                run_id="run_hash_second",
+                pack_id="pack_hash_second",
+                status="needs_manual_review",
+                run_status="needs_manual_review",
+                version=9,
+                report_markdown="## 报告\n\n项目服务期限为两年。\n",
+                report_ir=report_ir_two,
+                updated_at="2027-01-01T00:00:00.000Z",
+            ),
+            HMAC_KEY,
+        )
+        changed = build_run_snapshot_from_value(
+            _run_value(
+                run_id="run_hash_changed",
+                pack_id="pack_hash_changed",
+                report_markdown="## 报告\n\n项目服务期限为三年。\n",
+                report_ir=report_ir_two,
+            ),
+            HMAC_KEY,
+        )
+
+        self.assertEqual(first.report_sha256, second.report_sha256)
+        self.assertNotEqual(first.report_sha256, changed.report_sha256)
+        self.assertNotEqual(first.run_ref, second.run_ref)
+        self.assertNotEqual(first.report_version, second.report_version)
+
+    def test_run_file_loader_rejects_bad_files_and_filename_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                (b"", "empty"),
+                (b"\xff\xfe", "invalid UTF-8"),
+                (b"{", "invalid JSON"),
+                (b"[]", "non-object JSON"),
+            )
+            for payload, label in cases:
+                path = root / "run_finished.json"
+                path.write_bytes(payload)
+                with self.subTest(label=label), self.assertRaises(ProjectionError):
+                    load_run_snapshot(path, HMAC_KEY)
+
+            mismatch = root / "run_wrong_name.json"
+            mismatch.write_text(
+                json.dumps(_run_value(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ProjectionError):
+                load_run_snapshot(mismatch, HMAC_KEY)
+
+            oversized = root / "run_finished.json"
+            oversized.write_bytes(b"{}")
+            with self.assertRaises(ProjectionError):
+                load_run_snapshot(oversized, HMAC_KEY, max_bytes=1)
+
+            with self.assertRaises(ProjectionError):
+                load_run_snapshot(root, HMAC_KEY)
+
+    def test_run_file_loader_rejects_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target.json"
+            target.write_text(
+                json.dumps(_run_value(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            link = root / "run_finished.json"
+            link.symlink_to(target)
+
+            with self.assertRaises(ProjectionError):
+                load_run_snapshot(link, HMAC_KEY)
+
+    def test_projection_contains_only_matched_a_b_with_local_parent_ids(self) -> None:
+        snapshot = load_run_snapshot(FIXTURES / "run_finished.json", HMAC_KEY)
+        pack = _pack_value()
+        projection = build_projection(
+            snapshot,
+            FIXTURES / "evidence_pack_v2.json",
+        )
+        serialized = projection.model_dump_json()
+        unit = projection.units[0]
+
+        self.assertEqual(len(projection.units), 1)
+        self.assertEqual(unit.kind, "claim")
+        self.assertEqual(unit.claim_count, 1)
+        self.assertEqual([item.level for item in unit.evidence], ["A", "B"])
+        self.assertEqual([item.local_id for item in unit.evidence], ["e1", "e2"])
+        self.assertEqual(unit.evidence[1].parent_a_ids, ("e1",))
+        for forbidden in (
+            "C_ONLY_SECRET_MARKER",
+            snapshot.run_id,
+            snapshot.pack_id,
+            "menu-private-001",
+            "article-private-001",
+            "menu_code",
+            "articleid",
+            "filename",
+            "source_hash",
+            *(str(item["evidence_id"]) for item in pack["evidence_items"]),
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, serialized)
+
+    def test_projection_locator_contains_only_safe_enum_and_positive_positions(
+        self,
+    ) -> None:
+        text = "采购表格要求企业提交申报材料"
+        source_ref = {
+            "menu_code": "private-menu",
+            "articleid": "private-article",
+            "attachment_id": "private-attachment",
+            "filename": "private-filename.xlsx",
+            "page_no": 3,
+            "sheet_name": "private-sheet",
+            "table_index": 2,
+            "row": 4,
+            "column": 5,
+            "quote": text,
+            "source_hash": "a" * 64,
+        }
+        item = create_evidence_item(
+            level="A",
+            kind="table_cell",
+            value=text,
+            source_ref=source_ref,
+        )
+        projection = build_projection_from_values(
+            run_value=_run_value(report_markdown=text),
+            pack_value={
+                "pack_id": "pack_projection_fixture",
+                "evidence_schema_version": 2,
+                "evidence_items": [item],
+            },
+            hmac_key=HMAC_KEY,
+        )
+        locator = projection.units[0].evidence[0].locator
+
+        self.assertIsNotNone(locator)
+        self.assertEqual(
+            locator.model_dump(exclude_none=True),
+            {
+                "kind": "table_cell",
+                "table_index": 2,
+                "row": 4,
+                "column": 5,
+            },
+        )
+        serialized = projection.model_dump_json()
+        for forbidden in (
+            "private-menu",
+            "private-article",
+            "private-attachment",
+            "private-filename",
+            "private-sheet",
+            "a" * 64,
+        ):
+            self.assertNotIn(forbidden, serialized)
+
+    def test_projection_is_deterministic_across_dict_order_item_order_and_newlines(
+        self,
+    ) -> None:
+        run_one = _run_value()
+        pack_one = _pack_value()
+        run_two = dict(reversed(list(copy.deepcopy(run_one).items())))
+        run_two["report_markdown"] = str(run_two["report_markdown"]).replace(
+            "\n",
+            "\r\n",
+        )
+        pack_two = dict(reversed(list(copy.deepcopy(pack_one).items())))
+        pack_two["evidence_items"] = [
+            dict(reversed(list(item.items())))
+            for item in reversed(pack_two["evidence_items"])
+        ]
+
+        first = build_projection_from_values(
+            run_value=run_one,
+            pack_value=pack_one,
+            hmac_key=HMAC_KEY,
+        )
+        second = build_projection_from_values(
+            run_value=run_two,
+            pack_value=pack_two,
+            hmac_key=HMAC_KEY,
+        )
+        payload = first.model_dump(mode="json")
+        digest = payload.pop("projection_sha256")
+
+        self.assertEqual(first, second)
+        self.assertEqual(digest, canonical_sha256(payload))
+
+    def test_build_projection_does_not_modify_source_fixtures(self) -> None:
+        run_path = FIXTURES / "run_finished.json"
+        pack_path = FIXTURES / "evidence_pack_v2.json"
+        before = {
+            run_path: hashlib.sha256(run_path.read_bytes()).hexdigest(),
+            pack_path: hashlib.sha256(pack_path.read_bytes()).hexdigest(),
+        }
+
+        snapshot = load_run_snapshot(run_path, HMAC_KEY)
+        build_projection(snapshot, pack_path)
+
+        after = {
+            path: hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in before
+        }
+        self.assertEqual(before, after)
+
+    def test_pack_identity_future_schema_and_ineligible_run_fail_closed(self) -> None:
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(),
+                pack_value=_empty_pack("pack_different_identity"),
+                hmac_key=HMAC_KEY,
+            )
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(),
+                pack_value={
+                    "pack_id": "pack_projection_fixture",
+                    "evidence_schema_version": 999,
+                    "evidence_items": [],
+                },
+                hmac_key=HMAC_KEY,
+            )
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(status="running", run_status="running"),
+                pack_value=_empty_pack(),
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_evidence_file_loader_rejects_bad_symlink_nonregular_and_oversize_files(
+        self,
+    ) -> None:
+        snapshot = load_run_snapshot(FIXTURES / "run_finished.json", HMAC_KEY)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "pack.json"
+            for payload, label in (
+                (b"", "empty"),
+                (b"\xff\xfe", "invalid UTF-8"),
+                (b"{", "invalid JSON"),
+                (b"[]", "non-object JSON"),
+            ):
+                path.write_bytes(payload)
+                with self.subTest(label=label), self.assertRaises(ProjectionError):
+                    build_projection(snapshot, path)
+
+            path.write_bytes(b"{}")
+            with self.assertRaises(ProjectionError):
+                build_projection(snapshot, path, max_bytes=1)
+
+            with self.assertRaises(ProjectionError):
+                build_projection(snapshot, root)
+
+            target = root / "target.json"
+            target.write_text(
+                json.dumps(_pack_value(), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            link = root / "pack-link.json"
+            link.symlink_to(target)
+            with self.assertRaises(ProjectionError):
+                build_projection(snapshot, link)
+
+    def test_quote_is_preferred_and_non_scalar_fallback_is_rejected(self) -> None:
+        text = "采购服务期限为两年"
+        ref = {
+            "menu_code": "menu-one",
+            "articleid": "article-one",
+            "quote": "",
+            "source_hash": text_source_hash(text),
+        }
+        item = create_evidence_item(
+            level="A",
+            kind="article_field",
+            value={"name": "期限", "value": text},
+            source_ref=ref,
+        )
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=text),
+                pack_value={
+                    "pack_id": "pack_projection_fixture",
+                    "evidence_schema_version": 2,
+                    "evidence_items": [item],
+                },
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_per_evidence_excerpt_limit_rejects_without_truncation(self) -> None:
+        text = "采购" + ("期" * 1499)
+        item = create_evidence_item(
+            level="A",
+            kind="article_text",
+            value=text,
+            source_ref={
+                "menu_code": "menu-long",
+                "articleid": "article-long",
+                "quote": "",
+                "source_hash": text_source_hash(text),
+            },
+        )
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=text),
+                pack_value={
+                    "pack_id": "pack_projection_fixture",
+                    "evidence_schema_version": 2,
+                    "evidence_items": [item],
+                },
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_total_claim_text_budget_is_hard(self) -> None:
+        report = ("甲" * 3001) + "\n" + ("乙" * 3001)
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=report),
+                pack_value=_empty_pack(),
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_total_unique_evidence_budget_is_hard(self) -> None:
+        text = "采购服务期限为两年"
+        items = [
+            create_evidence_item(
+                level="A",
+                kind="article_text",
+                value=text,
+                source_ref={
+                    "menu_code": f"menu-{index}",
+                    "articleid": f"article-{index}",
+                    "quote": text,
+                    "source_hash": text_source_hash(text),
+                },
+            )
+            for index in range(9)
+        ]
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=text),
+                pack_value={
+                    "pack_id": "pack_projection_fixture",
+                    "evidence_schema_version": 2,
+                    "evidence_items": items,
+                },
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_total_evidence_excerpt_budget_is_hard(self) -> None:
+        text = "采购" + ("期" * 1398)
+        items = [
+            create_evidence_item(
+                level="A",
+                kind="article_text",
+                value=text,
+                source_ref={
+                    "menu_code": f"menu-{index}",
+                    "articleid": f"article-{index}",
+                    "quote": "",
+                    "source_hash": text_source_hash(text),
+                },
+            )
+            for index in range(6)
+        ]
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=text),
+                pack_value={
+                    "pack_id": "pack_projection_fixture",
+                    "evidence_schema_version": 2,
+                    "evidence_items": items,
+                },
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_complete_projection_json_budget_is_hard(self) -> None:
+        report = "\n".join(f"采购规则{index:04d}" for index in range(700))
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=report),
+                pack_value=_empty_pack(),
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_outbound_boundary_violation_fails_projection(self) -> None:
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(
+                    report_markdown=(
+                        "采购服务期限为两年，内部详情见 "
+                        "http://192.168.34.87/internal"
+                    )
+                ),
+                pack_value=_empty_pack(),
+                hmac_key=HMAC_KEY,
+            )
+
+    def test_raw_run_pack_and_evidence_id_in_claim_fail_closed(self) -> None:
+        pack = _pack_value()
+        raw_evidence_id = str(pack["evidence_items"][0]["evidence_id"])
+        report = (
+            "项目服务期限为两年，企业应在规定时间内提交采购材料。"
+            f"内部记录 run_finished pack_projection_fixture {raw_evidence_id}"
+        )
+
+        with self.assertRaises(ProjectionError):
+            build_projection_from_values(
+                run_value=_run_value(report_markdown=report),
+                pack_value=pack,
+                hmac_key=HMAC_KEY,
+            )
 
 
 if __name__ == "__main__":

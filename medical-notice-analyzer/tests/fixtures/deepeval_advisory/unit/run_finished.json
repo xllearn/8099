@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "run_id": "run_finished",
+  "pack_id": "pack_projection_fixture",
+  "status": "finished",
+  "run_status": "finished",
+  "version": 1,
+  "report_markdown": "## 采购规则\n\n项目服务期限为两年，企业应在规定时间内提交采购材料。",
+  "report_ir": null,
+  "updated_at": "2026-07-27T08:00:00.000Z",
+  "has_formal_body": false
+}

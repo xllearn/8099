@@ -1,0 +1,71 @@
+{
+  "pack_id": "pack_projection_fixture",
+  "evidence_schema_version": 2,
+  "evidence_items": [
+    {
+      "evidence_id": "18befb04d4be9387eee4cd28c1a951101ce1a16b25246b13698ddee307efbea3",
+      "level": "A",
+      "kind": "article_text",
+      "value": "项目服务期限为两年，企业应在规定时间内提交采购材料。",
+      "normalized_value": null,
+      "source_ref": {
+        "menu_code": "menu-private-001",
+        "articleid": "article-private-001",
+        "attachment_id": null,
+        "filename": null,
+        "page_no": null,
+        "sheet_name": null,
+        "table_index": null,
+        "row": null,
+        "column": null,
+        "cell_range": null,
+        "quote": "项目服务期限为两年，企业应在规定时间内提交采购材料。",
+        "source_hash": "6881cefd81c6e67e82ec3f4a1979404741704deec406e1214997e3cc98e12c72",
+        "region": null,
+        "bbox": null
+      },
+      "derived_from": [],
+      "extractor_version": null,
+      "mandatory": true
+    },
+    {
+      "evidence_id": "5f1e1c13f36e03860ddbe55cd03aa877d1aa8880dc8e8c179657a737e70463c6",
+      "level": "B",
+      "kind": "derived_fact",
+      "value": "项目服务期限为两年",
+      "normalized_value": "项目服务期限为两年",
+      "source_ref": {
+        "menu_code": "menu-private-001",
+        "articleid": "article-private-001",
+        "attachment_id": null,
+        "filename": null,
+        "page_no": null,
+        "sheet_name": null,
+        "table_index": null,
+        "row": null,
+        "column": null,
+        "cell_range": null,
+        "quote": "项目服务期限为两年，企业应在规定时间内提交采购材料。",
+        "source_hash": "6881cefd81c6e67e82ec3f4a1979404741704deec406e1214997e3cc98e12c72",
+        "region": null,
+        "bbox": null
+      },
+      "derived_from": [
+        "18befb04d4be9387eee4cd28c1a951101ce1a16b25246b13698ddee307efbea3"
+      ],
+      "extractor_version": "fixture-v1",
+      "mandatory": false
+    },
+    {
+      "evidence_id": "189205c72b8d9a29a48ceafcc23c06ac15326ad9fd645e09c3d7db03f3ee08c4",
+      "level": "C",
+      "kind": "summary",
+      "value": "C_ONLY_SECRET_MARKER",
+      "normalized_value": null,
+      "source_ref": null,
+      "derived_from": [],
+      "extractor_version": null,
+      "mandatory": false
+    }
+  ]
+}
