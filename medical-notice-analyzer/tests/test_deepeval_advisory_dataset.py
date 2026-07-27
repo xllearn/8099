@@ -1711,13 +1711,177 @@ class Fixed10FreezeTests(unittest.TestCase):
 
         for required in (
             "controlled output parent",
+            "filesystem root",
+            "sticky-directory semantics",
+            "final pathname identity",
             "same-UID writers are trusted and cooperative",
             "anchored parent-directory flock",
+            "Privileged attackers",
             "outside this boundary",
             "read-only or baked",
         ):
             with self.subTest(required=required):
                 self.assertIn(required, boundary)
+
+    def test_freeze_rejects_nonsticky_writable_namespace_ancestor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            writable_ancestor = root / "writable-ancestor"
+            output_parent = writable_ancestor / "controlled-parent"
+            output_dir = output_parent / "output"
+            _write_fixed10_sources(source_dir)
+            writable_ancestor.mkdir(mode=0o700)
+            output_parent.mkdir(mode=0o700)
+            writable_ancestor.chmod(0o777)
+
+            try:
+                error_type = getattr(dataset_module, "Fixed10FreezeError")
+                with self.assertRaises(error_type) as raised:
+                    self.freeze(source_dir, output_dir)
+
+                self.assertEqual(
+                    raised.exception.category,
+                    "output_namespace_invalid",
+                )
+                self.assertFalse(output_dir.exists())
+            finally:
+                writable_ancestor.chmod(0o700)
+
+    def test_owned_child_under_tmp_sticky_namespace_is_allowed(self) -> None:
+        tmp_root = Path("/tmp")
+        if os.name != "posix" or not tmp_root.is_dir():
+            self.skipTest("POSIX /tmp is required")
+        tmp_info = tmp_root.stat()
+        self.assertNotEqual(tmp_info.st_mode & 0o1000, 0)
+        self.assertNotEqual(tmp_info.st_mode & 0o002, 0)
+
+        with tempfile.TemporaryDirectory(dir=tmp_root) as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+
+            first = self.freeze(source_dir, output_dir)
+            second = self.freeze(source_dir, output_dir)
+
+        self.assertEqual(first, "created")
+        self.assertEqual(second, "unchanged")
+
+    def test_created_never_returns_after_parent_namespace_substitution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            namespace = root / "namespace"
+            output_parent = namespace / "output-parent"
+            moved_parent = namespace / "moved-output-parent"
+            output_dir = output_parent / "output"
+            decoy_marker = output_dir / "decoy.txt"
+            sentinel = b"preserve-decoy"
+            _write_fixed10_sources(source_dir)
+            namespace.mkdir(mode=0o700)
+            output_parent.mkdir(mode=0o700)
+            original = getattr(dataset_module, "_rename_noreplace_at")
+            injected = False
+
+            def detach_parent_after_publish(
+                parent_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                nonlocal injected
+                original(
+                    parent_descriptor,
+                    source_name,
+                    destination_name,
+                )
+                if destination_name == output_dir.name and not injected:
+                    output_parent.rename(moved_parent)
+                    output_parent.mkdir(mode=0o700)
+                    output_dir.mkdir(mode=0o700)
+                    decoy_marker.write_bytes(sentinel)
+                    injected = True
+
+            error_type = getattr(dataset_module, "Fixed10FreezeError")
+            with (
+                patch.object(
+                    dataset_module,
+                    "_rename_noreplace_at",
+                    side_effect=detach_parent_after_publish,
+                ),
+                self.assertRaises(error_type) as raised,
+            ):
+                self.freeze(source_dir, output_dir)
+
+            self.assertTrue(injected)
+            self.assertEqual(raised.exception.category, "output_changed")
+            self.assertEqual(decoy_marker.read_bytes(), sentinel)
+            self.assertFalse((moved_parent / output_dir.name).exists())
+            self.assertFalse(
+                any(
+                    "freeze-stage" in path.name
+                    for path in moved_parent.iterdir()
+                )
+            )
+
+    def test_unchanged_never_returns_after_parent_namespace_substitution(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            namespace = root / "namespace"
+            output_parent = namespace / "output-parent"
+            moved_parent = namespace / "moved-output-parent"
+            output_dir = output_parent / "output"
+            decoy_marker = output_dir / "decoy.txt"
+            sentinel = b"preserve-decoy"
+            _write_fixed10_sources(source_dir)
+            namespace.mkdir(mode=0o700)
+            output_parent.mkdir(mode=0o700)
+            self.freeze(source_dir, output_dir)
+            before = _directory_snapshot(output_dir)
+            original = getattr(dataset_module, "_tree_matches_at")
+            check_count = 0
+            injected = False
+
+            def detach_parent_after_final_tree_check(
+                root_descriptor: int,
+                expected: object,
+            ) -> bool:
+                nonlocal check_count, injected
+                result = original(root_descriptor, expected)
+                check_count += 1
+                if check_count == 2 and result:
+                    output_parent.rename(moved_parent)
+                    output_parent.mkdir(mode=0o700)
+                    output_dir.mkdir(mode=0o700)
+                    decoy_marker.write_bytes(sentinel)
+                    injected = True
+                return result
+
+            error_type = getattr(dataset_module, "Fixed10FreezeError")
+            with (
+                patch.object(
+                    dataset_module,
+                    "_tree_matches_at",
+                    side_effect=detach_parent_after_final_tree_check,
+                ),
+                self.assertRaises(error_type) as raised,
+            ):
+                self.freeze(source_dir, output_dir)
+
+            self.assertTrue(injected)
+            self.assertEqual(raised.exception.category, "output_changed")
+            self.assertEqual(decoy_marker.read_bytes(), sentinel)
+            self.assertEqual(
+                _directory_snapshot(moved_parent / output_dir.name),
+                before,
+            )
 
     def test_created_tree_has_controlled_modes_and_owners(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

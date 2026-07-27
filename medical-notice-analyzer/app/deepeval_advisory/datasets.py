@@ -38,10 +38,16 @@ FIXED10_SOURCE_SCHEMA_VERSION = "8099.deepeval-fixed10-source/v1"
 FIXED10_RUBRIC_VERSION = "advisory-rubric-v1"
 FIXED10_TRUST_BOUNDARY = (
     "Freeze requires a controlled output parent owned by the effective UID "
-    "or root with no group/other write; same-UID writers are trusted and "
-    "cooperative and honor the anchored parent-directory flock. "
-    "Noncooperative same-UID mutation after the final check is outside this "
-    "boundary. Deployed frozen datasets must be read-only or baked."
+    "or root with no group/other write. Namespace ownership and permissions "
+    "are checked recursively from that parent to the filesystem root; a "
+    "group/other-writable ancestor is allowed only with sticky-directory "
+    "semantics and a protected child owned by root or the effective UID. "
+    "Freeze reopens the anchored namespace and compares final pathname "
+    "identity before returning; same-UID writers are trusted and cooperative "
+    "and honor the anchored parent-directory flock. Privileged attackers and "
+    "noncooperative same-UID mutation after the final pathname check are "
+    "outside this boundary. Deployed frozen datasets must be read-only or "
+    "baked."
 )
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
@@ -1718,6 +1724,147 @@ def _require_controlled_output_parent(parent_descriptor: int) -> None:
         raise Fixed10FreezeError("output_parent_invalid")
 
 
+def _is_trusted_namespace_edge(
+    parent_identity: os.stat_result,
+    child_identity: os.stat_result,
+) -> bool:
+    trusted_owners = {0, os.geteuid()}
+    if (
+        not stat.S_ISDIR(parent_identity.st_mode)
+        or not stat.S_ISDIR(child_identity.st_mode)
+        or parent_identity.st_uid not in trusted_owners
+        or child_identity.st_uid not in trusted_owners
+    ):
+        return False
+    parent_mode = stat.S_IMODE(parent_identity.st_mode)
+    return (parent_mode & 0o022) == 0 or bool(parent_mode & stat.S_ISVTX)
+
+
+@contextmanager
+def _reopen_fixed10_namespace(
+    path: Path,
+    expected_parent_descriptor: int,
+) -> Iterator[int]:
+    _require_freeze_io()
+    absolute = _freeze_absolute_path(path)
+    components = absolute.parts
+    if not components or components[0] != os.path.sep:
+        raise Fixed10FreezeError("path_invalid")
+
+    descriptors: list[int] = []
+    try:
+        anchor = os.open(os.path.sep, _directory_flags())
+        descriptors.append(anchor)
+        current = anchor
+        current_identity = os.fstat(current)
+        if (
+            not stat.S_ISDIR(current_identity.st_mode)
+            or current_identity.st_uid not in {0, os.geteuid()}
+        ):
+            raise Fixed10FreezeError("output_namespace_invalid")
+
+        for component in components[1:]:
+            if component in {"", ".", ".."}:
+                raise Fixed10FreezeError("path_invalid")
+            before = os.stat(
+                component,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(
+                before.st_mode
+            ):
+                raise Fixed10FreezeError("output_namespace_invalid")
+            child = os.open(
+                component,
+                _directory_flags(),
+                dir_fd=current,
+            )
+            descriptors.append(child)
+            opened = os.fstat(child)
+            if not _same_stat_state(before, opened):
+                raise Fixed10FreezeError("output_changed")
+            if not _is_trusted_namespace_edge(current_identity, opened):
+                raise Fixed10FreezeError("output_namespace_invalid")
+            current = child
+            current_identity = opened
+
+        expected_identity = os.fstat(expected_parent_descriptor)
+        if not _same_file(current_identity, expected_identity):
+            raise Fixed10FreezeError("output_changed")
+        if not _is_controlled_directory(current_identity):
+            raise Fixed10FreezeError("output_parent_invalid")
+        yield current
+    except Fixed10FreezeError:
+        raise
+    except FileNotFoundError:
+        raise Fixed10FreezeError("output_changed") from None
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("output_changed") from None
+    finally:
+        _close_descriptors(descriptors)
+
+
+def _require_fixed10_namespace(
+    path: Path,
+    expected_parent_descriptor: int,
+) -> None:
+    with _reopen_fixed10_namespace(path, expected_parent_descriptor):
+        pass
+
+
+def _require_fixed10_output_path_identity(
+    output_parent: Path,
+    parent_descriptor: int,
+    output_name: str,
+    expected_identity: os.stat_result,
+) -> None:
+    output_descriptor: int | None = None
+    try:
+        with _reopen_fixed10_namespace(
+            output_parent,
+            parent_descriptor,
+        ) as reopened_parent:
+            before = os.stat(
+                output_name,
+                dir_fd=reopened_parent,
+                follow_symlinks=False,
+            )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(
+                before.st_mode
+            ):
+                raise Fixed10FreezeError("output_changed")
+            output_descriptor = os.open(
+                output_name,
+                _directory_flags(),
+                dir_fd=reopened_parent,
+            )
+            opened = os.fstat(output_descriptor)
+            if (
+                not _same_stat_state(before, opened)
+                or not _same_file(opened, expected_identity)
+                or not _is_controlled_directory(opened)
+            ):
+                raise Fixed10FreezeError("output_changed")
+            after = os.stat(
+                output_name,
+                dir_fd=reopened_parent,
+                follow_symlinks=False,
+            )
+            if not _same_stat_state(opened, after):
+                raise Fixed10FreezeError("output_changed")
+    except Fixed10FreezeError:
+        raise
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("output_changed") from None
+    finally:
+        if output_descriptor is not None:
+            try:
+                os.close(output_descriptor)
+            except OSError:
+                pass
+
+
 @contextmanager
 def _fixed10_lock(
     parent_descriptor: int,
@@ -1972,9 +2119,11 @@ def _tree_matches_at(
 
 def _existing_fixed10_status(
     parent_descriptor: int,
+    output_parent: Path,
     output_name: str,
     expected: _Fixed10Tree,
 ) -> str | None:
+    _require_fixed10_namespace(output_parent, parent_descriptor)
     _require_controlled_output_parent(parent_descriptor)
     try:
         before = os.stat(
@@ -2014,6 +2163,12 @@ def _existing_fixed10_status(
         _require_controlled_output_parent(parent_descriptor)
         if not _tree_matches_at(output_descriptor, expected):
             raise Fixed10FreezeError("output_conflict")
+        _require_fixed10_output_path_identity(
+            output_parent,
+            parent_descriptor,
+            output_name,
+            opened,
+        )
         return "unchanged"
     except Fixed10FreezeError:
         raise
@@ -2136,8 +2291,57 @@ def _rename_noreplace_at(
     raise OSError(error_number, "atomic no-replace publication failed")
 
 
+def _rollback_published_fixed10_tree(
+    parent_descriptor: int,
+    output_name: str,
+    stage_name: str,
+    stage_identity: os.stat_result,
+) -> None:
+    try:
+        current_output = os.stat(
+            output_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(current_output.st_mode)
+            or not _same_file(current_output, stage_identity)
+        ):
+            raise Fixed10FreezeError("rollback_failed")
+        _rename_noreplace_at(
+            parent_descriptor,
+            output_name,
+            stage_name,
+        )
+        os.fsync(parent_descriptor)
+        rolled_back = os.stat(
+            stage_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if not _same_file(rolled_back, stage_identity):
+            raise Fixed10FreezeError("rollback_failed")
+        try:
+            os.stat(
+                output_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise Fixed10FreezeError("rollback_failed")
+    except Fixed10FreezeError as exc:
+        if exc.category == "rollback_failed":
+            raise
+        raise Fixed10FreezeError("rollback_failed") from None
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("rollback_failed") from None
+
+
 def _publish_fixed10_tree(
     parent_descriptor: int,
+    output_parent: Path,
     output_name: str,
     expected: _Fixed10Tree,
 ) -> str:
@@ -2148,6 +2352,7 @@ def _publish_fixed10_tree(
     published = False
     case_names = tuple(sorted(expected.cases))
     try:
+        _require_fixed10_namespace(output_parent, parent_descriptor)
         for attempt in range(32):
             candidate = (
                 f".{output_name}.freeze-stage-{os.getpid()}-{attempt}"
@@ -2217,54 +2422,51 @@ def _publish_fixed10_tree(
         os.fsync(parent_descriptor)
         if not _tree_matches_at(stage_descriptor, expected):
             raise Fixed10FreezeError("staging_invalid")
+        _require_fixed10_namespace(output_parent, parent_descriptor)
         _rename_noreplace_at(
             parent_descriptor,
             stage_name,
             output_name,
         )
         published = True
-        published_stat = os.stat(
-            output_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if not _same_file(published_stat, stage_identity):
-            raise Fixed10FreezeError("output_changed")
-        _require_controlled_output_parent(parent_descriptor)
-        if not _tree_matches_at(stage_descriptor, expected):
-            current_output = os.stat(
+        publication_error: Fixed10FreezeError | None = None
+        try:
+            published_stat = os.stat(
                 output_name,
                 dir_fd=parent_descriptor,
                 follow_symlinks=False,
             )
-            if not _same_file(current_output, stage_identity):
+            if not _same_file(published_stat, stage_identity):
                 raise Fixed10FreezeError("output_changed")
-            _rename_noreplace_at(
+            _require_controlled_output_parent(parent_descriptor)
+            _require_fixed10_output_path_identity(
+                output_parent,
+                parent_descriptor,
+                output_name,
+                stage_identity,
+            )
+            if not _tree_matches_at(stage_descriptor, expected):
+                raise Fixed10FreezeError("output_invalid")
+            os.fsync(parent_descriptor)
+            _require_fixed10_output_path_identity(
+                output_parent,
+                parent_descriptor,
+                output_name,
+                stage_identity,
+            )
+        except Fixed10FreezeError as exc:
+            publication_error = exc
+        except (OSError, TypeError, ValueError):
+            publication_error = Fixed10FreezeError("output_changed")
+        if publication_error is not None:
+            _rollback_published_fixed10_tree(
                 parent_descriptor,
                 output_name,
                 stage_name,
+                stage_identity,
             )
             published = False
-            os.fsync(parent_descriptor)
-            rolled_back = os.stat(
-                stage_name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if not _same_file(rolled_back, stage_identity):
-                raise Fixed10FreezeError("rollback_failed")
-            try:
-                os.stat(
-                    output_name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                pass
-            else:
-                raise Fixed10FreezeError("rollback_failed")
-            raise Fixed10FreezeError("output_invalid")
-        os.fsync(parent_descriptor)
+            raise publication_error
         return "created"
     finally:
         for descriptor in (cases_descriptor, stage_descriptor):
@@ -2318,14 +2520,17 @@ def freeze_fixed10_dataset(
         exports = _read_fixed10_source_exports(source)
         expected = _build_fixed10_tree(exports)
         with _open_or_create_directory_path(output.parent) as parent_descriptor:
+            _require_fixed10_namespace(output.parent, parent_descriptor)
             _require_controlled_output_parent(parent_descriptor)
             with _fixed10_lock(
                 parent_descriptor,
                 timeout_seconds=timeout,
             ):
+                _require_fixed10_namespace(output.parent, parent_descriptor)
                 _require_controlled_output_parent(parent_descriptor)
                 status = _existing_fixed10_status(
                     parent_descriptor,
+                    output.parent,
                     output_name,
                     expected,
                 )
@@ -2333,6 +2538,7 @@ def freeze_fixed10_dataset(
                     return status
                 return _publish_fixed10_tree(
                     parent_descriptor,
+                    output.parent,
                     output_name,
                     expected,
                 )
