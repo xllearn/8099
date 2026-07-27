@@ -1,8 +1,10 @@
 import inspect
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +92,60 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
         self.assertIn("OK (skipped=1)", output)
         self.assertIn(MAIN_SERVICE_SKIP_MESSAGE, output)
 
+    def test_main_service_default_discovery_excludes_image_contract(
+        self,
+    ) -> None:
+        image_contract_candidates = (
+            PROJECT_ROOT
+            / "tests"
+            / "test_deepeval_advisory_image_contract.py",
+            PROJECT_ROOT
+            / "tests"
+            / "deepeval_advisory_image_contract.py",
+        )
+        self.assertTrue(
+            any(path.is_file() for path in image_contract_candidates)
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            discovery_root = Path(directory)
+            shutil.copy2(
+                Path(__file__),
+                discovery_root / Path(__file__).name,
+            )
+            for path in image_contract_candidates:
+                if path.is_file():
+                    shutil.copy2(path, discovery_root / path.name)
+
+            environment = os.environ.copy()
+            environment.pop(CONTRACT_REQUIRED_ENV, None)
+            environment.pop("PYTHONPATH", None)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    "-m",
+                    "unittest",
+                    "discover",
+                    "-s",
+                    str(discovery_root),
+                    "-p",
+                    "test_*.py",
+                    "-v",
+                ],
+                cwd=PROJECT_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("OK (skipped=1)", output)
+        self.assertNotIn("deepeval_advisory_image_contract", output)
+
     def test_worker_required_mode_fails_when_deepeval_is_absent(self) -> None:
         result = self._run_contract_without_site_packages(
             worker_contract_required=True,
@@ -156,8 +212,8 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
                 "COPY app/report_rules ./app/report_rules",
                 "COPY app/deepeval_advisory ./app/deepeval_advisory",
                 "COPY tests/__init__.py ./tests/__init__.py",
-                "COPY tests/test_deepeval_advisory_image_contract.py "
-                "./tests/test_deepeval_advisory_image_contract.py",
+                "COPY tests/deepeval_advisory_image_contract.py "
+                "./tests/deepeval_advisory_image_contract.py",
                 "COPY tests/test_deepeval_advisory_judge.py "
                 "./tests/test_deepeval_advisory_judge.py",
                 "COPY tests/test_deepeval_advisory_evaluator.py "
@@ -185,7 +241,7 @@ class DeepEvalAdvisoryDependencyContractTests(unittest.TestCase):
         )
         self.assertIn(
             'CMD ["python", "-m", "unittest", '
-            '"tests.test_deepeval_advisory_image_contract", '
+            '"tests.deepeval_advisory_image_contract", '
             '"tests.test_deepeval_advisory_judge", '
             '"tests.test_deepeval_advisory_evaluator", "-v"]',
             dockerfile,

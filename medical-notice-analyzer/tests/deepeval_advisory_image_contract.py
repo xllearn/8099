@@ -14,8 +14,8 @@ APP_ROOT = Path("/app")
 STATE_ROOT = Path("/state")
 EXPECTED_TEST_FILES = {
     "__init__.py",
+    "deepeval_advisory_image_contract.py",
     "test_deepeval_advisory_evaluator.py",
-    "test_deepeval_advisory_image_contract.py",
     "test_deepeval_advisory_judge.py",
 }
 SIDE_EFFECT_ENVIRONMENT = {
