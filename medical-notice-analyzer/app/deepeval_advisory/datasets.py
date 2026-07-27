@@ -36,6 +36,13 @@ MAX_DATASET_TREE_MEMBERS = (
 )
 FIXED10_SOURCE_SCHEMA_VERSION = "8099.deepeval-fixed10-source/v1"
 FIXED10_RUBRIC_VERSION = "advisory-rubric-v1"
+FIXED10_TRUST_BOUNDARY = (
+    "Freeze requires a controlled output parent owned by the effective UID "
+    "or root with no group/other write; same-UID writers are trusted and "
+    "cooperative and honor the anchored parent-directory flock. "
+    "Noncooperative same-UID mutation after the final check is outside this "
+    "boundary. Deployed frozen datasets must be read-only or baked."
+)
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CASE_REF_PATTERN = r"^case_[0-9a-f]{32}$"
@@ -1683,6 +1690,34 @@ def _build_fixed10_tree(
     return _Fixed10Tree(manifest=manifest_bytes, cases=cases)
 
 
+def _has_controlled_owner_and_mode(info: os.stat_result) -> bool:
+    return (
+        info.st_uid in {0, os.geteuid()}
+        and (stat.S_IMODE(info.st_mode) & 0o022) == 0
+    )
+
+
+def _is_controlled_directory(info: os.stat_result) -> bool:
+    return stat.S_ISDIR(info.st_mode) and _has_controlled_owner_and_mode(info)
+
+
+def _is_controlled_regular_file(info: os.stat_result) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_nlink == 1
+        and _has_controlled_owner_and_mode(info)
+    )
+
+
+def _require_controlled_output_parent(parent_descriptor: int) -> None:
+    try:
+        parent_identity = os.fstat(parent_descriptor)
+    except (OSError, TypeError, ValueError):
+        raise Fixed10FreezeError("output_parent_invalid") from None
+    if not _is_controlled_directory(parent_identity):
+        raise Fixed10FreezeError("output_parent_invalid")
+
+
 @contextmanager
 def _fixed10_lock(
     parent_descriptor: int,
@@ -1731,10 +1766,15 @@ def _fixed10_lock(
         if descriptor is not None:
             try:
                 if locked:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-                os.close(descriptor)
-            except OSError:
-                pass
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _write_exclusive_at(
@@ -1821,6 +1861,8 @@ def _tree_matches_at(
     cases_descriptor: int | None = None
     try:
         root_before = os.fstat(root_descriptor)
+        if not _is_controlled_directory(root_before):
+            return False
         expected_root_names = (
             "cases",
             "manifest.json",
@@ -1836,7 +1878,7 @@ def _tree_matches_at(
             max_bytes=MAX_DATASET_JSON_BYTES,
         )
         if (
-            manifest.stat_result.st_nlink != 1
+            not _is_controlled_regular_file(manifest.stat_result)
             or manifest.payload != expected.manifest
         ):
             return False
@@ -1844,6 +1886,8 @@ def _tree_matches_at(
             root_descriptor,
             "cases",
         )
+        if not _is_controlled_directory(_cases_stat):
+            return False
         expected_names = tuple(sorted(expected.cases))
         if _directory_names_at(
             cases_descriptor,
@@ -1858,7 +1902,7 @@ def _tree_matches_at(
                 max_bytes=MAX_DATASET_JSON_BYTES,
             )
             if (
-                observed.stat_result.st_nlink != 1
+                not _is_controlled_regular_file(observed.stat_result)
                 or observed.payload != expected.cases[name]
             ):
                 return False
@@ -1876,7 +1920,8 @@ def _tree_matches_at(
             )
             initial = first_case_reads[name]
             if (
-                repeated.payload != initial.payload
+                not _is_controlled_regular_file(repeated.stat_result)
+                or repeated.payload != initial.payload
                 or not _same_stat_state(
                     repeated.stat_result,
                     initial.stat_result,
@@ -1884,7 +1929,10 @@ def _tree_matches_at(
             ):
                 return False
         cases_after = os.fstat(cases_descriptor)
-        if not _same_stat_state(_cases_stat, cases_after):
+        if (
+            not _is_controlled_directory(cases_after)
+            or not _same_stat_state(_cases_stat, cases_after)
+        ):
             return False
         repeated_manifest = _read_regular_at(
             root_descriptor,
@@ -1892,7 +1940,10 @@ def _tree_matches_at(
             max_bytes=MAX_DATASET_JSON_BYTES,
         )
         if (
-            repeated_manifest.payload != manifest.payload
+            not _is_controlled_regular_file(
+                repeated_manifest.stat_result
+            )
+            or repeated_manifest.payload != manifest.payload
             or not _same_stat_state(
                 repeated_manifest.stat_result,
                 manifest.stat_result,
@@ -1904,7 +1955,11 @@ def _tree_matches_at(
             != expected_root_names
         ):
             return False
-        return _same_stat_state(root_before, os.fstat(root_descriptor))
+        root_after = os.fstat(root_descriptor)
+        return (
+            _is_controlled_directory(root_after)
+            and _same_stat_state(root_before, root_after)
+        )
     except (DatasetError, Fixed10FreezeError, OSError, TypeError, ValueError):
         return False
     finally:
@@ -1920,6 +1975,7 @@ def _existing_fixed10_status(
     output_name: str,
     expected: _Fixed10Tree,
 ) -> str | None:
+    _require_controlled_output_parent(parent_descriptor)
     try:
         before = os.stat(
             output_name,
@@ -1955,6 +2011,9 @@ def _existing_fixed10_status(
         )
         if not _same_stat_state(opened, after):
             raise Fixed10FreezeError("output_changed")
+        _require_controlled_output_parent(parent_descriptor)
+        if not _tree_matches_at(output_descriptor, expected):
+            raise Fixed10FreezeError("output_conflict")
         return "unchanged"
     except Fixed10FreezeError:
         raise
@@ -2154,7 +2213,10 @@ def _publish_fixed10_tree(
         )
         if not _same_file(observed, stage_identity):
             raise Fixed10FreezeError("staging_changed")
+        _require_controlled_output_parent(parent_descriptor)
         os.fsync(parent_descriptor)
+        if not _tree_matches_at(stage_descriptor, expected):
+            raise Fixed10FreezeError("staging_invalid")
         _rename_noreplace_at(
             parent_descriptor,
             stage_name,
@@ -2168,6 +2230,40 @@ def _publish_fixed10_tree(
         )
         if not _same_file(published_stat, stage_identity):
             raise Fixed10FreezeError("output_changed")
+        _require_controlled_output_parent(parent_descriptor)
+        if not _tree_matches_at(stage_descriptor, expected):
+            current_output = os.stat(
+                output_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_file(current_output, stage_identity):
+                raise Fixed10FreezeError("output_changed")
+            _rename_noreplace_at(
+                parent_descriptor,
+                output_name,
+                stage_name,
+            )
+            published = False
+            os.fsync(parent_descriptor)
+            rolled_back = os.stat(
+                stage_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+            if not _same_file(rolled_back, stage_identity):
+                raise Fixed10FreezeError("rollback_failed")
+            try:
+                os.stat(
+                    output_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                raise Fixed10FreezeError("rollback_failed")
+            raise Fixed10FreezeError("output_invalid")
         os.fsync(parent_descriptor)
         return "created"
     finally:
@@ -2192,6 +2288,8 @@ def freeze_fixed10_dataset(
     *,
     lock_timeout_seconds: float = 10.0,
 ) -> str:
+    """Freeze fixed10 under the documented controlled-writer trust boundary."""
+
     if (
         isinstance(lock_timeout_seconds, bool)
         or not isinstance(lock_timeout_seconds, (int, float))
@@ -2220,10 +2318,12 @@ def freeze_fixed10_dataset(
         exports = _read_fixed10_source_exports(source)
         expected = _build_fixed10_tree(exports)
         with _open_or_create_directory_path(output.parent) as parent_descriptor:
+            _require_controlled_output_parent(parent_descriptor)
             with _fixed10_lock(
                 parent_descriptor,
                 timeout_seconds=timeout,
             ):
+                _require_controlled_output_parent(parent_descriptor)
                 status = _existing_fixed10_status(
                     parent_descriptor,
                     output_name,
@@ -2259,6 +2359,7 @@ __all__ = [
     "MAX_DATASET_TREE_MEMBERS",
     "FIXED10_RUBRIC_VERSION",
     "FIXED10_SOURCE_SCHEMA_VERSION",
+    "FIXED10_TRUST_BOUNDARY",
     "DatasetCase",
     "DatasetEntry",
     "DatasetError",

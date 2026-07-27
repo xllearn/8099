@@ -1706,6 +1706,158 @@ class Fixed10FreezeTests(unittest.TestCase):
                 self.assertEqual(after.st_nlink, 2)
                 self.assertTrue(os.path.samefile(external, published))
 
+    def test_fixed10_trust_boundary_is_explicit(self) -> None:
+        boundary = getattr(dataset_module, "FIXED10_TRUST_BOUNDARY")
+
+        for required in (
+            "controlled output parent",
+            "same-UID writers are trusted and cooperative",
+            "anchored parent-directory flock",
+            "outside this boundary",
+            "read-only or baked",
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, boundary)
+
+    def test_created_tree_has_controlled_modes_and_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+
+            self.freeze(source_dir, output_dir)
+
+            members = (
+                output_dir,
+                output_dir / "cases",
+                output_dir / "manifest.json",
+                output_dir
+                / "cases"
+                / "case_00000000000000000000000000000001.json",
+            )
+            for member in members:
+                with self.subTest(member=member.name):
+                    info = member.stat()
+                    self.assertIn(info.st_uid, {0, os.geteuid()})
+                    self.assertEqual(info.st_mode & 0o022, 0)
+                    if member.is_file():
+                        self.assertEqual(info.st_nlink, 1)
+
+    def test_freeze_rejects_group_or_other_writable_output_parent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+            root.chmod(0o777)
+            try:
+                self.assert_freeze_rejected(source_dir, output_dir)
+                self.assertEqual(root.stat().st_mode & 0o777, 0o777)
+            finally:
+                root.chmod(0o700)
+
+    def test_existing_tree_rejects_insecure_modes_unchanged(self) -> None:
+        mutations = (
+            ("parent", lambda root, output: root, 0o777),
+            ("root", lambda root, output: output, 0o777),
+            ("cases", lambda root, output: output / "cases", 0o777),
+            (
+                "manifest",
+                lambda root, output: output / "manifest.json",
+                0o666,
+            ),
+            (
+                "case",
+                lambda root, output: output
+                / "cases"
+                / "case_00000000000000000000000000000001.json",
+                0o666,
+            ),
+        )
+        for name, select_target, insecure_mode in mutations:
+            with (
+                self.subTest(name=name),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                _write_fixed10_sources(source_dir)
+                self.freeze(source_dir, output_dir)
+                target = select_target(root, output_dir)
+                target.chmod(insecure_mode)
+                before = _directory_snapshot(output_dir)
+                try:
+                    error_type = getattr(
+                        dataset_module,
+                        "Fixed10FreezeError",
+                    )
+                    with self.assertRaises(error_type):
+                        self.freeze(source_dir, output_dir)
+                    self.assertEqual(_directory_snapshot(output_dir), before)
+                    self.assertEqual(
+                        target.stat().st_mode & 0o777,
+                        insecure_mode,
+                    )
+                finally:
+                    if target == root:
+                        root.chmod(0o700)
+
+    def test_existing_noop_rechecks_content_and_links_before_return(
+        self,
+    ) -> None:
+        for mutation in ("content", "hardlink"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                manifest_path = output_dir / "manifest.json"
+                external = root / "external-manifest.json"
+                _write_fixed10_sources(source_dir)
+                self.freeze(source_dir, output_dir)
+                original = getattr(dataset_module, "_tree_matches_at")
+                check_count = 0
+
+                def mutate_after_first_true(
+                    root_descriptor: int,
+                    expected: object,
+                ) -> bool:
+                    nonlocal check_count
+                    result = original(root_descriptor, expected)
+                    check_count += 1
+                    if check_count == 1 and result:
+                        if mutation == "content":
+                            manifest_path.write_bytes(
+                                manifest_path.read_bytes() + b" "
+                            )
+                        else:
+                            os.link(manifest_path, external)
+                    return result
+
+                error_type = getattr(dataset_module, "Fixed10FreezeError")
+                with (
+                    patch.object(
+                        dataset_module,
+                        "_tree_matches_at",
+                        side_effect=mutate_after_first_true,
+                    ),
+                    self.assertRaises(error_type) as raised,
+                ):
+                    self.freeze(source_dir, output_dir)
+
+                self.assertEqual(raised.exception.category, "output_conflict")
+                self.assertGreaterEqual(check_count, 2)
+                if mutation == "content":
+                    self.assertTrue(manifest_path.read_bytes().endswith(b" "))
+                else:
+                    self.assertEqual(manifest_path.stat().st_nlink, 2)
+
     def test_staged_hardlinked_manifest_or_case_is_never_published(
         self,
     ) -> None:
@@ -1763,6 +1915,250 @@ class Fixed10FreezeTests(unittest.TestCase):
                 self.assertFalse(
                     any("freeze-stage" in path.name for path in root.iterdir())
                 )
+
+    def test_stage_is_rechecked_immediately_before_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            _write_fixed10_sources(source_dir)
+            original = getattr(dataset_module, "_tree_matches_at")
+            check_count = 0
+
+            def mutate_after_first_true(
+                root_descriptor: int,
+                expected: object,
+            ) -> bool:
+                nonlocal check_count
+                result = original(root_descriptor, expected)
+                check_count += 1
+                if check_count == 1 and result:
+                    descriptor = os.open(
+                        "manifest.json",
+                        os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW,
+                        dir_fd=root_descriptor,
+                    )
+                    try:
+                        os.write(descriptor, b" ")
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                return result
+
+            error_type = getattr(dataset_module, "Fixed10FreezeError")
+            with (
+                patch.object(
+                    dataset_module,
+                    "_tree_matches_at",
+                    side_effect=mutate_after_first_true,
+                ),
+                self.assertRaises(error_type),
+            ):
+                self.freeze(source_dir, output_dir)
+
+            self.assertGreaterEqual(check_count, 2)
+            self.assertFalse(output_dir.exists())
+            self.assertFalse(
+                any("freeze-stage" in path.name for path in root.iterdir())
+            )
+
+    def test_post_rename_mutation_is_rolled_back_and_cleaned(self) -> None:
+        for mutation in ("content", "hardlink"):
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                root = Path(tmpdir)
+                source_dir = root / "source"
+                output_dir = root / "output"
+                external = root / "external-manifest.json"
+                _write_fixed10_sources(source_dir)
+                original = getattr(dataset_module, "_rename_noreplace_at")
+                injected = False
+
+                def mutate_inside_rename(
+                    parent_descriptor: int,
+                    source_name: str,
+                    destination_name: str,
+                ) -> None:
+                    nonlocal injected
+                    if destination_name == output_dir.name and not injected:
+                        stage_descriptor = os.open(
+                            source_name,
+                            os.O_RDONLY
+                            | os.O_DIRECTORY
+                            | os.O_NOFOLLOW,
+                            dir_fd=parent_descriptor,
+                        )
+                        try:
+                            if mutation == "content":
+                                manifest_descriptor = os.open(
+                                    "manifest.json",
+                                    os.O_WRONLY
+                                    | os.O_APPEND
+                                    | os.O_NOFOLLOW,
+                                    dir_fd=stage_descriptor,
+                                )
+                                try:
+                                    os.write(manifest_descriptor, b" ")
+                                    os.fsync(manifest_descriptor)
+                                finally:
+                                    os.close(manifest_descriptor)
+                            else:
+                                os.link(
+                                    "manifest.json",
+                                    external,
+                                    src_dir_fd=stage_descriptor,
+                                    follow_symlinks=False,
+                                )
+                            injected = True
+                        finally:
+                            os.close(stage_descriptor)
+                    original(
+                        parent_descriptor,
+                        source_name,
+                        destination_name,
+                    )
+
+                error_type = getattr(dataset_module, "Fixed10FreezeError")
+                with (
+                    patch.object(
+                        dataset_module,
+                        "_rename_noreplace_at",
+                        side_effect=mutate_inside_rename,
+                    ),
+                    self.assertRaises(error_type),
+                ):
+                    self.freeze(source_dir, output_dir)
+
+                self.assertTrue(injected)
+                self.assertFalse(output_dir.exists())
+                self.assertFalse(
+                    any("freeze-stage" in path.name for path in root.iterdir())
+                )
+                if mutation == "hardlink":
+                    self.assertTrue(external.is_file())
+                    self.assertEqual(external.stat().st_nlink, 1)
+
+    def test_unlock_failure_still_closes_duplicated_parent_descriptor(
+        self,
+    ) -> None:
+        import fcntl
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            parent_descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            original_close = os.close
+            original_dup = os.dup
+            original_flock = fcntl.flock
+            duplicated: list[int] = []
+            closed: list[int] = []
+
+            def capture_dup(descriptor: int) -> int:
+                duplicate = original_dup(descriptor)
+                duplicated.append(duplicate)
+                return duplicate
+
+            def capture_close(descriptor: int) -> None:
+                closed.append(descriptor)
+                original_close(descriptor)
+
+            def fail_unlock(descriptor: int, operation: int) -> None:
+                if operation == fcntl.LOCK_UN:
+                    raise OSError("synthetic unlock failure")
+                original_flock(descriptor, operation)
+
+            try:
+                with (
+                    patch.object(
+                        dataset_module.os,
+                        "dup",
+                        side_effect=capture_dup,
+                    ),
+                    patch.object(
+                        dataset_module.os,
+                        "close",
+                        side_effect=capture_close,
+                    ),
+                    patch.object(
+                        fcntl,
+                        "flock",
+                        side_effect=fail_unlock,
+                    ),
+                ):
+                    with dataset_module._fixed10_lock(
+                        parent_descriptor,
+                        timeout_seconds=1.0,
+                    ):
+                        pass
+            finally:
+                for descriptor in duplicated:
+                    if descriptor not in closed:
+                        original_close(descriptor)
+                original_close(parent_descriptor)
+
+            self.assertEqual(len(duplicated), 1)
+            self.assertIn(duplicated[0], closed)
+
+    def test_destination_appearing_at_rename_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source_dir = root / "source"
+            output_dir = root / "output"
+            sentinel = b"do-not-clobber"
+            _write_fixed10_sources(source_dir)
+            original = getattr(dataset_module, "_rename_noreplace_at")
+            injected = False
+
+            def inject_destination(
+                parent_descriptor: int,
+                source_name: str,
+                destination_name: str,
+            ) -> None:
+                nonlocal injected
+                if destination_name == output_dir.name and not injected:
+                    descriptor = os.open(
+                        destination_name,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                    try:
+                        os.write(descriptor, sentinel)
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    os.fsync(parent_descriptor)
+                    injected = True
+                original(
+                    parent_descriptor,
+                    source_name,
+                    destination_name,
+                )
+
+            error_type = getattr(dataset_module, "Fixed10FreezeError")
+            with (
+                patch.object(
+                    dataset_module,
+                    "_rename_noreplace_at",
+                    side_effect=inject_destination,
+                ),
+                self.assertRaises(error_type) as raised,
+            ):
+                self.freeze(source_dir, output_dir)
+
+            self.assertTrue(injected)
+            self.assertEqual(raised.exception.category, "output_conflict")
+            self.assertEqual(output_dir.read_bytes(), sentinel)
+            self.assertFalse(
+                any("freeze-stage" in path.name for path in root.iterdir())
+            )
 
     def test_concurrent_cli_calls_create_once_without_clobber(self) -> None:
         self.assertTrue(FREEZE_SCRIPT.is_file())
