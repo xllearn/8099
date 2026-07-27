@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import stat
 import tempfile
 from collections.abc import Callable, Mapping
@@ -35,6 +36,7 @@ _SAFE_OWNER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _SAFE_ATTEMPT_REF = re.compile(
     r"^attempt_[A-Za-z0-9][A-Za-z0-9._-]{7,119}$"
 )
+_LEASE_TOKEN = re.compile(r"^[0-9a-f]{32}$")
 _CANONICAL_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$"
 )
@@ -53,6 +55,7 @@ _LEASE_FIELDS = {
     "schema_version",
     "key",
     "owner",
+    "lease_token",
     "acquired_at",
     "expires_at",
     "heartbeat_at",
@@ -62,6 +65,19 @@ _LEASE_FIELDS = {
     "issued_at",
 }
 _LEASE_PHASES = {"not_issued", "issued", "indeterminate"}
+_INDETERMINATE_ATTEMPT_FIELDS = {
+    "schema_version",
+    "attempt_ref",
+    "key",
+    "owner",
+    "evaluation_id",
+    "acquired_at",
+    "issued_at",
+    "expired_at",
+    "recovered_at",
+    "request_phase",
+    "error_category",
+}
 _ALLOWED_TRANSITIONS = {
     JobStatus.DISCOVERED: {
         JobStatus.PENDING,
@@ -289,51 +305,73 @@ def _exclusive_create_json(path: Path, value: Mapping[str, Any]) -> None:
     if not payload or len(payload) > _MAX_STORED_JSON_BYTES:
         raise StoreError("stored data operation failed")
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    flags |= getattr(os, "O_BINARY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    descriptor: int | None = None
-    created_identity: tuple[int, int] | None = None
-    try:
-        descriptor = os.open(candidate, flags, 0o600)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise OSError("exclusive target is not regular")
-        created_identity = (opened.st_dev, opened.st_ino)
-        if hasattr(os, "fchmod"):
-            os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb") as handle:
-            descriptor = None
-            written = handle.write(payload)
-            if written != len(payload):
-                raise OSError("short JSON write")
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(candidate.parent)
-    except FileExistsError:
-        raise
-    except (OSError, TypeError, ValueError):
-        if created_identity is not None:
-            try:
-                current = candidate.lstat()
-                if (
-                    stat.S_ISREG(current.st_mode)
-                    and (current.st_dev, current.st_ino) == created_identity
+    guard = candidate.parent / f".{candidate.name}.exclusive.lock"
+    temporary_prefix = f".{candidate.name}.exclusive."
+    with _portalocker_guard(guard):
+        removed_orphan = False
+        try:
+            for orphan in candidate.parent.glob(
+                f"{temporary_prefix}*.tmp"
+            ):
+                info = orphan.lstat()
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(
+                    info.st_mode
                 ):
-                    candidate.unlink()
-                    _fsync_directory(candidate.parent)
-            except OSError:
-                pass
-        raise StoreError("stored data operation failed") from None
-    finally:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+                    raise StoreError("stored data operation failed")
+                orphan.unlink()
+                removed_orphan = True
+            if removed_orphan:
+                _fsync_directory(candidate.parent)
+            if not _target_is_absent(candidate):
+                raise FileExistsError(str(candidate))
+        except FileExistsError:
+            raise
+        except StoreError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise StoreError("stored data operation failed") from None
+
+        descriptor: int | None = None
+        temporary: Path | None = None
+        removed_temporary = False
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=temporary_prefix,
+                suffix=".tmp",
+                dir=candidate.parent,
+            )
+            temporary = Path(temporary_name)
+            os.chmod(temporary, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                written = handle.write(payload)
+                if written != len(payload):
+                    raise OSError("short JSON write")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.link(temporary, candidate)
+            _fsync_directory(candidate.parent)
+        except FileExistsError:
+            raise
+        except (OSError, TypeError, ValueError):
+            raise StoreError("stored data operation failed") from None
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                    removed_temporary = True
+                except OSError:
+                    pass
+            if removed_temporary:
+                _fsync_directory(candidate.parent)
 
 
-def _ensure_private_guard_file(path: Path) -> None:
+def _open_private_guard_file(path: Path) -> BinaryIO:
     _prepare_private_directory(path.parent)
     flags = os.O_RDWR | os.O_CREAT
     flags |= getattr(os, "O_BINARY", 0)
@@ -346,6 +384,17 @@ def _ensure_private_guard_file(path: Path) -> None:
             raise OSError("guard is not a regular file")
         if hasattr(os, "fchmod"):
             os.fchmod(descriptor, 0o600)
+        path_info = path.lstat()
+        if (
+            stat.S_ISLNK(path_info.st_mode)
+            or not stat.S_ISREG(path_info.st_mode)
+            or (path_info.st_dev, path_info.st_ino)
+            != (info.st_dev, info.st_ino)
+        ):
+            raise OSError("guard identity changed")
+        handle = os.fdopen(descriptor, "a+b", buffering=0)
+        descriptor = None
+        return handle
     except (OSError, TypeError, ValueError):
         raise StoreError("storage lock is unavailable") from None
     finally:
@@ -358,18 +407,34 @@ def _ensure_private_guard_file(path: Path) -> None:
 
 @contextmanager
 def _portalocker_guard(path: Path) -> Iterator[None]:
-    _ensure_private_guard_file(path)
+    handle = _open_private_guard_file(path)
+    locked = False
     try:
-        with portalocker.Lock(str(path), mode="a", timeout=30):
+        try:
+            portalocker.lock(handle, portalocker.LOCK_EX)
+            locked = True
+            opened = os.fstat(handle.fileno())
+            current = path.lstat()
+            if (
+                stat.S_ISLNK(current.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino)
+                != (opened.st_dev, opened.st_ino)
+            ):
+                raise OSError("guard identity changed after lock")
+        except (OSError, TypeError, ValueError, portalocker.LockException):
+            raise StoreError("storage lock is unavailable") from None
+        yield
+    finally:
+        if locked:
             try:
-                os.chmod(path, 0o600)
-            except OSError:
-                raise StoreError("storage lock is unavailable") from None
-            yield
-    except StoreError:
-        raise
-    except Exception:
-        raise StoreError("storage lock is unavailable") from None
+                portalocker.unlock(handle)
+            except Exception:
+                pass
+        try:
+            handle.close()
+        except OSError:
+            pass
 
 
 def _validate_pattern(
@@ -396,6 +461,14 @@ def _validate_key(value: object) -> str:
 
 def _validate_owner(value: object) -> str:
     return _validate_pattern(value, _SAFE_OWNER, "lease owner is invalid")
+
+
+def _validate_lease_token(value: object) -> str:
+    return _validate_pattern(
+        value,
+        _LEASE_TOKEN,
+        "lease token is invalid",
+    )
 
 
 def _validate_evaluation_id(value: object) -> str:
@@ -704,58 +777,74 @@ class AdvisoryStore:
         _prepare_private_directory(directory)
         guard = directory / ".index.lock"
         with _portalocker_guard(guard):
-            history_path = directory / f"{job.job_id}.json"
-            if _target_is_absent(history_path):
-                try:
-                    _exclusive_create_json(
-                        history_path,
-                        job.model_dump(mode="json"),
-                    )
-                except FileExistsError:
-                    pass
-            else:
-                existing = _strict_job_from_file(history_path)
+            with _portalocker_guard(self._job_guard_path(job.job_id)):
+                canonical = self.read_job(job.job_id)
                 if (
-                    existing.job_id != job.job_id
-                    or existing.run_ref != job.run_ref
-                    or existing.report_version != job.report_version
-                    or existing.created_at != job.created_at
+                    canonical.job_id != job.job_id
+                    or canonical.run_ref != job.run_ref
+                    or canonical.report_version != job.report_version
+                    or canonical.created_at != job.created_at
                 ):
                     raise StoreError(
                         "stored data is invalid or unavailable"
-                    )
-                if existing != job:
-                    _atomic_write_json(
-                        history_path,
-                        job.model_dump(mode="json"),
                     )
 
-            indexed: list[AdvisoryJob] = []
-            for path in sorted(directory.glob("*.json")):
-                if path.name == "latest.json":
-                    continue
-                candidate = _strict_job_from_file(path)
-                if (
-                    candidate.run_ref != job.run_ref
-                    or candidate.report_version != job.report_version
-                ):
+                history_path = directory / f"{canonical.job_id}.json"
+                if _target_is_absent(history_path):
+                    try:
+                        _exclusive_create_json(
+                            history_path,
+                            canonical.model_dump(mode="json"),
+                        )
+                    except FileExistsError:
+                        pass
+                else:
+                    existing = _strict_job_from_file(history_path)
+                    if (
+                        existing.job_id != canonical.job_id
+                        or existing.run_ref != canonical.run_ref
+                        or existing.report_version
+                        != canonical.report_version
+                        or existing.created_at != canonical.created_at
+                    ):
+                        raise StoreError(
+                            "stored data is invalid or unavailable"
+                        )
+                    if existing != canonical:
+                        _atomic_write_json(
+                            history_path,
+                            canonical.model_dump(mode="json"),
+                        )
+
+                indexed: list[AdvisoryJob] = []
+                for path in sorted(directory.glob("*.json")):
+                    if path.name == "latest.json":
+                        continue
+                    candidate = _strict_job_from_file(path)
+                    if (
+                        candidate.run_ref != canonical.run_ref
+                        or candidate.report_version
+                        != canonical.report_version
+                    ):
+                        raise StoreError(
+                            "stored data is invalid or unavailable"
+                        )
+                    indexed.append(candidate)
+                if not indexed:
                     raise StoreError(
                         "stored data is invalid or unavailable"
                     )
-                indexed.append(candidate)
-            if not indexed:
-                raise StoreError("stored data is invalid or unavailable")
-            latest = max(
-                indexed,
-                key=lambda candidate: (
-                    candidate.created_at,
-                    candidate.job_id,
-                ),
-            )
-            _atomic_write_json(
-                directory / "latest.json",
-                latest.model_dump(mode="json"),
-            )
+                latest = max(
+                    indexed,
+                    key=lambda candidate: (
+                        candidate.created_at,
+                        candidate.job_id,
+                    ),
+                )
+                _atomic_write_json(
+                    directory / "latest.json",
+                    latest.model_dump(mode="json"),
+                )
 
     def read_latest_job(
         self,
@@ -791,6 +880,7 @@ class AdvisoryStore:
             if key != expected_key:
                 raise StoreError("stored data is invalid or unavailable")
             _validate_owner(value["owner"])
+            _validate_lease_token(value["lease_token"])
             acquired = _parse_canonical_timestamp(value["acquired_at"])
             heartbeat = _parse_canonical_timestamp(value["heartbeat_at"])
             expires = _parse_canonical_timestamp(value["expires_at"])
@@ -842,6 +932,7 @@ class AdvisoryStore:
             "schema_version": "8099.deepeval-lease/v1",
             "key": key,
             "owner": owner,
+            "lease_token": secrets.token_hex(16),
             "acquired_at": acquired_at,
             "expires_at": _format_canonical_timestamp(
                 now + timedelta(seconds=ttl_seconds)
@@ -885,7 +976,10 @@ class AdvisoryStore:
                 )
                 _atomic_write_json(lease_path, replacement)
                 return True
-            self._record_indeterminate_attempt(lease)
+            self._record_indeterminate_attempt(
+                lease,
+                recovered_at=_format_canonical_timestamp(now),
+            )
             if lease["request_phase"] == "issued":
                 lease["request_phase"] = "indeterminate"
                 _atomic_write_json(lease_path, lease)
@@ -894,8 +988,24 @@ class AdvisoryStore:
     def _record_indeterminate_attempt(
         self,
         lease: Mapping[str, Any],
+        *,
+        recovered_at: str,
     ) -> None:
         attempt_ref = _validate_attempt_ref(lease["attempt_ref"])
+        safe_recovered_at = _format_canonical_timestamp(
+            _parse_canonical_timestamp(recovered_at)
+        )
+        acquired_at = _format_canonical_timestamp(
+            _parse_canonical_timestamp(lease["acquired_at"])
+        )
+        issued_at = _format_canonical_timestamp(
+            _parse_canonical_timestamp(lease["issued_at"])
+        )
+        expired_at = _format_canonical_timestamp(
+            _parse_canonical_timestamp(lease["expires_at"])
+        )
+        if not acquired_at <= issued_at <= expired_at <= safe_recovered_at:
+            raise StoreError("stored data is invalid or unavailable")
         value = {
             "schema_version": "8099.deepeval-attempt/v1",
             "attempt_ref": attempt_ref,
@@ -904,10 +1014,10 @@ class AdvisoryStore:
             "evaluation_id": _validate_evaluation_id(
                 lease["evaluation_id"]
             ),
-            "acquired_at": lease["acquired_at"],
-            "issued_at": lease["issued_at"],
-            "expired_at": lease["expires_at"],
-            "recovered_at": lease["expires_at"],
+            "acquired_at": acquired_at,
+            "issued_at": issued_at,
+            "expired_at": expired_at,
+            "recovered_at": safe_recovered_at,
             "request_phase": "indeterminate",
             "error_category": "outcome_unknown",
         }
@@ -916,7 +1026,26 @@ class AdvisoryStore:
             _exclusive_create_json(path, value)
         except FileExistsError:
             existing = _read_json_object(path)
-            if existing != value:
+            if set(existing) != _INDETERMINATE_ATTEMPT_FIELDS:
+                raise StoreError(
+                    "stored data is invalid or unavailable"
+                ) from None
+            existing_recovered_at = _format_canonical_timestamp(
+                _parse_canonical_timestamp(existing["recovered_at"])
+            )
+            if not (
+                expired_at
+                <= existing_recovered_at
+                <= safe_recovered_at
+            ):
+                raise StoreError(
+                    "stored data is invalid or unavailable"
+                ) from None
+            existing_without_recovery = dict(existing)
+            existing_without_recovery.pop("recovered_at")
+            value_without_recovery = dict(value)
+            value_without_recovery.pop("recovered_at")
+            if existing_without_recovery != value_without_recovery:
                 raise StoreError(
                     "stored data is invalid or unavailable"
                 ) from None
@@ -926,14 +1055,20 @@ class AdvisoryStore:
         key: str,
         owner: str,
         ttl_seconds: int,
+        *,
+        lease_token: str,
     ) -> dict[str, Any]:
         safe_key = _validate_key(key)
         safe_owner = _validate_owner(owner)
         safe_ttl = _validate_ttl(ttl_seconds)
+        safe_lease_token = _validate_lease_token(lease_token)
         with _portalocker_guard(self._lease_guard_path(safe_key)):
             lease = self.read_lease(safe_key)
-            if lease["owner"] != safe_owner:
-                raise StoreError("lease owner does not match")
+            if (
+                lease["owner"] != safe_owner
+                or lease["lease_token"] != safe_lease_token
+            ):
+                raise StoreError("lease holder does not match")
             now = self._now_datetime()
             if now >= _parse_canonical_timestamp(lease["expires_at"]):
                 raise StoreError("lease is expired")
@@ -956,15 +1091,21 @@ class AdvisoryStore:
         owner: str,
         evaluation_id: str,
         attempt_ref: str,
+        *,
+        lease_token: str,
     ) -> dict[str, Any]:
         safe_key = _validate_key(key)
         safe_owner = _validate_owner(owner)
         safe_evaluation_id = _validate_evaluation_id(evaluation_id)
         safe_attempt_ref = _validate_attempt_ref(attempt_ref)
+        safe_lease_token = _validate_lease_token(lease_token)
         with _portalocker_guard(self._lease_guard_path(safe_key)):
             lease = self.read_lease(safe_key)
-            if lease["owner"] != safe_owner:
-                raise StoreError("lease owner does not match")
+            if (
+                lease["owner"] != safe_owner
+                or lease["lease_token"] != safe_lease_token
+            ):
+                raise StoreError("lease holder does not match")
             now = self._now_datetime()
             if now >= _parse_canonical_timestamp(lease["expires_at"]):
                 raise StoreError("lease is expired")
@@ -994,28 +1135,50 @@ class AdvisoryStore:
             _atomic_write_json(self._lease_path(safe_key), validated)
             return validated
 
-    def release_lease(self, key: str, owner: str) -> bool:
+    def release_lease(
+        self,
+        key: str,
+        owner: str,
+        *,
+        lease_token: str,
+    ) -> bool:
         safe_key = _validate_key(key)
         safe_owner = _validate_owner(owner)
+        safe_lease_token = _validate_lease_token(lease_token)
         lease_path = self._lease_path(safe_key)
         with _portalocker_guard(self._lease_guard_path(safe_key)):
             if _target_is_absent(lease_path):
                 return False
             lease = self.read_lease(safe_key)
-            if lease["owner"] != safe_owner:
-                raise StoreError("lease owner does not match")
-            if lease["request_phase"] == "indeterminate":
-                self._record_indeterminate_attempt(lease)
-                return False
             if (
-                lease["request_phase"] == "issued"
-                and self._now_datetime()
-                >= _parse_canonical_timestamp(lease["expires_at"])
+                lease["owner"] != safe_owner
+                or lease["lease_token"] != safe_lease_token
             ):
-                self._record_indeterminate_attempt(lease)
-                lease["request_phase"] = "indeterminate"
-                _atomic_write_json(lease_path, lease)
+                raise StoreError("lease holder does not match")
+            if lease["request_phase"] == "indeterminate":
+                recovered_at = _format_canonical_timestamp(
+                    self._now_datetime()
+                )
+                self._record_indeterminate_attempt(
+                    lease,
+                    recovered_at=recovered_at,
+                )
                 return False
+            if lease["request_phase"] == "issued":
+                recovered_at = _format_canonical_timestamp(
+                    self._now_datetime()
+                )
+                if (
+                    _parse_canonical_timestamp(recovered_at)
+                    >= _parse_canonical_timestamp(lease["expires_at"])
+                ):
+                    self._record_indeterminate_attempt(
+                        lease,
+                        recovered_at=recovered_at,
+                    )
+                    lease["request_phase"] = "indeterminate"
+                    _atomic_write_json(lease_path, lease)
+                    return False
             try:
                 info = lease_path.lstat()
                 if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(
@@ -1050,15 +1213,6 @@ class AdvisoryStore:
         with _portalocker_guard(self._job_guard_path(safe_job_id)):
             current = self.read_job(safe_job_id)
             if (
-                current.status is JobStatus.CACHED
-                and current.evaluation_id == safe_evaluation_id
-                and current.source_evaluation_id
-                == cached_source.evaluation_id
-            ):
-                return self.read_result(safe_job_id)
-            if current.status is not JobStatus.RUNNING:
-                raise StoreError("job transition is not allowed")
-            if (
                 current.advisory_input_sha256
                 != cached_source.advisory_input_sha256
             ):
@@ -1074,27 +1228,42 @@ class AdvisoryStore:
                         current.advisory_input_sha256
                     ),
                     "status": JobStatus.CACHED.value,
-                    "created_at": self._now(),
+                    "created_at": current.created_at,
                 }
             )
-            cached_result = _coerce_result(result_value)
-            job_value = current.model_dump(mode="json")
-            job_value.update(
-                {
-                    "status": JobStatus.CACHED.value,
-                    "updated_at": self._now(),
-                    "evaluation_id": safe_evaluation_id,
-                    "source_evaluation_id": (
-                        cached_source.evaluation_id
-                    ),
-                }
-            )
-            cached_job = _coerce_job(job_value)
-            self.write_result(cached_result)
-            _atomic_write_json(
-                self._job_path(safe_job_id),
-                cached_job.model_dump(mode="json"),
-            )
+            expected_result = _coerce_result(result_value)
+            if (
+                current.status is JobStatus.CACHED
+                and current.evaluation_id == safe_evaluation_id
+                and current.source_evaluation_id
+                == cached_source.evaluation_id
+            ):
+                cached_result = self.read_result(safe_job_id)
+                if cached_result != expected_result:
+                    raise StoreError(
+                        "stored data is invalid or unavailable"
+                    )
+                cached_job = current
+            elif current.status is JobStatus.RUNNING:
+                job_value = current.model_dump(mode="json")
+                job_value.update(
+                    {
+                        "status": JobStatus.CACHED.value,
+                        "updated_at": self._now(),
+                        "evaluation_id": safe_evaluation_id,
+                        "source_evaluation_id": (
+                            cached_source.evaluation_id
+                        ),
+                    }
+                )
+                cached_job = _coerce_job(job_value)
+                cached_result = self.write_result(expected_result)
+                _atomic_write_json(
+                    self._job_path(safe_job_id),
+                    cached_job.model_dump(mode="json"),
+                )
+            else:
+                raise StoreError("job transition is not allowed")
         self._record_run_index(cached_job)
         return cached_result
 
@@ -1126,6 +1295,27 @@ class AdvisoryStore:
         )
         completed = status_counts[JobStatus.COMPLETED.value]
         cached = status_counts[JobStatus.CACHED.value]
+        valid_score_reports = 0
+        for job in latest.values():
+            if job.status not in {
+                JobStatus.COMPLETED,
+                JobStatus.CACHED,
+            }:
+                continue
+            try:
+                result = self.read_result(job.job_id)
+            except StoreError:
+                continue
+            if (
+                job.evaluation_id is not None
+                and result.evaluation_id == job.evaluation_id
+                and result.job_id == job.job_id
+                and result.run_ref == job.run_ref
+                and result.advisory_input_sha256
+                == job.advisory_input_sha256
+                and result.status is job.status
+            ):
+                valid_score_reports += 1
         coverage: dict[str, Any] = {
             "schema_version": "8099.deepeval-coverage/v1",
             "coverage_scope": "latest_job_per_run_ref_report_version",
@@ -1134,7 +1324,7 @@ class AdvisoryStore:
             "terminal_reports": terminal,
             "scored_reports": completed,
             "cached_reports": cached,
-            "valid_score_reports": completed + cached,
+            "valid_score_reports": valid_score_reports,
             "status_counts": status_counts,
         }
         for status in JobStatus:

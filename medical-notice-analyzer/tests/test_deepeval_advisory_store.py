@@ -27,7 +27,11 @@ from app.deepeval_advisory.models import (
     MetricObservation,
     MetricStatus,
 )
-from app.deepeval_advisory.store import AdvisoryStore, StoreError
+from app.deepeval_advisory.store import (
+    AdvisoryStore,
+    StoreError,
+    _atomic_write_json,
+)
 
 
 RUN_REF = "runref_" + "a" * 32
@@ -280,6 +284,141 @@ class AdvisoryStoreLayoutAndAtomicityTests(unittest.TestCase):
             )
             self.assertNotIn(secret, str(raised.exception))
 
+    @unittest.skipUnless(
+        hasattr(os, "link"),
+        "atomic no-replace publication requires hard-link support",
+    )
+    def test_exclusive_create_never_exposes_partial_final_to_reader(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            result = make_result()
+            final_path = root / "results" / f"{result.job_id}.json"
+            before_publish = threading.Event()
+            allow_publish = threading.Event()
+            errors: list[BaseException] = []
+            real_link = os.link
+
+            def paused_link(
+                source: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                destination: str
+                | bytes
+                | os.PathLike[str]
+                | os.PathLike[bytes],
+                *args: Any,
+                **kwargs: Any,
+            ) -> None:
+                before_publish.set()
+                if not allow_publish.wait(10):
+                    raise RuntimeError("publish pause timed out")
+                real_link(source, destination, *args, **kwargs)
+
+            def write_result() -> None:
+                try:
+                    store.write_result(result)
+                except BaseException as exc:  # pragma: no cover - asserted
+                    errors.append(exc)
+
+            with patch(
+                "app.deepeval_advisory.store.os.link",
+                side_effect=paused_link,
+            ):
+                writer = threading.Thread(target=write_result)
+                writer.start()
+                try:
+                    self.assertTrue(before_publish.wait(3))
+                    self.assertFalse(final_path.exists())
+                    with self.assertRaises(StoreError):
+                        store.read_result(result.job_id)
+                finally:
+                    allow_publish.set()
+                    writer.join(10)
+
+            self.assertFalse(writer.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(store.read_result(result.job_id), result)
+            self.assertEqual(
+                list(
+                    final_path.parent.glob(
+                        f".{final_path.name}.exclusive.*.tmp"
+                    )
+                ),
+                [],
+            )
+
+    def test_exclusive_create_fsync_failure_cleans_final_and_orphan_temp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            result = make_result()
+            final_path = root / "results" / f"{result.job_id}.json"
+            orphan = (
+                final_path.parent
+                / f".{final_path.name}.exclusive.orphan.tmp"
+            )
+            orphan.write_bytes(b"orphan")
+
+            with patch(
+                "app.deepeval_advisory.store.os.fsync",
+                side_effect=OSError("PRIVATE_FSYNC_FAILURE"),
+            ):
+                with self.assertRaises(StoreError):
+                    store.write_result(result)
+
+            self.assertFalse(final_path.exists())
+            self.assertFalse(orphan.exists())
+            self.assertEqual(
+                list(
+                    final_path.parent.glob(
+                        f".{final_path.name}.exclusive.*.tmp"
+                    )
+                ),
+                [],
+            )
+            self.assertEqual(store.write_result(result), result)
+
+    @unittest.skipUnless(
+        hasattr(os, "link"),
+        "atomic no-replace publication requires hard-link support",
+    )
+    def test_exclusive_create_link_failure_or_crash_never_publishes(
+        self,
+    ) -> None:
+        for failure, expected_error in (
+            (OSError("PRIVATE_LINK_FAILURE"), StoreError),
+            (RuntimeError("SIMULATED_CRASH"), RuntimeError),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    store = AdvisoryStore(root)
+                    result = make_result()
+                    final_path = (
+                        root / "results" / f"{result.job_id}.json"
+                    )
+
+                    with patch(
+                        "app.deepeval_advisory.store.os.link",
+                        side_effect=failure,
+                    ):
+                        with self.assertRaises(expected_error):
+                            store.write_result(result)
+
+                    self.assertFalse(final_path.exists())
+                    self.assertEqual(
+                        list(
+                            final_path.parent.glob(
+                                f".{final_path.name}.exclusive.*.tmp"
+                            )
+                        ),
+                        [],
+                    )
+                    self.assertEqual(store.write_result(result), result)
+
 
 class AdvisoryJobPersistenceTests(unittest.TestCase):
     def test_create_job_is_idempotent_and_never_overwrites(self) -> None:
@@ -423,6 +562,41 @@ class AdvisoryJobPersistenceTests(unittest.TestCase):
                 store.write_result(conflicting)
             self.assertEqual(store.read_result(result.job_id), result)
 
+    def test_stale_run_index_snapshot_cannot_regress_canonical_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            running = make_job(
+                job_id="job_index_monotonic",
+                status=JobStatus.RUNNING,
+            )
+            store.create_job(running)
+            completed = store.transition_job(
+                running.job_id,
+                JobStatus.COMPLETED,
+                evaluation_id="eval_index_12345678",
+            )
+
+            store._record_run_index(running)
+
+            self.assertEqual(
+                store.read_latest_job(RUN_REF, 1),
+                completed,
+            )
+            history_path = (
+                root
+                / "run-index"
+                / RUN_REF
+                / "v00000001"
+                / f"{running.job_id}.json"
+            )
+            self.assertEqual(
+                json.loads(history_path.read_text(encoding="utf-8"))[
+                    "status"
+                ],
+                JobStatus.COMPLETED.value,
+            )
+
     def test_unsafe_identifiers_are_rejected_before_path_access(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = AdvisoryStore(Path(directory))
@@ -467,6 +641,7 @@ class AdvisoryLeaseTests(unittest.TestCase):
             lease = store.read_lease(ADVISORY_KEY)
             self.assertIn(lease["owner"], {"worker-a", "worker-b"})
             self.assertEqual(lease["request_phase"], "not_issued")
+            self.assertRegex(lease["lease_token"], r"^[0-9a-f]{32}$")
 
     @unittest.skipUnless(
         os.name == "posix",
@@ -524,6 +699,9 @@ class AdvisoryLeaseTests(unittest.TestCase):
                     ttl_seconds=10,
                 )
             )
+            first_lease = store.read_lease(ADVISORY_KEY)
+            self.assertIn("lease_token", first_lease)
+            old_token = first_lease["lease_token"]
             clock.advance(11)
 
             self.assertTrue(
@@ -537,6 +715,7 @@ class AdvisoryLeaseTests(unittest.TestCase):
             self.assertEqual(lease["owner"], "worker-b")
             self.assertEqual(lease["request_phase"], "not_issued")
             self.assertIsNone(lease["issued_at"])
+            self.assertNotEqual(lease["lease_token"], old_token)
 
     def test_stale_issued_lease_becomes_one_indeterminate_attempt_no_retry(
         self,
@@ -552,11 +731,13 @@ class AdvisoryLeaseTests(unittest.TestCase):
                     ttl_seconds=10,
                 )
             )
+            lease_token = store.read_lease(ADVISORY_KEY)["lease_token"]
             issued = store.mark_request_issued(
                 ADVISORY_KEY,
                 "worker-a",
                 "eval_issued_12345678",
                 "attempt_issued_12345678",
+                lease_token=lease_token,
             )
             self.assertEqual(issued["request_phase"], "issued")
             clock.advance(11)
@@ -572,6 +753,12 @@ class AdvisoryLeaseTests(unittest.TestCase):
             self.assertEqual(recovered["request_phase"], "indeterminate")
             attempts = list((root / "attempts").glob("*.json"))
             self.assertEqual(len(attempts), 1)
+            attempt = json.loads(attempts[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                attempt["recovered_at"],
+                "2026-07-27T01:02:14.004Z",
+            )
+            self.assertNotIn("lease_token", attempt)
             first_attempt = attempts[0].read_bytes()
 
             clock.advance(30)
@@ -602,11 +789,13 @@ class AdvisoryLeaseTests(unittest.TestCase):
                     ttl_seconds=10,
                 )
             )
+            lease_token = store.read_lease(ADVISORY_KEY)["lease_token"]
             store.mark_request_issued(
                 ADVISORY_KEY,
                 "worker-a",
                 "eval_release_12345678",
                 "attempt_release_12345678",
+                lease_token=lease_token,
             )
             clock.advance(11)
 
@@ -615,6 +804,7 @@ class AdvisoryLeaseTests(unittest.TestCase):
                     ADVISORY_KEY,
                     "worker-a",
                     ttl_seconds=10,
+                    lease_token=lease_token,
                 )
             with self.assertRaises(StoreError):
                 store.mark_request_issued(
@@ -622,6 +812,7 @@ class AdvisoryLeaseTests(unittest.TestCase):
                     "worker-a",
                     "eval_release_12345678",
                     "attempt_release_12345678",
+                    lease_token=lease_token,
                 )
             self.assertEqual(
                 store.read_lease(ADVISORY_KEY)["request_phase"],
@@ -629,7 +820,11 @@ class AdvisoryLeaseTests(unittest.TestCase):
             )
 
             self.assertFalse(
-                store.release_lease(ADVISORY_KEY, "worker-a")
+                store.release_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    lease_token=lease_token,
+                )
             )
             lease_path = root / "leases" / f"{ADVISORY_KEY}.json"
             self.assertTrue(lease_path.is_file())
@@ -642,7 +837,11 @@ class AdvisoryLeaseTests(unittest.TestCase):
             first_attempt = attempts[0].read_bytes()
 
             self.assertFalse(
-                store.release_lease(ADVISORY_KEY, "worker-a")
+                store.release_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    lease_token=lease_token,
+                )
             )
             self.assertFalse(
                 store.try_acquire_lease(
@@ -658,6 +857,80 @@ class AdvisoryLeaseTests(unittest.TestCase):
             self.assertEqual(attempts[0].read_bytes(), first_attempt)
             self.assertTrue(lease_path.is_file())
 
+    def test_reclaimed_lease_fences_stale_token_for_same_owner(self) -> None:
+        clock = MutableClock()
+        with tempfile.TemporaryDirectory() as directory:
+            store = AdvisoryStore(Path(directory), clock=clock)
+            self.assertTrue(
+                store.try_acquire_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    ttl_seconds=10,
+                )
+            )
+            first_lease = store.read_lease(ADVISORY_KEY)
+            self.assertIn("lease_token", first_lease)
+            old_token = first_lease["lease_token"]
+            clock.advance(11)
+            self.assertTrue(
+                store.try_acquire_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    ttl_seconds=20,
+                )
+            )
+            new_lease = store.read_lease(ADVISORY_KEY)
+            new_token = new_lease["lease_token"]
+            self.assertNotEqual(old_token, new_token)
+
+            for operation in (
+                lambda: store.heartbeat_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    ttl_seconds=10,
+                    lease_token=old_token,
+                ),
+                lambda: store.mark_request_issued(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    "eval_fenced_12345678",
+                    "attempt_fenced_12345678",
+                    lease_token=old_token,
+                ),
+                lambda: store.release_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    lease_token=old_token,
+                ),
+            ):
+                with self.subTest(operation=operation), self.assertRaises(
+                    StoreError
+                ):
+                    operation()
+
+            self.assertEqual(store.read_lease(ADVISORY_KEY), new_lease)
+            heartbeat = store.heartbeat_lease(
+                ADVISORY_KEY,
+                "worker-a",
+                ttl_seconds=10,
+                lease_token=new_token,
+            )
+            self.assertEqual(heartbeat["lease_token"], new_token)
+            store.mark_request_issued(
+                ADVISORY_KEY,
+                "worker-a",
+                "eval_fenced_12345678",
+                "attempt_fenced_12345678",
+                lease_token=new_token,
+            )
+            self.assertTrue(
+                store.release_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    lease_token=new_token,
+                )
+            )
+
     def test_heartbeat_mark_issued_and_release_require_owner_match(self) -> None:
         clock = MutableClock()
         with tempfile.TemporaryDirectory() as directory:
@@ -670,19 +943,26 @@ class AdvisoryLeaseTests(unittest.TestCase):
                     ttl_seconds=10,
                 )
             )
+            lease_token = store.read_lease(ADVISORY_KEY)["lease_token"]
             for operation in (
                 lambda: store.heartbeat_lease(
                     ADVISORY_KEY,
                     "worker-b",
                     ttl_seconds=10,
+                    lease_token=lease_token,
                 ),
                 lambda: store.mark_request_issued(
                     ADVISORY_KEY,
                     "worker-b",
                     "eval_issued_12345678",
                     "attempt_issued_12345678",
+                    lease_token=lease_token,
                 ),
-                lambda: store.release_lease(ADVISORY_KEY, "worker-b"),
+                lambda: store.release_lease(
+                    ADVISORY_KEY,
+                    "worker-b",
+                    lease_token=lease_token,
+                ),
             ):
                 with self.subTest(operation=operation), self.assertRaises(
                     StoreError
@@ -694,6 +974,7 @@ class AdvisoryLeaseTests(unittest.TestCase):
                 ADVISORY_KEY,
                 "worker-a",
                 ttl_seconds=10,
+                lease_token=lease_token,
             )
             self.assertEqual(
                 heartbeat["heartbeat_at"],
@@ -708,8 +989,15 @@ class AdvisoryLeaseTests(unittest.TestCase):
                 "worker-a",
                 "eval_issued_12345678",
                 "attempt_issued_12345678",
+                lease_token=lease_token,
             )
-            self.assertTrue(store.release_lease(ADVISORY_KEY, "worker-a"))
+            self.assertTrue(
+                store.release_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    lease_token=lease_token,
+                )
+            )
             self.assertFalse((root / "leases" / f"{ADVISORY_KEY}.json").exists())
 
     def test_corrupt_lease_fails_closed_without_content_echo(self) -> None:
@@ -749,6 +1037,30 @@ class AdvisoryLeaseTests(unittest.TestCase):
             )
             self.assertNotIn(secret, str(raised.exception))
             self.assertEqual(lease_path.read_bytes(), before)
+
+    def test_pre_fencing_lease_without_token_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            self.assertTrue(
+                store.try_acquire_lease(
+                    ADVISORY_KEY,
+                    "worker-a",
+                    ttl_seconds=10,
+                )
+            )
+            lease_path = root / "leases" / f"{ADVISORY_KEY}.json"
+            value = json.loads(lease_path.read_text(encoding="utf-8"))
+            value.pop("lease_token", None)
+            lease_path.write_bytes(canonical_json_bytes(value))
+
+            with self.assertRaises(StoreError) as raised:
+                store.read_lease(ADVISORY_KEY)
+
+            self.assertEqual(
+                str(raised.exception),
+                "stored data is invalid or unavailable",
+            )
 
     def test_lease_key_owner_and_ttl_are_strictly_validated(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1019,6 +1331,160 @@ class AdvisoryCacheTests(unittest.TestCase):
                 (root / "results" / f"{current_job.job_id}.json").is_file()
             )
 
+    def test_cache_hit_retry_reuses_result_after_job_write_failure(self) -> None:
+        clock = MutableClock()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root, clock=clock)
+            source = make_result()
+            current_job = make_job(
+                job_id="job_cache_reconcile_one",
+                run_ref=SECOND_RUN_REF,
+                status=JobStatus.RUNNING,
+            )
+            store.create_job(current_job)
+            real_atomic_write = _atomic_write_json
+            failed = False
+
+            def fail_first_job_write(
+                path: Path,
+                value: Any,
+            ) -> None:
+                nonlocal failed
+                if (
+                    not failed
+                    and path.parent.name == "jobs"
+                    and path.name == f"{current_job.job_id}.json"
+                ):
+                    failed = True
+                    raise StoreError("injected job write failure")
+                real_atomic_write(path, value)
+
+            with patch(
+                "app.deepeval_advisory.store._atomic_write_json",
+                side_effect=fail_first_job_write,
+            ):
+                with self.assertRaises(StoreError):
+                    store.record_cache_hit(
+                        current_job.job_id,
+                        source,
+                        evaluation_id="eval_reconcile_12345678",
+                    )
+
+            first_result = store.read_result(current_job.job_id)
+            self.assertEqual(first_result.created_at, current_job.created_at)
+            self.assertEqual(
+                store.read_job(current_job.job_id).status,
+                JobStatus.RUNNING,
+            )
+            clock.advance(30)
+
+            retried = store.record_cache_hit(
+                current_job.job_id,
+                source,
+                evaluation_id="eval_reconcile_12345678",
+            )
+
+            self.assertEqual(retried, first_result)
+            cached_job = store.read_job(current_job.job_id)
+            self.assertEqual(cached_job.status, JobStatus.CACHED)
+            self.assertEqual(
+                cached_job.source_evaluation_id,
+                source.evaluation_id,
+            )
+            self.assertEqual(
+                store.read_latest_job(
+                    current_job.run_ref,
+                    current_job.report_version,
+                ),
+                cached_job,
+            )
+            self.assertEqual(
+                len(list((root / "results").glob("*.json"))),
+                1,
+            )
+
+    def test_cache_hit_retry_repairs_index_after_job_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            source = make_result()
+            current_job = make_job(
+                job_id="job_cache_reconcile_two",
+                run_ref=SECOND_RUN_REF,
+                status=JobStatus.RUNNING,
+            )
+            store.create_job(current_job)
+
+            with patch.object(
+                store,
+                "_record_run_index",
+                side_effect=StoreError("injected index failure"),
+            ):
+                with self.assertRaises(StoreError):
+                    store.record_cache_hit(
+                        current_job.job_id,
+                        source,
+                        evaluation_id="eval_repair_12345678",
+                    )
+
+            cached_job = store.read_job(current_job.job_id)
+            self.assertEqual(cached_job.status, JobStatus.CACHED)
+            self.assertEqual(
+                store.read_latest_job(
+                    current_job.run_ref,
+                    current_job.report_version,
+                ).status,
+                JobStatus.RUNNING,
+            )
+
+            retried = store.record_cache_hit(
+                current_job.job_id,
+                source,
+                evaluation_id="eval_repair_12345678",
+            )
+
+            self.assertEqual(retried, store.read_result(current_job.job_id))
+            self.assertEqual(
+                store.read_latest_job(
+                    current_job.run_ref,
+                    current_job.report_version,
+                ),
+                cached_job,
+            )
+
+    def test_cache_hit_fast_path_rejects_mismatched_existing_result(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            source = make_result()
+            current_job = make_job(
+                job_id="job_cache_reconcile_bad",
+                run_ref=SECOND_RUN_REF,
+                status=JobStatus.RUNNING,
+            )
+            store.create_job(current_job)
+            store.record_cache_hit(
+                current_job.job_id,
+                source,
+                evaluation_id="eval_reconcile_bad_12345678",
+            )
+            result_path = (
+                root / "results" / f"{current_job.job_id}.json"
+            )
+            mismatched = json.loads(result_path.read_text(encoding="utf-8"))
+            mismatched["token_input"] += 1
+            result_path.write_bytes(canonical_json_bytes(mismatched))
+
+            with self.assertRaises(StoreError):
+                store.record_cache_hit(
+                    current_job.job_id,
+                    source,
+                    evaluation_id="eval_reconcile_bad_12345678",
+                )
+
 
 class AdvisoryCoverageTests(unittest.TestCase):
     def test_latest_job_per_run_version_drives_deterministic_coverage(
@@ -1078,7 +1544,7 @@ class AdvisoryCoverageTests(unittest.TestCase):
             self.assertEqual(first["terminal_reports"], 3)
             self.assertEqual(first["scored_reports"], 1)
             self.assertEqual(first["cached_reports"], 1)
-            self.assertEqual(first["valid_score_reports"], 2)
+            self.assertEqual(first["valid_score_reports"], 0)
             self.assertEqual(first["unavailable_reports"], 1)
             self.assertEqual(first["pending_reports"], 1)
             self.assertEqual(first["completed_reports"], 1)
@@ -1103,6 +1569,75 @@ class AdvisoryCoverageTests(unittest.TestCase):
                     ),
                     0o600,
                 )
+
+    def test_valid_score_coverage_requires_matching_result_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = AdvisoryStore(root)
+            valid_job = make_job(
+                job_id="job_coverage_valid",
+                run_ref="runref_" + "1" * 32,
+                status=JobStatus.COMPLETED,
+                evaluation_id="eval_coverage_valid_12345678",
+            )
+            missing_job = make_job(
+                job_id="job_coverage_missing",
+                run_ref="runref_" + "2" * 32,
+                status=JobStatus.COMPLETED,
+                evaluation_id="eval_coverage_missing_12345678",
+            )
+            mismatch_job = make_job(
+                job_id="job_coverage_mismatch",
+                run_ref="runref_" + "3" * 32,
+                status=JobStatus.COMPLETED,
+                evaluation_id="eval_coverage_mismatch_12345678",
+            )
+            corrupt_job = make_job(
+                job_id="job_coverage_corrupt",
+                run_ref="runref_" + "4" * 32,
+                status=JobStatus.CACHED,
+                evaluation_id="eval_coverage_corrupt_12345678",
+            )
+            for job in (
+                valid_job,
+                missing_job,
+                mismatch_job,
+                corrupt_job,
+            ):
+                store.create_job(job)
+
+            store.write_result(
+                make_result(
+                    status=JobStatus.COMPLETED,
+                    evaluation_id=valid_job.evaluation_id or "",
+                    job_id=valid_job.job_id,
+                    run_ref=valid_job.run_ref,
+                    advisory_key=valid_job.advisory_input_sha256,
+                )
+            )
+            store.write_result(
+                make_result(
+                    status=JobStatus.COMPLETED,
+                    evaluation_id=mismatch_job.evaluation_id or "",
+                    job_id=mismatch_job.job_id,
+                    run_ref="runref_" + "5" * 32,
+                    advisory_key=mismatch_job.advisory_input_sha256,
+                )
+            )
+            (
+                root / "results" / f"{corrupt_job.job_id}.json"
+            ).write_bytes(b"{")
+
+            coverage = store.rebuild_coverage()
+
+            self.assertEqual(coverage["eligible_reports"], 4)
+            self.assertEqual(coverage["terminal_reports"], 4)
+            self.assertEqual(coverage["completed_reports"], 3)
+            self.assertEqual(coverage["scored_reports"], 3)
+            self.assertEqual(coverage["cached_reports"], 1)
+            self.assertEqual(coverage["valid_score_reports"], 1)
 
 
 if __name__ == "__main__":
