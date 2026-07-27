@@ -104,6 +104,23 @@ def _case_value(
     return payload
 
 
+def _rehash_case_value(value: dict[str, object]) -> dict[str, object]:
+    projection = value["projection"]
+    projection_payload = {
+        key: nested
+        for key, nested in projection.items()
+        if key != "projection_sha256"
+    }
+    projection["projection_sha256"] = canonical_sha256(projection_payload)
+    case_payload = {
+        key: nested
+        for key, nested in value.items()
+        if key != "case_sha256"
+    }
+    value["case_sha256"] = canonical_sha256(case_payload)
+    return value
+
+
 def _entry_value(
     case_bytes: bytes,
     *,
@@ -333,6 +350,31 @@ class DatasetSchemaTests(unittest.TestCase):
                 projection["units"][0]["text"] = unsafe
                 # Keep both hashes stale: boundary rejection must win.
                 DatasetCase.model_validate(_case_value(projection=projection))
+
+    def test_case_rejects_rehashed_generic_uri_schemes_after_nfkc(self) -> None:
+        unsafe_values = (
+            "来源 s3://private-bucket/object",
+            "实时通道 ws://example.test/feed",
+            "联系人 mailto:reviewer@example.test",
+            "本地来源 file:/private/source",
+            "内嵌内容 data:text/plain,private",
+            "全角 ｓ３：／／private-bucket/object",
+        )
+        for unsafe in unsafe_values:
+            with self.subTest(unsafe=unsafe), self.assertRaisesRegex(
+                ValidationError,
+                "safety boundary",
+            ):
+                value = _case_value()
+                value["projection"]["units"][0]["text"] = unsafe
+                DatasetCase.model_validate(_rehash_case_value(value))
+
+        safe = _case_value()
+        safe["projection"]["units"][0]["text"] = (
+            "结论: 采购范围一致；Note: 人工复核完成。"
+        )
+        model = DatasetCase.model_validate(_rehash_case_value(safe))
+        self.assertIn("结论:", model.projection.units[0].text)
 
     def test_case_rejects_evidence_c_and_full_source_payload_fields(self) -> None:
         projection = _projection_value()
@@ -1128,6 +1170,96 @@ class DatasetSchemaTests(unittest.TestCase):
         self.assertEqual(first.error_categories, ("file_hash_mismatch",))
         self.assertFalse(first.labeling_ready)
         self.assertIsNone(first.release_decision)
+
+    def test_case_aba_bytes_are_bound_to_first_inventory_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            case_value, _ = _write_tree(root)
+            case_path = root / "cases" / f"{CASE_REF}.json"
+            valid_bytes = case_path.read_bytes()
+            invalid_value = copy.deepcopy(case_value)
+            invalid_value["case_sha256"] = "0" * 64
+            invalid_bytes = canonical_json_bytes(invalid_value)
+            self.assertEqual(len(invalid_bytes), len(valid_bytes))
+            inode = case_path.stat().st_ino
+            fixed_mtime_ns = case_path.stat().st_mtime_ns
+
+            def replace(payload: bytes) -> None:
+                case_path.write_bytes(payload)
+                os.utime(
+                    case_path,
+                    ns=(fixed_mtime_ns, fixed_mtime_ns),
+                )
+
+            replace(invalid_bytes)
+            original_load = dataset_module._load_dataset_case_at
+
+            def load_during_valid_window(*args: object, **kwargs: object) -> object:
+                replace(valid_bytes)
+                try:
+                    return original_load(*args, **kwargs)
+                finally:
+                    replace(invalid_bytes)
+
+            with patch.object(
+                dataset_module,
+                "_load_dataset_case_at",
+                side_effect=load_during_valid_window,
+            ):
+                validation = validate_dataset_tree(root)
+
+            final_stat = case_path.stat()
+        self.assertEqual(final_stat.st_ino, inode)
+        self.assertEqual(final_stat.st_size, len(invalid_bytes))
+        self.assertEqual(final_stat.st_mtime_ns, fixed_mtime_ns)
+        self.assertFalse(validation.valid)
+        self.assertIn("file_changed", validation.error_categories)
+
+    def test_manifest_aba_bytes_are_bound_to_first_inventory_digest(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _, manifest_value = _write_tree(root)
+            manifest_path = root / "manifest.json"
+            valid_bytes = manifest_path.read_bytes()
+            invalid_value = copy.deepcopy(manifest_value)
+            invalid_value["manifest_sha256"] = "0" * 64
+            invalid_bytes = canonical_json_bytes(invalid_value)
+            self.assertEqual(len(invalid_bytes), len(valid_bytes))
+            inode = manifest_path.stat().st_ino
+            fixed_mtime_ns = manifest_path.stat().st_mtime_ns
+
+            def replace(payload: bytes) -> None:
+                manifest_path.write_bytes(payload)
+                os.utime(
+                    manifest_path,
+                    ns=(fixed_mtime_ns, fixed_mtime_ns),
+                )
+
+            replace(invalid_bytes)
+            original_load = dataset_module._load_manifest_at
+
+            def load_during_valid_window(*args: object, **kwargs: object) -> object:
+                replace(valid_bytes)
+                try:
+                    return original_load(*args, **kwargs)
+                finally:
+                    replace(invalid_bytes)
+
+            with patch.object(
+                dataset_module,
+                "_load_manifest_at",
+                side_effect=load_during_valid_window,
+            ):
+                validation = validate_dataset_tree(root)
+
+            final_stat = manifest_path.stat()
+        self.assertEqual(final_stat.st_ino, inode)
+        self.assertEqual(final_stat.st_size, len(invalid_bytes))
+        self.assertEqual(final_stat.st_mtime_ns, fixed_mtime_ns)
+        self.assertFalse(validation.valid)
+        self.assertIn("file_changed", validation.error_categories)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar, Literal, NamedTuple, Self
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -45,7 +45,15 @@ _CANONICAL_TIMESTAMP_PATTERN = re.compile(
 )
 _SAFE_PATH_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
 _WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:")
-_ANY_URL = re.compile(r"\b(?:https?|ftp)://", re.IGNORECASE)
+_HIERARCHICAL_URI = re.compile(
+    r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://",
+    re.IGNORECASE,
+)
+_LOCATOR_URI = re.compile(
+    r"(?<![A-Za-z0-9+.-])"
+    r"(?:mailto|file|data|urn|tel|sms|blob|magnet|jdbc|odbc|ipfs|cid):",
+    re.IGNORECASE,
+)
 _RAW_IDENTITY_NAME = re.compile(
     r"(?<![A-Za-z0-9_])"
     r"(?:run_id|pack_id|articleid|menu_code)"
@@ -200,7 +208,8 @@ def _assert_safe_content(value: str, *, conclusion_only: bool = False) -> str:
     except BoundaryViolation:
         raise ValueError("content violates the dataset safety boundary") from None
     if (
-        _ANY_URL.search(scanned)
+        _HIERARCHICAL_URI.search(scanned)
+        or _LOCATOR_URI.search(scanned)
         or _RAW_IDENTITY_NAME.search(scanned)
         or _RAW_RUN_OR_PACK_ID.search(scanned)
         or _RAW_UUID.search(scanned)
@@ -698,6 +707,21 @@ def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
     return (first.st_dev, first.st_ino) == (second.st_dev, second.st_ino)
 
 
+def _same_stat_state(first: os.stat_result, second: os.stat_result) -> bool:
+    return (
+        _same_file(first, second)
+        and first.st_size == second.st_size
+        and first.st_mtime_ns == second.st_mtime_ns
+        and first.st_ctime_ns == second.st_ctime_ns
+    )
+
+
+class _AnchoredRead(NamedTuple):
+    payload: bytes
+    payload_sha256: str
+    stat_result: os.stat_result
+
+
 @contextmanager
 def _open_directory_path(path: Path) -> Iterator[int]:
     _require_anchored_io()
@@ -736,7 +760,10 @@ def _open_directory_path(path: Path) -> Iterator[int]:
             )
             descriptors.append(child)
             after = os.fstat(child)
-            if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
+            if not stat.S_ISDIR(after.st_mode) or not _same_stat_state(
+                before,
+                after,
+            ):
                 raise DatasetError("root_invalid")
             current = child
         yield current
@@ -784,7 +811,10 @@ def _open_relative_parent(
             )
             descriptors.append(child)
             after = os.fstat(child)
-            if not stat.S_ISDIR(after.st_mode) or not _same_file(before, after):
+            if not stat.S_ISDIR(after.st_mode) or not _same_stat_state(
+                before,
+                after,
+            ):
                 raise DatasetError("path_invalid")
             current = child
         yield current, parts[-1]
@@ -801,7 +831,7 @@ def _read_regular_at(
     name: str,
     *,
     max_bytes: int,
-) -> bytes:
+) -> _AnchoredRead:
     if (
         isinstance(max_bytes, bool)
         or not isinstance(max_bytes, int)
@@ -838,7 +868,10 @@ def _read_regular_at(
             dir_fd=parent_descriptor,
         )
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or not _same_file(before, opened):
+        if not stat.S_ISREG(opened.st_mode) or not _same_stat_state(
+            before,
+            opened,
+        ):
             raise DatasetError("file_changed")
         if opened.st_size <= 0 or opened.st_size > max_bytes:
             raise DatasetError("file_size")
@@ -869,12 +902,14 @@ def _read_regular_at(
     if (
         len(payload) != opened.st_size
         or len(payload) > max_bytes
-        or after_open.st_size != opened.st_size
-        or after_open.st_mtime_ns != opened.st_mtime_ns
-        or not _same_file(opened, after_open)
+        or not _same_stat_state(opened, after_open)
     ):
         raise DatasetError("file_changed")
-    return payload
+    return _AnchoredRead(
+        payload=payload,
+        payload_sha256=hashlib.sha256(payload).hexdigest(),
+        stat_result=after_open,
+    )
 
 
 def _read_path_bytes(path: Path, *, max_bytes: int) -> bytes:
@@ -886,7 +921,7 @@ def _read_path_bytes(path: Path, *, max_bytes: int) -> bytes:
             parent_descriptor,
             candidate.name,
             max_bytes=max_bytes,
-        )
+        ).payload
 
 
 def _decode_json_object(payload: bytes) -> dict[str, Any]:
@@ -918,13 +953,18 @@ def _parse_manifest_payload(payload: bytes) -> DatasetManifest:
         raise DatasetError("manifest_invalid") from None
 
 
-def _load_manifest_at(root_descriptor: int) -> DatasetManifest:
-    payload = _read_regular_at(
+def _load_manifest_at(
+    root_descriptor: int,
+) -> tuple[DatasetManifest, str]:
+    anchored_read = _read_regular_at(
         root_descriptor,
         "manifest.json",
         max_bytes=MAX_DATASET_JSON_BYTES,
     )
-    return _parse_manifest_payload(payload)
+    return (
+        _parse_manifest_payload(anchored_read.payload),
+        anchored_read.payload_sha256,
+    )
 
 
 def load_dataset_manifest(path: Path) -> DatasetManifest:
@@ -957,24 +997,28 @@ def _parse_case_payload(payload: bytes, entry: DatasetEntry) -> DatasetCase:
 def _load_dataset_case_at(
     root_descriptor: int,
     entry: DatasetEntry,
-) -> DatasetCase:
+) -> tuple[DatasetCase, str]:
     with _open_relative_parent(
         root_descriptor,
         entry.relative_path,
     ) as (parent_descriptor, name):
-        payload = _read_regular_at(
+        anchored_read = _read_regular_at(
             parent_descriptor,
             name,
             max_bytes=MAX_DATASET_JSON_BYTES,
         )
-    return _parse_case_payload(payload, entry)
+    return (
+        _parse_case_payload(anchored_read.payload, entry),
+        anchored_read.payload_sha256,
+    )
 
 
 def load_dataset_case(root: Path, entry: DatasetEntry) -> DatasetCase:
     if not isinstance(entry, DatasetEntry):
         raise DatasetError("path_invalid")
     with _open_directory_path(Path(root)) as root_descriptor:
-        return _load_dataset_case_at(root_descriptor, entry)
+        case, _payload_sha256 = _load_dataset_case_at(root_descriptor, entry)
+        return case
 
 
 def iter_jsonl(
@@ -1021,7 +1065,7 @@ def iter_jsonl(
             raise DatasetError("jsonl_model_invalid") from None
 
 
-TreeSnapshotEntry = tuple[str, int, int, int, int, int]
+TreeSnapshotEntry = tuple[str, int, int, int, int, int, int, str | None]
 
 
 def _expected_tree_members(
@@ -1078,6 +1122,77 @@ def _inventory_directory(
                     continue
 
                 file_type = stat.S_IFMT(before.st_mode)
+                if stat.S_ISLNK(before.st_mode):
+                    snapshot.append(
+                        (
+                            relative_path,
+                            file_type,
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_ctime_ns,
+                            None,
+                        )
+                    )
+                    categories.add("tree_unexpected")
+                    continue
+                if stat.S_ISREG(before.st_mode):
+                    payload_sha256: str | None = None
+                    snapshot_stat = before
+                    if relative_path in expected_files:
+                        try:
+                            anchored_read = _read_regular_at(
+                                directory_descriptor,
+                                name,
+                                max_bytes=MAX_DATASET_JSON_BYTES,
+                            )
+                        except DatasetError as exc:
+                            categories.add(exc.category)
+                        else:
+                            payload_sha256 = anchored_read.payload_sha256
+                            snapshot_stat = anchored_read.stat_result
+                            if not _same_stat_state(
+                                before,
+                                snapshot_stat,
+                            ):
+                                categories.add("file_changed")
+                    else:
+                        categories.add("tree_unexpected")
+                    snapshot.append(
+                        (
+                            relative_path,
+                            file_type,
+                            snapshot_stat.st_dev,
+                            snapshot_stat.st_ino,
+                            snapshot_stat.st_size,
+                            snapshot_stat.st_mtime_ns,
+                            snapshot_stat.st_ctime_ns,
+                            payload_sha256,
+                        )
+                    )
+                    if (
+                        before.st_size <= 0
+                        or before.st_size > MAX_DATASET_JSON_BYTES
+                    ):
+                        categories.add("file_size")
+                    continue
+                if not stat.S_ISDIR(before.st_mode):
+                    snapshot.append(
+                        (
+                            relative_path,
+                            file_type,
+                            before.st_dev,
+                            before.st_ino,
+                            before.st_size,
+                            before.st_mtime_ns,
+                            before.st_ctime_ns,
+                            None,
+                        )
+                    )
+                    categories.add("tree_unexpected")
+                    continue
+
                 snapshot.append(
                     (
                         relative_path,
@@ -1086,24 +1201,10 @@ def _inventory_directory(
                         before.st_ino,
                         before.st_size,
                         before.st_mtime_ns,
+                        before.st_ctime_ns,
+                        None,
                     )
                 )
-                if stat.S_ISLNK(before.st_mode):
-                    categories.add("tree_unexpected")
-                    continue
-                if stat.S_ISREG(before.st_mode):
-                    if relative_path not in expected_files:
-                        categories.add("tree_unexpected")
-                    if (
-                        before.st_size <= 0
-                        or before.st_size > MAX_DATASET_JSON_BYTES
-                    ):
-                        categories.add("file_size")
-                    continue
-                if not stat.S_ISDIR(before.st_mode):
-                    categories.add("tree_unexpected")
-                    continue
-
                 if relative_path not in expected_directories:
                     categories.add("tree_unexpected")
                     continue
@@ -1115,7 +1216,7 @@ def _inventory_directory(
                         dir_fd=directory_descriptor,
                     )
                     opened = os.fstat(child_descriptor)
-                    if not stat.S_ISDIR(opened.st_mode) or not _same_file(
+                    if not stat.S_ISDIR(opened.st_mode) or not _same_stat_state(
                         before,
                         opened,
                     ):
@@ -1187,24 +1288,50 @@ def _inventory_tree(
     return categories, tuple(sorted(snapshot, key=lambda item: item[0]))
 
 
+def _snapshot_file_digests(
+    snapshot: tuple[TreeSnapshotEntry, ...],
+) -> dict[str, str]:
+    return {
+        path: payload_sha256
+        for path, file_type, *_metadata, payload_sha256 in snapshot
+        if file_type == stat.S_IFREG and payload_sha256 is not None
+    }
+
+
 def validate_dataset_tree(root: Path) -> DatasetValidation:
     categories: set[IntegrityErrorCategory] = set()
     checked_entry_count = 0
     try:
         with _open_directory_path(Path(root)) as root_descriptor:
-            manifest = _load_manifest_at(root_descriptor)
+            manifest, manifest_payload_sha256 = _load_manifest_at(
+                root_descriptor
+            )
             inventory_categories, before_snapshot = _inventory_tree(
                 root_descriptor,
                 manifest,
             )
             categories.update(inventory_categories)
+            before_digests = _snapshot_file_digests(before_snapshot)
+            if (
+                before_digests.get("manifest.json")
+                != manifest_payload_sha256
+            ):
+                categories.add("file_changed")
             for entry in manifest.entries:
                 try:
-                    _load_dataset_case_at(root_descriptor, entry)
+                    _case, case_payload_sha256 = _load_dataset_case_at(
+                        root_descriptor,
+                        entry,
+                    )
                 except DatasetError as exc:
                     categories.add(exc.category)
                 else:
                     checked_entry_count += 1
+                    if (
+                        before_digests.get(entry.relative_path)
+                        != case_payload_sha256
+                    ):
+                        categories.add("file_changed")
             if "tree_limit" not in categories:
                 inventory_categories, after_snapshot = _inventory_tree(
                     root_descriptor,
