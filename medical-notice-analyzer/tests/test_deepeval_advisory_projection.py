@@ -217,6 +217,7 @@ class AdvisoryHashingTests(unittest.TestCase):
         blocked = (
             "-----BEGIN PRIVATE KEY-----",
             "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN PGP PRIVATE KEY BLOCK-----",
             (
                 "eyJhbGciOiJIUzI1NiJ9."
                 "eyJzdWIiOiJzeW50aGV0aWMifQ."
@@ -227,6 +228,9 @@ class AdvisoryHashingTests(unittest.TestCase):
             "github_pat_synthetic1234567890",
             "xoxb-synthetic-1234567890",
             "xoxp-synthetic-1234567890",
+            "glpat-synthetic1234567890",
+            "AKIA" + "A" * 16,
+            "AIza" + "A" * 35,
         )
         for value in blocked:
             with self.subTest(value=value), self.assertRaises(
@@ -251,8 +255,24 @@ class AdvisoryHashingTests(unittest.TestCase):
     def test_guard_rejects_windows_unc_device_and_extended_paths(self) -> None:
         blocked = (
             r"\\server\share\report.json",
+            r"//server/share/report.json",
+            r"//server\share\report.json",
+            r"\\server/share/report.json",
             r"\\?\C:\private\report.json",
             r"\\.\PIPE\advisory",
+        )
+        for value in blocked:
+            with self.subTest(value=value), self.assertRaises(
+                BoundaryViolation
+            ):
+                assert_safe_outbound_text(value)
+
+    def test_guard_rejects_any_unix_absolute_path_token(self) -> None:
+        blocked = (
+            "/workspace/private/report.json",
+            "/Users/alice/report.json",
+            "/private/tmp/report.json",
+            "source=/custom/location/report.json",
         )
         for value in blocked:
             with self.subTest(value=value), self.assertRaises(
@@ -336,6 +356,8 @@ class AdvisoryHashingTests(unittest.TestCase):
             "A层证据显示项目预算为人民币一百万元，B层证据补充了交付安排。",
             "公开政策来源：https://www.gov.cn/zhengce/content/2026/report.html",
             "Public report: https://example.com/app/report?section=data",
+            "Public path: https://example.com/workspace/private/report.json",
+            "Public path: https://example.com/Users/alice/report.json",
             "Public boundary: http://172.15.255.254/report",
             "Public boundary: http://172.32.0.1/report",
             "Public address: http://11.0.0.1/report",
@@ -360,6 +382,18 @@ class AdvisoryHashingTests(unittest.TestCase):
         )
         self.assertNotIn(secret, str(raised.exception))
         self.assertNotIn(offending, str(raised.exception))
+
+    def test_standalone_provider_token_is_not_echoed_in_exception(self) -> None:
+        token = "glpat-UNIQUE_SYNTHETIC_TOKEN_9f3d"
+
+        with self.assertRaises(BoundaryViolation) as raised:
+            assert_safe_outbound_text(token)
+
+        self.assertEqual(
+            str(raised.exception),
+            "outbound text violates the safety boundary",
+        )
+        self.assertNotIn(token, str(raised.exception))
 
     def test_new_secret_classes_are_not_echoed_in_exceptions(self) -> None:
         secret = "UNIQUE_ACCESS_TOKEN_VALUE_8e2c"

@@ -33,7 +33,7 @@ _TOKEN_ASSIGNMENT = re.compile(
     re.IGNORECASE,
 )
 _PEM_PRIVATE_KEY_HEADER = re.compile(
-    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----",
+    r"-----BEGIN (?:(?:[A-Z0-9]+ )*PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----",
     re.IGNORECASE,
 )
 _JWT_TOKEN = re.compile(
@@ -46,7 +46,10 @@ _PROVIDER_TOKEN = re.compile(
     r"sk-[A-Za-z0-9_-]{4,}|"
     r"ghp_[A-Za-z0-9_]{4,}|"
     r"github_pat_[A-Za-z0-9_]{4,}|"
-    r"xox[baprs]-[A-Za-z0-9_-]{4,}"
+    r"xox[baprs]-[A-Za-z0-9_-]{4,}|"
+    r"glpat-[A-Za-z0-9_-]{4,}|"
+    r"AKIA[A-Z0-9]{16}|"
+    r"AIza[A-Za-z0-9_-]{35}"
     r")(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
@@ -54,13 +57,11 @@ _WINDOWS_DRIVE_PATH = re.compile(
     r"(?<![A-Za-z0-9])[A-Za-z]:[\\/]",
 )
 _WINDOWS_UNC_OR_DEVICE_PATH = re.compile(
-    r"\\\\(?:[?.]\\|[^\\/\s]+\\[^\\/\s]+)",
+    r"(?:\\\\[?.]\\|"
+    r"(?<![:\\/])(?:\\\\|//)[^\\/\s]+[\\/][^\\/\s]+)",
 )
-_SENSITIVE_UNIX_PATH = re.compile(
-    r"(?<![A-Za-z0-9])/"
-    r"(?:app|opt|var|home|root|data|etc|usr|srv|mnt|tmp|run|proc|sys|dev)"
-    r"(?:/|$)",
-    re.IGNORECASE,
+_UNIX_ABSOLUTE_PATH = re.compile(
+    r"(?<![\w:/.\]-])/(?![/\s])[^\s<>'\"]+",
 )
 _HTTP_URL = re.compile(
     r"\bhttps?://[^\s<>'\"]+",
@@ -172,7 +173,7 @@ def assert_safe_outbound_text(value: str) -> None:
         _PROVIDER_TOKEN,
         _WINDOWS_DRIVE_PATH,
         _WINDOWS_UNC_OR_DEVICE_PATH,
-        _SENSITIVE_UNIX_PATH,
+        _UNIX_ABSOLUTE_PATH,
     ):
         if pattern.search(value):
             raise BoundaryViolation(_BOUNDARY_MESSAGE)
