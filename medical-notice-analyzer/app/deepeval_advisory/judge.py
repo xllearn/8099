@@ -6,7 +6,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
-import hashlib
+import hmac
 import json
 import logging
 import math
@@ -21,12 +21,14 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from app.deepeval_advisory.hashing import (
     BoundaryViolation,
     assert_safe_outbound_text,
+    canonical_json_bytes,
+    text_sha256,
 )
 from app.deepeval_advisory.models import StrictModel
 
 
 _LOGGER = logging.getLogger(__name__)
-_MAX_PROMPT_BYTES = 64 * 1024
+_MAX_REQUEST_BYTES = 64 * 1024
 _MAX_ATTEMPTS = 3
 _RETRYABLE_CATEGORIES = frozenset({"http_429", "http_503"})
 _REQUEST_ID_PATTERN = re.compile(r"^req_[A-Za-z0-9_-]{8,80}$")
@@ -217,13 +219,11 @@ def require_judge_context() -> JudgeCallContext:
     return context
 
 
-def _text_fingerprint(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
 def validate_judge_prompt(
     prompt: str,
     context: JudgeCallContext | None = None,
+    *,
+    response_schema: dict[str, Any] | None = None,
 ) -> str:
     active_context = require_judge_context()
     if context is not None and context is not active_context:
@@ -233,16 +233,21 @@ def validate_judge_prompt(
 
     try:
         assert_safe_outbound_text(prompt)
-        encoded_prompt = prompt.encode("utf-8")
+        logical_request = canonical_json_bytes(
+            {
+                "prompt": prompt,
+                "response_schema": response_schema,
+            }
+        )
     except BoundaryViolation:
         raise JudgeError("prompt_boundary_violation") from None
-    except UnicodeEncodeError:
-        raise JudgeError("prompt_invalid") from None
+    except (TypeError, ValueError, OverflowError, UnicodeEncodeError):
+        raise JudgeError("request_invalid") from None
 
-    if len(encoded_prompt) > _MAX_PROMPT_BYTES:
-        raise JudgeError("prompt_too_large")
+    if len(logical_request) > _MAX_REQUEST_BYTES:
+        raise JudgeError("request_too_large")
 
-    prompt_sha256 = _text_fingerprint(prompt)
+    prompt_sha256 = text_sha256(prompt)
     active_context._consume_subcall()
     _log_judge_call(
         active_context,
@@ -254,6 +259,14 @@ def validate_judge_prompt(
 
 
 class JudgeTransport(Protocol):
+    """Deadline-aware Judge transport boundary.
+
+    Every transport receives ``context.deadline_monotonic``. A synchronous
+    implementation must stop or return by that deadline when possible; the
+    adapter rejects any late synchronous response. Async calls are additionally
+    bounded by the adapter using the remaining monotonic deadline.
+    """
+
     def complete(
         self,
         *,
@@ -429,8 +442,8 @@ class FakeJudgeTransport:
             token_output=len(response_text.encode("utf-8")),
             cost=0.0,
             latency_ms=0,
-            input_fingerprint=_text_fingerprint(prompt),
-            output_fingerprint=_text_fingerprint(response_text),
+            input_fingerprint=text_sha256(prompt),
+            output_fingerprint=text_sha256(response_text),
         )
 
     def complete(
@@ -536,6 +549,64 @@ def parse_judge_response(
         ) from None
 
 
+def _verify_response_integrity(
+    response: JudgeResponse,
+    guarded_prompt: str,
+) -> None:
+    if not isinstance(response, JudgeResponse):
+        raise JudgeError(
+            "unavailable",
+            outcome="unknown",
+        )
+    try:
+        input_fingerprint = text_sha256(guarded_prompt)
+        output_fingerprint = text_sha256(response.text)
+    except UnicodeEncodeError:
+        raise JudgeError(
+            "response_integrity_invalid",
+            outcome="completed",
+        ) from None
+    if not (
+        hmac.compare_digest(
+            response.input_fingerprint,
+            input_fingerprint,
+        )
+        and hmac.compare_digest(
+            response.output_fingerprint,
+            output_fingerprint,
+        )
+    ):
+        raise JudgeError(
+            "response_integrity_invalid",
+            retryable=False,
+            outcome="completed",
+        )
+
+
+def _require_context_after_response(
+    expected_context: JudgeCallContext,
+) -> None:
+    try:
+        active_context = require_judge_context()
+    except JudgeError as error:
+        category = (
+            "deadline_exceeded"
+            if error.category == "context_expired"
+            else "context_invalid_after_response"
+        )
+        raise JudgeError(
+            category,
+            retryable=False,
+            outcome="unknown",
+        ) from None
+    if active_context is not expected_context:
+        raise JudgeError(
+            "context_invalid_after_response",
+            retryable=False,
+            outcome="unknown",
+        )
+
+
 def _log_judge_call(
     context: JudgeCallContext,
     *,
@@ -611,8 +682,12 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
         response_schema = _response_schema_for(schema)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            guarded_prompt = validate_judge_prompt(prompt, context)
-            prompt_sha256 = _text_fingerprint(guarded_prompt)
+            guarded_prompt = validate_judge_prompt(
+                prompt,
+                context,
+                response_schema=response_schema,
+            )
+            prompt_sha256 = text_sha256(guarded_prompt)
             _log_judge_call(
                 context,
                 prompt_sha256=prompt_sha256,
@@ -625,6 +700,8 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
                     response_schema=response_schema,
                     context=context,
                 )
+                _require_context_after_response(context)
+                _verify_response_integrity(response, guarded_prompt)
                 result = parse_judge_response(
                     response,
                     schema,
@@ -677,8 +754,12 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
         response_schema = _response_schema_for(schema)
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
-            guarded_prompt = validate_judge_prompt(prompt, context)
-            prompt_sha256 = _text_fingerprint(guarded_prompt)
+            guarded_prompt = validate_judge_prompt(
+                prompt,
+                context,
+                response_schema=response_schema,
+            )
+            prompt_sha256 = text_sha256(guarded_prompt)
             _log_judge_call(
                 context,
                 prompt_sha256=prompt_sha256,
@@ -686,11 +767,30 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
                 attempt=attempt,
             )
             try:
-                response = await self._transport.acomplete(
-                    prompt=guarded_prompt,
-                    response_schema=response_schema,
-                    context=context,
+                remaining_seconds = (
+                    context.deadline_monotonic - time.monotonic()
                 )
+                if remaining_seconds <= 0:
+                    raise JudgeError("context_expired")
+                try:
+                    response = await asyncio.wait_for(
+                        self._transport.acomplete(
+                            prompt=guarded_prompt,
+                            response_schema=response_schema,
+                            context=context,
+                        ),
+                        timeout=remaining_seconds,
+                    )
+                except TimeoutError:
+                    if time.monotonic() < context.deadline_monotonic:
+                        raise
+                    raise JudgeError(
+                        "deadline_exceeded",
+                        retryable=False,
+                        outcome="unknown",
+                    ) from None
+                _require_context_after_response(context)
+                _verify_response_integrity(response, guarded_prompt)
                 result = parse_judge_response(
                     response,
                     schema,
@@ -733,3 +833,6 @@ class DeepEvalJudgeLLM(DeepEvalBaseLLM):
             return result
 
         raise JudgeError("unavailable", outcome="unknown")
+
+    generate._is_deepeval_observed = True
+    a_generate._is_deepeval_observed = True

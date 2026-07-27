@@ -10,10 +10,17 @@ import logging
 import math
 from pathlib import Path
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+import app.deepeval_advisory.judge as judge_module
+from app.deepeval_advisory.hashing import (
+    canonical_json_bytes,
+    text_sha256,
+)
 from app.deepeval_advisory.judge import (
     DeepEvalJudgeLLM,
     FakeJudgeTransport,
@@ -47,6 +54,47 @@ class AlternateEnvelope(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verdict: str
+
+
+class LargeSchemaEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(description="d" * 8192)
+
+
+def exact_request_prompt(
+    response_schema: dict[str, object] | None,
+    *,
+    multibyte: bool = False,
+) -> str:
+    empty_size = len(
+        canonical_json_bytes(
+            {
+                "prompt": "",
+                "response_schema": response_schema,
+            }
+        )
+    )
+    remaining = 65536 - empty_size
+    if remaining < 0:
+        raise AssertionError("test schema exceeds the request budget")
+    if multibyte:
+        prompt = ("界" * (remaining // 3)) + ("a" * (remaining % 3))
+    else:
+        prompt = "a" * remaining
+    if (
+        len(
+            canonical_json_bytes(
+                {
+                    "prompt": prompt,
+                    "response_schema": response_schema,
+                }
+            )
+        )
+        != 65536
+    ):
+        raise AssertionError("test prompt is not exactly 64 KiB")
+    return prompt
 
 
 def make_context(
@@ -102,6 +150,150 @@ def make_fake(
         ),
         failures={} if failures is None else failures,
     )
+
+
+class TamperedFingerprintTransport:
+    def __init__(self, field_name: str) -> None:
+        self._field_name = field_name
+        self._fake = make_fake(
+            responses={
+                "ScoreEnvelope": "RESPONSE_BODY_SENTINEL not-json"
+            },
+        )
+
+    @property
+    def sync_call_count(self) -> int:
+        return self._fake.sync_call_count
+
+    @property
+    def async_call_count(self) -> int:
+        return self._fake.async_call_count
+
+    def _tamper(self, response: JudgeResponse) -> JudgeResponse:
+        current = getattr(response, self._field_name)
+        replacement = "0" * 64 if current != "0" * 64 else "1" * 64
+        return response.model_copy(
+            update={self._field_name: replacement},
+        )
+
+    def complete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        return self._tamper(
+            self._fake.complete(
+                prompt=prompt,
+                response_schema=response_schema,
+                context=context,
+            )
+        )
+
+    async def acomplete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        return self._tamper(
+            await self._fake.acomplete(
+                prompt=prompt,
+                response_schema=response_schema,
+                context=context,
+            )
+        )
+
+
+class ClockAdvancingSyncTransport:
+    def __init__(self, clock: list[float], late_time: float) -> None:
+        self._clock = clock
+        self._late_time = late_time
+        self._fake = make_fake()
+
+    @property
+    def sync_call_count(self) -> int:
+        return self._fake.sync_call_count
+
+    def complete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        response = self._fake.complete(
+            prompt=prompt,
+            response_schema=response_schema,
+            context=context,
+        )
+        self._clock[0] = self._late_time
+        return response
+
+    async def acomplete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        return await self._fake.acomplete(
+            prompt=prompt,
+            response_schema=response_schema,
+            context=context,
+        )
+
+
+class BlockingAsyncTransport:
+    def __init__(self, *, suppress_cancellation: bool = False) -> None:
+        self.suppress_cancellation = suppress_cancellation
+        self.sync_call_count = 0
+        self.async_call_count = 0
+        self.started = asyncio.Event()
+        self.cancelled = False
+        self._release = asyncio.Event()
+
+    def complete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        self.sync_call_count += 1
+        raise AssertionError("sync transport must not be called")
+
+    async def acomplete(
+        self,
+        *,
+        prompt: str,
+        response_schema: dict[str, object] | None,
+        context: JudgeCallContext,
+    ) -> JudgeResponse:
+        self.async_call_count += 1
+        self.started.set()
+        try:
+            await self._release.wait()
+        except asyncio.CancelledError:
+            self.cancelled = True
+            if not self.suppress_cancellation:
+                raise
+
+        response_text = (
+            '{"reason":"LATE_RESPONSE_SENTINEL","score":0.5}'
+        )
+        return JudgeResponse(
+            text=response_text,
+            resolved_model_version=PROFILE_VERSION,
+            token_input=1,
+            token_output=1,
+            cost=0.0,
+            latency_ms=0,
+            input_fingerprint=text_sha256(prompt),
+            output_fingerprint=text_sha256(response_text),
+        )
 
 
 class JudgeModelContractTests(unittest.TestCase):
@@ -207,6 +399,10 @@ class JudgeModelContractTests(unittest.TestCase):
                     JudgeResponse.model_validate(payload)
 
     def test_transport_protocol_has_only_exact_keyword_arguments(self) -> None:
+        protocol_doc = JudgeTransport.__doc__ or ""
+        self.assertIn("deadline_monotonic", protocol_doc)
+        self.assertIn("synchronous", protocol_doc)
+
         for method_name in ("complete", "acomplete"):
             method = getattr(JudgeTransport, method_name)
             signature = inspect.signature(method)
@@ -373,42 +569,113 @@ class JudgePromptGuardTests(unittest.TestCase):
     def test_utf8_size_limit_allows_exactly_64_kib_and_rejects_one_more(
         self,
     ) -> None:
-        exact = "a" * 65536
+        exact = exact_request_prompt(None)
         too_large = exact + "a"
         exact_context = make_context(max_subcalls=1)
         large_context = make_context(max_subcalls=1)
 
         with judge_context(exact_context):
             self.assertEqual(
-                validate_judge_prompt(exact, exact_context),
+                validate_judge_prompt(
+                    exact,
+                    exact_context,
+                    response_schema=None,
+                ),
                 exact,
             )
         self.assertEqual(exact_context.subcalls_used, 1)
 
         with judge_context(large_context):
             with self.assertRaises(JudgeError) as raised:
-                validate_judge_prompt(too_large, large_context)
-        self.assertEqual(raised.exception.category, "prompt_too_large")
+                validate_judge_prompt(
+                    too_large,
+                    large_context,
+                    response_schema=None,
+                )
+        self.assertEqual(raised.exception.category, "request_too_large")
         self.assertEqual(large_context.subcalls_used, 0)
 
     def test_utf8_size_limit_counts_multibyte_bytes(self) -> None:
-        exact = ("界" * 21845) + "a"
+        exact = exact_request_prompt(None, multibyte=True)
         too_large = exact + "界"
-        self.assertEqual(len(exact.encode("utf-8")), 65536)
-        self.assertEqual(len(too_large.encode("utf-8")), 65539)
+        self.assertEqual(
+            len(
+                canonical_json_bytes(
+                    {"prompt": exact, "response_schema": None}
+                )
+            ),
+            65536,
+        )
+        self.assertEqual(
+            len(
+                canonical_json_bytes(
+                    {"prompt": too_large, "response_schema": None}
+                )
+            ),
+            65539,
+        )
 
         exact_context = make_context(max_subcalls=1)
         with judge_context(exact_context):
             self.assertEqual(
-                validate_judge_prompt(exact, exact_context),
+                validate_judge_prompt(
+                    exact,
+                    exact_context,
+                    response_schema=None,
+                ),
                 exact,
             )
 
         large_context = make_context(max_subcalls=1)
         with judge_context(large_context):
             with self.assertRaises(JudgeError) as raised:
-                validate_judge_prompt(too_large, large_context)
-        self.assertEqual(raised.exception.category, "prompt_too_large")
+                validate_judge_prompt(
+                    too_large,
+                    large_context,
+                    response_schema=None,
+                )
+        self.assertEqual(raised.exception.category, "request_too_large")
+        self.assertEqual(large_context.subcalls_used, 0)
+
+    def test_large_pydantic_schema_counts_toward_request_budget(
+        self,
+    ) -> None:
+        response_schema = LargeSchemaEnvelope.model_json_schema()
+        exact = exact_request_prompt(response_schema)
+        exact_transport = make_fake(
+            responses={"LargeSchemaEnvelope": {"value": "bounded"}},
+        )
+        exact_adapter = DeepEvalJudgeLLM(
+            exact_transport,
+            profile_version=PROFILE_VERSION,
+        )
+        exact_context = make_context(max_subcalls=1)
+
+        with judge_context(exact_context):
+            result = exact_adapter.generate(
+                exact,
+                schema=LargeSchemaEnvelope,
+            )
+        self.assertEqual(result, LargeSchemaEnvelope(value="bounded"))
+        self.assertEqual(exact_transport.sync_call_count, 1)
+
+        large_transport = make_fake(
+            responses={"LargeSchemaEnvelope": {"value": "bounded"}},
+        )
+        large_adapter = DeepEvalJudgeLLM(
+            large_transport,
+            profile_version=PROFILE_VERSION,
+        )
+        large_context = make_context(max_subcalls=1)
+        with judge_context(large_context):
+            with self.assertRaises(JudgeError) as raised:
+                large_adapter.generate(
+                    exact + "a",
+                    schema=LargeSchemaEnvelope,
+                )
+
+        self.assertEqual(raised.exception.category, "request_too_large")
+        self.assertEqual(large_transport.sync_call_count, 0)
         self.assertEqual(large_context.subcalls_used, 0)
 
     def test_prompt_requires_string_and_active_matching_context(self) -> None:
@@ -562,11 +829,15 @@ class FakeJudgeTransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_fake_metadata_and_fingerprints_are_deterministic(
         self,
     ) -> None:
-        first = make_fake()
-        second = make_fake()
+        responses = {
+            "ScoreEnvelope": SAFE_SCORE,
+            None: "deterministic\r\nplain result",
+        }
+        first = make_fake(responses=responses)
+        second = make_fake(responses=responses)
         context = make_context()
         arguments = {
-            "prompt": "deterministic bounded prompt",
+            "prompt": "deterministic\r\nbounded prompt",
             "response_schema": ScoreEnvelope.model_json_schema(),
             "context": context,
         }
@@ -574,14 +845,29 @@ class FakeJudgeTransportTests(unittest.IsolatedAsyncioTestCase):
         first_sync = first.complete(**arguments)
         second_sync = second.complete(**arguments)
         first_async = await first.acomplete(**arguments)
+        text_response = first.complete(
+            prompt=arguments["prompt"],
+            response_schema=None,
+            context=context,
+        )
 
         self.assertEqual(first_sync, second_sync)
         self.assertEqual(first_sync, first_async)
         self.assertEqual(first_sync.resolved_model_version, PROFILE_VERSION)
         self.assertEqual(first_sync.latency_ms, 0)
         self.assertEqual(first_sync.cost, 0.0)
-        self.assertRegex(first_sync.input_fingerprint, r"^[0-9a-f]{64}$")
-        self.assertRegex(first_sync.output_fingerprint, r"^[0-9a-f]{64}$")
+        self.assertEqual(
+            first_sync.input_fingerprint,
+            text_sha256(arguments["prompt"]),
+        )
+        self.assertEqual(
+            first_sync.output_fingerprint,
+            text_sha256(first_sync.text),
+        )
+        self.assertEqual(
+            text_response.output_fingerprint,
+            text_sha256(text_response.text),
+        )
 
     async def test_unknown_schema_and_invalid_configuration_fail_bounded(
         self,
@@ -617,6 +903,127 @@ class FakeJudgeTransportTests(unittest.IsolatedAsyncioTestCase):
             invalid_failures.exception.category,
             "fake_configuration_invalid",
         )
+
+
+class DeepEvalTraceIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_generate_methods_are_marked_unwrapped_judge_functions(
+        self,
+    ) -> None:
+        for method_name in ("generate", "a_generate"):
+            method = getattr(DeepEvalJudgeLLM, method_name)
+            with self.subTest(method=method_name):
+                self.assertIs(
+                    getattr(method, "_is_deepeval_observed", None),
+                    True,
+                )
+                self.assertEqual(
+                    Path(method.__code__.co_filename).name,
+                    "judge.py",
+                )
+                self.assertFalse(hasattr(method, "__wrapped__"))
+
+    async def test_internal_trace_harness_captures_controls_not_judge_data(
+        self,
+    ) -> None:
+        import deepeval.tracing.tracing as tracing
+        from deepeval.tracing.context import current_span_context
+
+        captures: list[dict[str, object]] = []
+
+        class CapturingObserver:
+            def __init__(self, *args, **kwargs) -> None:
+                self.result = None
+                self.record = {
+                    "args": args,
+                    "kwargs": kwargs,
+                    "result": None,
+                }
+
+            def __enter__(self):
+                captures.append(self.record)
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> bool:
+                self.record["result"] = self.result
+                return False
+
+        with (
+            patch.object(tracing, "Observer", CapturingObserver),
+            patch.object(
+                tracing,
+                "get_settings",
+                return_value=SimpleNamespace(
+                    CONFIDENT_TRACE_INTERNAL=True,
+                ),
+            ),
+        ):
+            parent_token = current_span_context.set(object())
+            try:
+
+                @tracing.observe(
+                    type="llm",
+                    _drop_if_root=True,
+                    _internal=True,
+                )
+                def sync_control(value: str) -> str:
+                    return "CONTROL_SYNC_RESULT"
+
+                @tracing.observe(
+                    type="llm",
+                    _drop_if_root=True,
+                    _internal=True,
+                )
+                async def async_control(value: str) -> str:
+                    return "CONTROL_ASYNC_RESULT"
+
+                self.assertEqual(
+                    sync_control("CONTROL_SYNC_PROMPT"),
+                    "CONTROL_SYNC_RESULT",
+                )
+                self.assertEqual(
+                    await async_control("CONTROL_ASYNC_PROMPT"),
+                    "CONTROL_ASYNC_RESULT",
+                )
+
+                transport = make_fake(
+                    responses={
+                        "ScoreEnvelope": {
+                            "score": 0.75,
+                            "reason": "TRACE_RESULT_SENTINEL",
+                        }
+                    },
+                )
+                adapter = DeepEvalJudgeLLM(
+                    transport,
+                    profile_version=PROFILE_VERSION,
+                )
+                context = make_context(max_subcalls=2)
+                with judge_context(context):
+                    sync_result = adapter.generate(
+                        "TRACE_PROMPT_SENTINEL sync bounded",
+                        schema=ScoreEnvelope,
+                    )
+                    async_result = await adapter.a_generate(
+                        "TRACE_PROMPT_SENTINEL async bounded",
+                        schema=ScoreEnvelope,
+                    )
+                self.assertEqual(
+                    sync_result.reason,
+                    "TRACE_RESULT_SENTINEL",
+                )
+                self.assertEqual(
+                    async_result.reason,
+                    "TRACE_RESULT_SENTINEL",
+                )
+            finally:
+                current_span_context.reset(parent_token)
+
+        self.assertEqual(len(captures), 2)
+        serialized_captures = repr(captures)
+        self.assertIn("CONTROL_SYNC_PROMPT", serialized_captures)
+        self.assertIn("CONTROL_ASYNC_PROMPT", serialized_captures)
+        self.assertNotIn("TRACE_PROMPT_SENTINEL", serialized_captures)
+        self.assertNotIn("TRACE_RESULT_SENTINEL", serialized_captures)
 
 
 class DeepEvalJudgeLLMTests(unittest.TestCase):
@@ -757,6 +1164,78 @@ class DeepEvalJudgeLLMTests(unittest.TestCase):
         self.assertEqual(raised.exception.outcome, "completed")
         self.assertEqual(str(raised.exception), "model_version_mismatch")
         self.assertEqual(transport.sync_call_count, 1)
+
+    def test_sync_fingerprint_mismatch_is_rejected_before_parsing(
+        self,
+    ) -> None:
+        for field_name in (
+            "input_fingerprint",
+            "output_fingerprint",
+        ):
+            with self.subTest(field=field_name):
+                transport = TamperedFingerprintTransport(field_name)
+                adapter = DeepEvalJudgeLLM(
+                    transport,
+                    profile_version=PROFILE_VERSION,
+                )
+                context = make_context(max_subcalls=3)
+                with judge_context(context):
+                    with self.assertRaises(JudgeError) as raised:
+                        adapter.generate(
+                            "bounded integrity prompt",
+                            schema=ScoreEnvelope,
+                        )
+
+                self.assertEqual(
+                    raised.exception.category,
+                    "response_integrity_invalid",
+                )
+                self.assertIs(raised.exception.retryable, False)
+                self.assertEqual(raised.exception.outcome, "completed")
+                self.assertEqual(
+                    str(raised.exception),
+                    "response_integrity_invalid",
+                )
+                self.assertNotIn(
+                    "RESPONSE_BODY_SENTINEL",
+                    str(raised.exception),
+                )
+                self.assertEqual(transport.sync_call_count, 1)
+                self.assertEqual(context.subcalls_used, 1)
+
+    def test_late_sync_response_is_rejected_after_transport_returns(
+        self,
+    ) -> None:
+        clock = [100.0]
+        transport = ClockAdvancingSyncTransport(clock, late_time=102.0)
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context(
+            max_subcalls=3,
+            fresh_until_monotonic=110.0,
+            deadline_monotonic=101.0,
+        )
+
+        with patch.object(
+            judge_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock[0]),
+        ):
+            with judge_context(context):
+                with self.assertRaises(JudgeError) as raised:
+                    adapter.generate(
+                        "bounded deadline prompt",
+                        schema=ScoreEnvelope,
+                    )
+
+        self.assertEqual(raised.exception.category, "deadline_exceeded")
+        self.assertIs(raised.exception.retryable, False)
+        self.assertEqual(raised.exception.outcome, "unknown")
+        self.assertEqual(str(raised.exception), "deadline_exceeded")
+        self.assertEqual(transport.sync_call_count, 1)
+        self.assertEqual(context.subcalls_used, 1)
 
     def test_only_not_started_retryable_429_and_503_are_retried(self) -> None:
         retryable_cases = ("http_429", "http_503")
@@ -977,6 +1456,165 @@ class DeepEvalJudgeLLMTests(unittest.TestCase):
 
 
 class DeepEvalJudgeAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_async_fingerprint_mismatch_is_not_retried(self) -> None:
+        transport = TamperedFingerprintTransport("output_fingerprint")
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context(max_subcalls=3)
+
+        with judge_context(context):
+            with self.assertRaises(JudgeError) as raised:
+                await adapter.a_generate(
+                    "bounded async integrity prompt",
+                    schema=ScoreEnvelope,
+                )
+
+        self.assertEqual(
+            raised.exception.category,
+            "response_integrity_invalid",
+        )
+        self.assertIs(raised.exception.retryable, False)
+        self.assertEqual(raised.exception.outcome, "completed")
+        self.assertNotIn(
+            "RESPONSE_BODY_SENTINEL",
+            str(raised.exception),
+        )
+        self.assertEqual(transport.sync_call_count, 0)
+        self.assertEqual(transport.async_call_count, 1)
+        self.assertEqual(context.subcalls_used, 1)
+
+    async def test_async_transport_is_bounded_by_remaining_deadline(
+        self,
+    ) -> None:
+        transport = BlockingAsyncTransport()
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        now = time.monotonic()
+        context = make_context(
+            max_subcalls=3,
+            fresh_until_monotonic=now + 5,
+            deadline_monotonic=now + 0.2,
+        )
+
+        with judge_context(context):
+            with self.assertRaises(JudgeError) as raised:
+                await asyncio.wait_for(
+                    adapter.a_generate(
+                        "bounded async deadline prompt",
+                        schema=ScoreEnvelope,
+                    ),
+                    timeout=0.8,
+                )
+
+        self.assertEqual(raised.exception.category, "deadline_exceeded")
+        self.assertIs(raised.exception.retryable, False)
+        self.assertEqual(raised.exception.outcome, "unknown")
+        self.assertEqual(transport.sync_call_count, 0)
+        self.assertEqual(transport.async_call_count, 1)
+        self.assertTrue(transport.cancelled)
+        self.assertEqual(context.subcalls_used, 1)
+
+    async def test_async_late_response_after_timeout_is_not_accepted(
+        self,
+    ) -> None:
+        transport = BlockingAsyncTransport(suppress_cancellation=True)
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        now = time.monotonic()
+        context = make_context(
+            max_subcalls=3,
+            fresh_until_monotonic=now + 5,
+            deadline_monotonic=now + 0.2,
+        )
+
+        with judge_context(context):
+            with self.assertRaises(JudgeError) as raised:
+                await asyncio.wait_for(
+                    adapter.a_generate(
+                        "bounded async late response prompt",
+                        schema=ScoreEnvelope,
+                    ),
+                    timeout=0.8,
+                )
+
+        self.assertEqual(raised.exception.category, "deadline_exceeded")
+        self.assertIs(raised.exception.retryable, False)
+        self.assertEqual(raised.exception.outcome, "unknown")
+        self.assertNotIn(
+            "LATE_RESPONSE_SENTINEL",
+            str(raised.exception),
+        )
+        self.assertEqual(transport.async_call_count, 1)
+        self.assertTrue(transport.cancelled)
+        self.assertEqual(context.subcalls_used, 1)
+
+    async def test_transport_timeout_error_before_deadline_is_unavailable(
+        self,
+    ) -> None:
+        transport = make_fake(
+            failures={
+                "ScoreEnvelope": [
+                    TimeoutError("PROVIDER_TIMEOUT_BODY_SENTINEL")
+                ]
+            },
+        )
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        context = make_context(max_subcalls=3)
+
+        with judge_context(context):
+            with self.assertRaises(JudgeError) as raised:
+                await adapter.a_generate(
+                    "bounded provider timeout prompt",
+                    schema=ScoreEnvelope,
+                )
+
+        self.assertEqual(raised.exception.category, "unavailable")
+        self.assertEqual(raised.exception.outcome, "unknown")
+        self.assertNotIn(
+            "PROVIDER_TIMEOUT_BODY_SENTINEL",
+            str(raised.exception),
+        )
+        self.assertEqual(transport.async_call_count, 1)
+        self.assertEqual(context.subcalls_used, 1)
+
+    async def test_external_async_cancellation_is_preserved(self) -> None:
+        transport = BlockingAsyncTransport()
+        adapter = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+        now = time.monotonic()
+        context = make_context(
+            max_subcalls=3,
+            fresh_until_monotonic=now + 10,
+            deadline_monotonic=now + 5,
+        )
+
+        with judge_context(context):
+            task = asyncio.create_task(
+                adapter.a_generate(
+                    "bounded externally cancelled prompt",
+                    schema=ScoreEnvelope,
+                )
+            )
+            await asyncio.wait_for(transport.started.wait(), timeout=0.5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertEqual(transport.async_call_count, 1)
+        self.assertTrue(transport.cancelled)
+        self.assertEqual(context.subcalls_used, 1)
+
     async def test_async_retry_matrix_and_budget_match_sync_contract(
         self,
     ) -> None:
