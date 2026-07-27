@@ -713,6 +713,94 @@ class DatasetSchemaTests(unittest.TestCase):
         self.assertFalse(validation.valid)
         self.assertIn("file_size", validation.error_categories)
 
+    def test_deep_unexpected_tree_is_rejected_without_recursion_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_tree(root)
+            current = root / "unexpected"
+            current.mkdir()
+            created = [current]
+            try:
+                for _ in range(1_050):
+                    current = current / "d"
+                    current.mkdir()
+                    created.append(current)
+
+                validation = validate_dataset_tree(root)
+            finally:
+                for directory in reversed(created):
+                    directory.rmdir()
+
+        self.assertFalse(validation.valid)
+        self.assertEqual(
+            validation.error_categories,
+            ("tree_unexpected",),
+        )
+
+    def test_wide_tree_stops_at_exported_member_limit(self) -> None:
+        member_limit = getattr(
+            dataset_module,
+            "MAX_DATASET_TREE_MEMBERS",
+            128,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_tree(root)
+            for index in range(member_limit + 1):
+                (root / f"extra-{index:05d}").write_bytes(b"x")
+
+            first = validate_dataset_tree(root)
+            second = validate_dataset_tree(root)
+
+        self.assertFalse(first.valid)
+        self.assertEqual(first, second)
+        self.assertIn("tree_limit", first.error_categories)
+
+    def test_exported_tree_limits_bound_manifest_shape(self) -> None:
+        max_depth = getattr(dataset_module, "MAX_DATASET_TREE_DEPTH", 8)
+        max_entries = getattr(
+            dataset_module,
+            "MAX_DATASET_MANIFEST_ENTRIES",
+            128,
+        )
+        max_members = getattr(
+            dataset_module,
+            "MAX_DATASET_TREE_MEMBERS",
+            1 + max_depth * max_entries,
+        )
+        self.assertGreaterEqual(max_depth, 2)
+        self.assertGreaterEqual(max_entries, 100)
+        self.assertGreater(max_members, 100)
+        self.assertGreaterEqual(
+            max_members,
+            1 + max_depth * max_entries,
+        )
+
+        case_bytes = canonical_json_bytes(_case_value())
+        too_deep = _entry_value(
+            case_bytes,
+            relative_path="/".join(
+                ["nested"] * max_depth + [f"{CASE_REF}.json"]
+            ),
+        )
+        with self.assertRaises(ValidationError):
+            DatasetEntry.model_validate(too_deep)
+
+        entries = []
+        for index in range(1, max_entries + 2):
+            case_ref = f"case_{index:032x}"
+            entries.append(
+                _entry_value(
+                    case_bytes,
+                    case_ref=case_ref,
+                    relative_path=f"cases/{case_ref}.json",
+                )
+            )
+        with self.assertRaises(ValidationError):
+            DatasetManifest.model_validate(_manifest_value(entries))
+
     def test_manifest_reader_rejects_utf8_json_size_and_hash_errors(self) -> None:
         invalid_payloads = (
             b"\xff",

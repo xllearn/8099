@@ -25,6 +25,11 @@ from app.deepeval_advisory.models import AdvisoryProjection, StrictModel
 MAX_DATASET_JSON_BYTES = 1024 * 1024
 MAX_DATASET_JSONL_BYTES = 16 * 1024 * 1024
 MAX_DATASET_JSONL_LINE_BYTES = 256 * 1024
+MAX_DATASET_TREE_DEPTH = 8
+MAX_DATASET_MANIFEST_ENTRIES = 128
+MAX_DATASET_TREE_MEMBERS = (
+    1 + MAX_DATASET_TREE_DEPTH * MAX_DATASET_MANIFEST_ENTRIES
+)
 
 _HASH_PATTERN = r"^[0-9a-f]{64}$"
 _CASE_REF_PATTERN = r"^case_[0-9a-f]{32}$"
@@ -135,6 +140,7 @@ IntegrityErrorCategory = Literal[
     "manifest_invalid",
     "path_invalid",
     "tree_unexpected",
+    "tree_limit",
     "file_hash_mismatch",
     "case_invalid",
     "entry_metadata_mismatch",
@@ -155,6 +161,7 @@ _ERROR_ORDER = {
             "manifest_invalid",
             "path_invalid",
             "tree_unexpected",
+            "tree_limit",
             "file_hash_mismatch",
             "case_invalid",
             "entry_metadata_mismatch",
@@ -396,6 +403,7 @@ class DatasetEntry(StrictModel):
         if (
             candidate.is_absolute()
             or any(part in {"", ".", ".."} for part in candidate.parts)
+            or len(candidate.parts) > MAX_DATASET_TREE_DEPTH
             or candidate.as_posix() != value
             or candidate.suffix != ".json"
             or any(
@@ -416,7 +424,10 @@ class DatasetManifest(_RawSelfHashedModel):
     dataset_version: Literal["fixed10/v1", "calibration100/v1"]
     projection_version: Literal["claim-ab-v1"]
     rubric_version: str = Field(pattern=_VERSION_TOKEN_PATTERN)
-    entries: tuple[DatasetEntry, ...] = Field(min_length=1)
+    entries: tuple[DatasetEntry, ...] = Field(
+        min_length=1,
+        max_length=MAX_DATASET_MANIFEST_ENTRIES,
+    )
     subsets: dict[str, tuple[str, ...]]
     declared_count: int = Field(ge=0)
     runnable_count: int = Field(ge=0)
@@ -1034,89 +1045,103 @@ def _inventory_directory(
     expected_directories: set[str],
     categories: set[IntegrityErrorCategory],
     snapshot: list[TreeSnapshotEntry],
+    member_count: list[int],
 ) -> None:
     try:
         with os.scandir(directory_descriptor) as iterator:
-            names = sorted(entry.name for entry in iterator)
+            for entry in iterator:
+                member_count[0] += 1
+                if member_count[0] > MAX_DATASET_TREE_MEMBERS:
+                    categories.add("tree_limit")
+                    return
+                name = entry.name
+                if (
+                    not isinstance(name, str)
+                    or name in {"", ".", ".."}
+                    or "/" in name
+                ):
+                    categories.add("tree_unexpected")
+                    continue
+                relative_parts = (*prefix, name)
+                relative_path = "/".join(relative_parts)
+                if len(relative_parts) > MAX_DATASET_TREE_DEPTH:
+                    categories.add("tree_limit")
+                    continue
+                try:
+                    before = os.stat(
+                        name,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                except (OSError, TypeError, ValueError):
+                    categories.add("tree_unexpected")
+                    continue
+
+                file_type = stat.S_IFMT(before.st_mode)
+                snapshot.append(
+                    (
+                        relative_path,
+                        file_type,
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                    )
+                )
+                if stat.S_ISLNK(before.st_mode):
+                    categories.add("tree_unexpected")
+                    continue
+                if stat.S_ISREG(before.st_mode):
+                    if relative_path not in expected_files:
+                        categories.add("tree_unexpected")
+                    if (
+                        before.st_size <= 0
+                        or before.st_size > MAX_DATASET_JSON_BYTES
+                    ):
+                        categories.add("file_size")
+                    continue
+                if not stat.S_ISDIR(before.st_mode):
+                    categories.add("tree_unexpected")
+                    continue
+
+                if relative_path not in expected_directories:
+                    categories.add("tree_unexpected")
+                    continue
+                child_descriptor: int | None = None
+                try:
+                    child_descriptor = os.open(
+                        name,
+                        _directory_flags(),
+                        dir_fd=directory_descriptor,
+                    )
+                    opened = os.fstat(child_descriptor)
+                    if not stat.S_ISDIR(opened.st_mode) or not _same_file(
+                        before,
+                        opened,
+                    ):
+                        categories.add("tree_unexpected")
+                        continue
+                    _inventory_directory(
+                        child_descriptor,
+                        prefix=relative_parts,
+                        expected_files=expected_files,
+                        expected_directories=expected_directories,
+                        categories=categories,
+                        snapshot=snapshot,
+                        member_count=member_count,
+                    )
+                    if "tree_limit" in categories:
+                        return
+                except (OSError, TypeError, ValueError):
+                    categories.add("tree_unexpected")
+                finally:
+                    if child_descriptor is not None:
+                        try:
+                            os.close(child_descriptor)
+                        except OSError:
+                            pass
     except (OSError, TypeError, ValueError):
         categories.add("tree_unexpected")
-        return
-
-    for name in names:
-        if not isinstance(name, str) or name in {"", ".", ".."} or "/" in name:
-            categories.add("tree_unexpected")
-            continue
-        relative_parts = (*prefix, name)
-        relative_path = "/".join(relative_parts)
-        try:
-            before = os.stat(
-                name,
-                dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        except (OSError, TypeError, ValueError):
-            categories.add("tree_unexpected")
-            continue
-
-        file_type = stat.S_IFMT(before.st_mode)
-        snapshot.append(
-            (
-                relative_path,
-                file_type,
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-            )
-        )
-        if stat.S_ISLNK(before.st_mode):
-            categories.add("tree_unexpected")
-            continue
-        if stat.S_ISREG(before.st_mode):
-            if relative_path not in expected_files:
-                categories.add("tree_unexpected")
-            if (
-                before.st_size <= 0
-                or before.st_size > MAX_DATASET_JSON_BYTES
-            ):
-                categories.add("file_size")
-            continue
-        if not stat.S_ISDIR(before.st_mode):
-            categories.add("tree_unexpected")
-            continue
-
-        if relative_path not in expected_directories:
-            categories.add("tree_unexpected")
-        child_descriptor: int | None = None
-        try:
-            child_descriptor = os.open(
-                name,
-                _directory_flags(),
-                dir_fd=directory_descriptor,
-            )
-            opened = os.fstat(child_descriptor)
-            if not stat.S_ISDIR(opened.st_mode) or not _same_file(
-                before,
-                opened,
-            ):
-                categories.add("tree_unexpected")
-                continue
-            _inventory_directory(
-                child_descriptor,
-                prefix=relative_parts,
-                expected_files=expected_files,
-                expected_directories=expected_directories,
-                categories=categories,
-                snapshot=snapshot,
-            )
-        except (OSError, TypeError, ValueError):
-            categories.add("tree_unexpected")
-        finally:
-            if child_descriptor is not None:
-                try:
-                    os.close(child_descriptor)
-                except OSError:
-                    pass
 
 
 def _inventory_tree(
@@ -1126,14 +1151,24 @@ def _inventory_tree(
     expected_files, expected_directories = _expected_tree_members(manifest)
     categories: set[IntegrityErrorCategory] = set()
     snapshot: list[TreeSnapshotEntry] = []
-    _inventory_directory(
-        root_descriptor,
-        prefix=(),
-        expected_files=expected_files,
-        expected_directories=expected_directories,
-        categories=categories,
-        snapshot=snapshot,
-    )
+    if (
+        len(expected_files) + len(expected_directories)
+        > MAX_DATASET_TREE_MEMBERS
+    ):
+        categories.add("tree_limit")
+    else:
+        try:
+            _inventory_directory(
+                root_descriptor,
+                prefix=(),
+                expected_files=expected_files,
+                expected_directories=expected_directories,
+                categories=categories,
+                snapshot=snapshot,
+                member_count=[0],
+            )
+        except RecursionError:
+            categories.add("tree_limit")
     observed_files = {
         path
         for path, file_type, *_rest in snapshot
@@ -1149,7 +1184,7 @@ def _inventory_tree(
         or not expected_directories.issubset(observed_directories)
     ):
         categories.add("tree_unexpected")
-    return categories, tuple(snapshot)
+    return categories, tuple(sorted(snapshot, key=lambda item: item[0]))
 
 
 def validate_dataset_tree(root: Path) -> DatasetValidation:
@@ -1170,15 +1205,21 @@ def validate_dataset_tree(root: Path) -> DatasetValidation:
                     categories.add(exc.category)
                 else:
                     checked_entry_count += 1
-            inventory_categories, after_snapshot = _inventory_tree(
-                root_descriptor,
-                manifest,
-            )
-            categories.update(inventory_categories)
-            if before_snapshot != after_snapshot:
-                categories.add("file_changed")
+            if "tree_limit" not in categories:
+                inventory_categories, after_snapshot = _inventory_tree(
+                    root_descriptor,
+                    manifest,
+                )
+                categories.update(inventory_categories)
+                if (
+                    "tree_limit" not in inventory_categories
+                    and before_snapshot != after_snapshot
+                ):
+                    categories.add("file_changed")
     except DatasetError as exc:
         categories.add(exc.category)
+    except RecursionError:
+        categories.add("tree_limit")
 
     ordered = tuple(sorted(categories, key=_ERROR_ORDER.__getitem__))
     return DatasetValidation(
@@ -1192,6 +1233,9 @@ __all__ = [
     "MAX_DATASET_JSON_BYTES",
     "MAX_DATASET_JSONL_BYTES",
     "MAX_DATASET_JSONL_LINE_BYTES",
+    "MAX_DATASET_TREE_DEPTH",
+    "MAX_DATASET_MANIFEST_ENTRIES",
+    "MAX_DATASET_TREE_MEMBERS",
     "DatasetCase",
     "DatasetEntry",
     "DatasetError",
