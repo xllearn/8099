@@ -47,6 +47,8 @@ from app.deepeval_advisory.judge import (
     JudgeCallContext,
     JudgeError,
     JudgeResponse,
+    JudgeUsageRecord,
+    JudgeUsageSnapshot,
     require_judge_context,
 )
 from app.deepeval_advisory.models import (
@@ -54,6 +56,7 @@ from app.deepeval_advisory.models import (
     AdvisoryProjection,
     EvidenceExcerpt,
     JobStatus,
+    MetricObservation,
     MetricStatus,
     ProjectionUnit,
     SafeLocator,
@@ -718,6 +721,57 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertRegex(result.input_fingerprint, r"^[0-9a-f]{64}$")
         self.assertRegex(result.output_fingerprint, r"^[0-9a-f]{64}$")
 
+    async def test_real_empty_evidence_skips_faithfulness_transport(
+        self,
+    ) -> None:
+        projection = make_projection(
+            (
+                make_unit(
+                    evidence=(),
+                    expected_facts=(),
+                    attachment_expectation=None,
+                ),
+            )
+        )
+        responses = safe_real_responses()
+        transport = FakeJudgeTransport(
+            profile_version=PROFILE_VERSION,
+            responses={
+                key: responses[key]
+                for key in (
+                    "Statements",
+                    "Verdicts",
+                    "AnswerRelevancyScoreReason",
+                )
+            },
+        )
+        judge = DeepEvalJudgeLLM(
+            transport,
+            profile_version=PROFILE_VERSION,
+        )
+
+        result = await evaluate_projection(
+            job=make_job(),
+            projection=projection,
+            judge=judge,
+            judge_provider="fake",
+            profile_version=PROFILE_VERSION,
+            cache_mode="use",
+        )
+
+        by_id = observations_by_id(result)
+        self.assertEqual(
+            by_id[METRIC_IDS[0]].status,
+            MetricStatus.NOT_APPLICABLE,
+        )
+        self.assertIsNone(by_id[METRIC_IDS[0]].score)
+        self.assertEqual(
+            by_id[METRIC_IDS[3]].status,
+            MetricStatus.SCORED,
+        )
+        self.assertEqual(transport.sync_call_count, 0)
+        self.assertEqual(transport.async_call_count, 3)
+
     async def test_one_case_per_unit_contains_only_approved_business_fields(
         self,
     ) -> None:
@@ -864,7 +918,7 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         metrics = controlled_metric_set(
-            faithfulness=[0.8, 0.6],
+            faithfulness=[0.8],
             critical=[],
             attachment=[],
             relevancy=[0.7, 0.5],
@@ -901,6 +955,15 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
             by_id[METRIC_IDS[3]].status,
             MetricStatus.SCORED,
         )
+        self.assertEqual(by_id[METRIC_IDS[0]].score, 0.8)
+        self.assertEqual(
+            tuple(
+                call["actual_output"]
+                for call in metrics[0].calls
+            ),
+            (units[0].text,),
+        )
+        self.assertEqual(len(metrics[3].calls), 2)
         self.assertEqual(len(metrics[1].calls), 0)
         self.assertEqual(len(metrics[2].calls), 0)
 
@@ -1181,6 +1244,50 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
                             result,
                         )
 
+    async def test_only_resource_limit_errors_are_over_budget_without_scores(
+        self,
+    ) -> None:
+        unit = make_unit(
+            expected_facts=("Required fact.",),
+            attachment_expectation="Attachment is present.",
+        )
+
+        for category, expected_status in (
+            ("request_too_large", JobStatus.OVER_BUDGET),
+            ("subcall_budget_exceeded", JobStatus.OVER_BUDGET),
+            ("prompt_boundary_violation", JobStatus.UNAVAILABLE),
+            ("request_invalid", JobStatus.UNAVAILABLE),
+        ):
+            with self.subTest(category=category):
+                metrics = controlled_metric_set(
+                    faithfulness=[JudgeError(category)],
+                    critical=[JudgeError(category)],
+                    attachment=[JudgeError(category)],
+                    relevancy=[JudgeError(category)],
+                )
+                with patch.object(
+                    evaluator_module,
+                    "_build_metrics",
+                    return_value=metrics,
+                ):
+                    result = await evaluate_projection(
+                        job=make_job(),
+                        projection=make_projection((unit,)),
+                        judge=NoCallJudge(),
+                        judge_provider="fake",
+                        profile_version=PROFILE_VERSION,
+                        cache_mode="use",
+                    )
+
+                self.assertEqual(result.status, expected_status)
+                self.assertTrue(
+                    all(
+                        item.status is MetricStatus.UNAVAILABLE
+                        and item.score is None
+                        for item in result.metrics
+                    )
+                )
+
     async def test_over_budget_is_never_used_after_partial_scoring(
         self,
     ) -> None:
@@ -1323,6 +1430,116 @@ class AdvisoryEvaluatorBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(SAFE_EVIDENCE, serialized)
         self.assertNotIn("Evaluate the bounded advisory unit.", serialized)
         self.assertNotIn('{"score":1.0}', serialized)
+
+    def test_malformed_usage_snapshot_rejection_is_atomic(
+        self,
+    ) -> None:
+        now = evaluator_module.time.monotonic()
+        context = JudgeCallContext(
+            request_id="req_atomic_12345678",
+            evaluation_id="eval_atomic_12345678",
+            run_ref=RUN_REF,
+            metric_id=METRIC_IDS[0],
+            metric_version="1",
+            projection_sha256=PROJECTION_SHA256,
+            max_subcalls=4,
+            fresh_until_monotonic=now + 30.0,
+            deadline_monotonic=now + 60.0,
+        )
+        valid_record = JudgeUsageRecord(
+            sequence=1,
+            token_input=2,
+            token_output=3,
+            cost=0.1,
+            latency_ms=4,
+            input_fingerprint="d" * 64,
+            output_fingerprint="e" * 64,
+        )
+        malformed_snapshots = {
+            "fingerprint": JudgeUsageSnapshot(
+                token_input=2,
+                token_output=3,
+                cost=0.1,
+                latency_ms=4,
+                response_count=1,
+                records=(
+                    JudgeUsageRecord(
+                        sequence=1,
+                        token_input=2,
+                        token_output=3,
+                        cost=0.1,
+                        latency_ms=4,
+                        input_fingerprint="not-a-sha256",
+                        output_fingerprint="e" * 64,
+                    ),
+                ),
+            ),
+            "summary_totals": JudgeUsageSnapshot(
+                token_input=99,
+                token_output=3,
+                cost=0.1,
+                latency_ms=4,
+                response_count=1,
+                records=(valid_record,),
+            ),
+            "duplicate_sequence": JudgeUsageSnapshot(
+                token_input=4,
+                token_output=6,
+                cost=0.2,
+                latency_ms=8,
+                response_count=2,
+                records=(valid_record, valid_record),
+            ),
+            "overflow": JudgeUsageSnapshot(
+                token_input=evaluator_module._MAX_LEDGER_INTEGER + 1,
+                token_output=3,
+                cost=0.1,
+                latency_ms=4,
+                response_count=1,
+                records=(valid_record,),
+            ),
+        }
+        empty_fingerprints = evaluator_module._UsageLedger().fingerprints()
+        unavailable = tuple(
+            MetricObservation(
+                metric_id=metric_id,
+                metric_version="1",
+                status=MetricStatus.UNAVAILABLE,
+            )
+            for metric_id in METRIC_IDS
+        )
+
+        for name, snapshot in malformed_snapshots.items():
+            with self.subTest(name=name):
+                ledger = evaluator_module._UsageLedger()
+                with self.assertRaises(
+                    evaluator_module._MetricEvaluationError
+                ):
+                    ledger.note_snapshot(
+                        context=context,
+                        unit_ordinal=1,
+                        snapshot=snapshot,
+                    )
+
+                self.assertEqual(ledger.accepted_response_count, 0)
+                self.assertEqual(ledger.token_input, 0)
+                self.assertEqual(ledger.token_output, 0)
+                self.assertEqual(ledger.cost, 0)
+                self.assertEqual(ledger.latency_ms, 0)
+                self.assertEqual(
+                    ledger.fingerprints(),
+                    empty_fingerprints,
+                )
+                self.assertEqual(
+                    evaluator_module._result_status(
+                        unavailable,
+                        over_budget_rejected=True,
+                        accepted_response_count=(
+                            ledger.accepted_response_count
+                        ),
+                    ),
+                    JobStatus.OVER_BUDGET,
+                )
 
     async def test_cache_modes_are_identical_and_perform_no_cache_io(
         self,

@@ -25,6 +25,7 @@ from app.deepeval_advisory.hashing import (
 from app.deepeval_advisory.judge import (
     JudgeCallContext,
     JudgeError,
+    JudgeUsageRecord,
     JudgeUsageSnapshot,
     judge_context,
 )
@@ -89,8 +90,6 @@ _MAX_LEDGER_INTEGER = (1 << 63) - 1
 _MAX_LEDGER_COST = Decimal(str(sys.float_info.max))
 _OVER_BUDGET_CATEGORIES = frozenset(
     {
-        "prompt_boundary_violation",
-        "request_invalid",
         "request_too_large",
         "subcall_budget_exceeded",
     }
@@ -128,13 +127,18 @@ class _UsageLedger:
         snapshot: JudgeUsageSnapshot,
     ) -> None:
         if (
-            type(snapshot.response_count) is not int
+            not isinstance(snapshot, JudgeUsageSnapshot)
+            or type(snapshot.response_count) is not int
             or snapshot.response_count < 0
+            or type(snapshot.records) is not tuple
             or snapshot.response_count != len(snapshot.records)
         ):
             raise _MetricEvaluationError("usage ledger is invalid")
-        self.accepted_response_count += snapshot.response_count
 
+        new_accepted_response_count = _checked_integer_sum(
+            self.accepted_response_count,
+            snapshot.response_count,
+        )
         new_token_input = _checked_integer_sum(
             self.token_input,
             snapshot.token_input,
@@ -147,6 +151,8 @@ class _UsageLedger:
             self.latency_ms,
             snapshot.latency_ms,
         )
+        if type(snapshot.cost) is not float:
+            raise _MetricEvaluationError("usage ledger is invalid")
         try:
             snapshot_cost = Decimal(str(snapshot.cost))
             new_cost = self.cost + snapshot_cost
@@ -162,10 +168,20 @@ class _UsageLedger:
             raise _MetricEvaluationError("usage ledger overflow")
 
         new_records: list[dict[str, Any]] = []
+        record_token_input = 0
+        record_token_output = 0
+        record_cost = Decimal("0")
+        record_latency_ms = 0
+        previous_sequence = 0
         for record in snapshot.records:
             if (
-                type(record.sequence) is not int
+                not isinstance(record, JudgeUsageRecord)
+                or type(record.sequence) is not int
                 or record.sequence < 1
+                or record.sequence <= previous_sequence
+                or type(record.cost) is not float
+                or type(record.input_fingerprint) is not str
+                or type(record.output_fingerprint) is not str
                 or not re.fullmatch(
                     r"[0-9a-f]{64}",
                     record.input_fingerprint,
@@ -178,6 +194,34 @@ class _UsageLedger:
                 raise _MetricEvaluationError(
                     "usage fingerprint record is invalid"
                 )
+            previous_sequence = record.sequence
+            record_token_input = _checked_integer_sum(
+                record_token_input,
+                record.token_input,
+            )
+            record_token_output = _checked_integer_sum(
+                record_token_output,
+                record.token_output,
+            )
+            record_latency_ms = _checked_integer_sum(
+                record_latency_ms,
+                record.latency_ms,
+            )
+            try:
+                item_cost = Decimal(str(record.cost))
+                record_cost += item_cost
+            except (InvalidOperation, TypeError, ValueError):
+                raise _MetricEvaluationError(
+                    "usage ledger is invalid"
+                ) from None
+            if (
+                not item_cost.is_finite()
+                or item_cost < 0
+                or not record_cost.is_finite()
+                or record_cost < 0
+                or record_cost > _MAX_LEDGER_COST
+            ):
+                raise _MetricEvaluationError("usage ledger overflow")
             new_records.append(
                 {
                     "ordinal": len(self._records)
@@ -193,6 +237,15 @@ class _UsageLedger:
                 }
             )
 
+        if (
+            record_token_input != snapshot.token_input
+            or record_token_output != snapshot.token_output
+            or float(record_cost) != snapshot.cost
+            or record_latency_ms != snapshot.latency_ms
+        ):
+            raise _MetricEvaluationError("usage ledger is invalid")
+
+        self.accepted_response_count = new_accepted_response_count
         self.token_input = new_token_input
         self.token_output = new_token_output
         self.latency_ms = new_latency_ms
@@ -417,7 +470,19 @@ def _applicable_unit_ordinals(
     metric_id: str,
     projection: AdvisoryProjection,
 ) -> tuple[int, ...]:
-    if metric_id in {METRIC_IDS[0], METRIC_IDS[3]}:
+    if metric_id == METRIC_IDS[0]:
+        return tuple(
+            ordinal
+            for ordinal, unit in enumerate(
+                projection.units,
+                start=1,
+            )
+            if any(
+                evidence.level in {"A", "B"}
+                for evidence in unit.evidence
+            )
+        )
+    if metric_id == METRIC_IDS[3]:
         return tuple(range(1, len(projection.units) + 1))
     if metric_id == METRIC_IDS[1]:
         return tuple(
