@@ -11,7 +11,6 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.deepeval_advisory.datasets import (
     Fixed10FreezeError,
-    freeze_calibration100_dataset,
     freeze_fixed10_dataset,
 )
 
@@ -20,10 +19,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Freeze an immutable offline DeepEval advisory dataset.",
     )
-    parser.add_argument(
-        "dataset",
-        choices=("fixed10", "calibration100"),
-    )
+    parser.add_argument("dataset", choices=("fixed10",))
     parser.add_argument(
         "--source-dir",
         required=True,
@@ -44,12 +40,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
-    freeze = {
-        "fixed10": freeze_fixed10_dataset,
-        "calibration100": freeze_calibration100_dataset,
-    }[arguments.dataset]
     try:
-        status = freeze(
+        status = freeze_fixed10_dataset(
             arguments.source_dir,
             arguments.output_dir,
             lock_timeout_seconds=arguments.lock_timeout_seconds,
@@ -59,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "category": exc.category,
-                    "error": f"{arguments.dataset} dataset freeze failed",
+                    "error": "fixed10 dataset freeze failed",
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -70,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         json.dumps(
             {
-                "dataset_version": f"{arguments.dataset}/v1",
+                "dataset_version": "fixed10/v1",
                 "status": status,
             },
             sort_keys=True,
