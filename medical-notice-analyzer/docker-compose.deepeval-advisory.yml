@@ -20,9 +20,24 @@ services:
     ports:
       - "${DEEPEVAL_ADVISORY_BIND_IP:-127.0.0.1}:${DEEPEVAL_ADVISORY_PORT:-8100}:8100"
     volumes:
-      - ${DEEPEVAL_ANALYSIS_RUN_SOURCE:-./data/analysis_runs}:/source/analysis_runs:ro
-      - ${DEEPEVAL_EVIDENCE_PACK_SOURCE:-./data/evidence_packs}:/source/evidence_packs:ro
-      - ${DEEPEVAL_ADVISORY_STATE_SOURCE:-./deepeval-advisory-state}:/state/advisory
+      - type: bind
+        source: ${DEEPEVAL_ANALYSIS_RUN_SOURCE:-./data/analysis_runs}
+        target: /source/analysis_runs
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DEEPEVAL_EVIDENCE_PACK_SOURCE:-./data/evidence_packs}
+        target: /source/evidence_packs
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DEEPEVAL_ADVISORY_STATE_SOURCE:-./deepeval-advisory-state}
+        target: /state/advisory
+        read_only: false
+        bind:
+          create_host_path: false
     read_only: true
     tmpfs:
       - /tmp

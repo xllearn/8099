@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,7 @@ _METRIC_IDS = (
     "attachment_state_consistency_v1",
     "answer_relevancy_v1",
 )
+_JOB_ID_PATTERN = re.compile(r"^job_[A-Za-z0-9_-]{8,80}$")
 
 
 def _json_object(path: Path) -> dict[str, Any] | None:
@@ -36,9 +38,30 @@ def _json_object(path: Path) -> dict[str, Any] | None:
 
 def build_safe_snapshot(state_dir: Path) -> dict[str, Any]:
     root = Path(state_dir)
-    latest: dict[tuple[str, int], AdvisoryJob] = {}
     state_errors = 0
+    worker_value = _json_object(root / "worker" / "current.json") or {}
+    inventory_present = "current_job_ids" in worker_value
+    current_job_ids: tuple[str, ...] = ()
+    if inventory_present:
+        raw_inventory = worker_value.get("current_job_ids")
+        if (
+            isinstance(raw_inventory, list)
+            and all(
+                type(job_id) is str
+                and _JOB_ID_PATTERN.fullmatch(job_id)
+                for job_id in raw_inventory
+            )
+            and len(raw_inventory) == len(set(raw_inventory))
+        ):
+            current_job_ids = tuple(raw_inventory)
+        else:
+            state_errors += 1
+    current_job_id_set = set(current_job_ids)
+
+    latest: dict[tuple[str, int], AdvisoryJob] = {}
     for path in sorted((root / "jobs").glob("*.json")):
+        if inventory_present and path.stem not in current_job_id_set:
+            continue
         value = _json_object(path)
         try:
             job = AdvisoryJob.model_validate(value)
@@ -55,9 +78,18 @@ def build_safe_snapshot(state_dir: Path) -> dict[str, Any]:
             current.job_id,
         ):
             latest[identity] = job
+    if inventory_present:
+        stored_current_ids = {
+            job.job_id for job in latest.values()
+        }
+        state_errors += len(
+            current_job_id_set - stored_current_ids
+        )
 
     results: dict[str, AdvisoryResult] = {}
     for path in sorted((root / "results").glob("*.json")):
+        if inventory_present and path.stem not in current_job_id_set:
+            continue
         value = _json_object(path)
         try:
             result = AdvisoryResult.model_validate(value)
@@ -66,19 +98,30 @@ def build_safe_snapshot(state_dir: Path) -> dict[str, Any]:
             continue
         results[result.job_id] = result
 
-    worker_value = _json_object(root / "worker" / "current.json") or {}
     discovery_errors = worker_value.get("discovery_errors", 0)
     if type(discovery_errors) is not int or discovery_errors < 0:
         discovery_errors = 0
         state_errors += 1
 
     enrolled = len(latest)
-    eligible_value = worker_value.get("eligible", enrolled)
-    eligible = (
-        eligible_value
-        if type(eligible_value) is int and eligible_value >= enrolled
-        else enrolled
-    )
+    if inventory_present:
+        eligible_value = worker_value.get("eligible")
+        if (
+            type(eligible_value) is int
+            and eligible_value >= enrolled
+        ):
+            eligible = eligible_value
+        else:
+            eligible = enrolled
+            state_errors += 1
+    else:
+        eligible_value = worker_value.get("eligible", enrolled)
+        eligible = (
+            eligible_value
+            if type(eligible_value) is int
+            and eligible_value >= enrolled
+            else enrolled
+        )
     cached = sum(
         job.status is JobStatus.CACHED for job in latest.values()
     )

@@ -7,6 +7,7 @@ import threading
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from app.deepeval_advisory.models import (
     AdvisoryResult,
@@ -166,6 +167,105 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
                         before,
                     )
 
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _write_sources(
+                root,
+                run_id="run_fault_z_first",
+                pack_id="pack_fault_z_first",
+            )
+            _write_sources(
+                root,
+                run_id="run_fault_a_next",
+                pack_id="pack_fault_a_next",
+            )
+            _write_sources(
+                root,
+                run_id="run_fault_m_store",
+                pack_id="pack_fault_m_store",
+            )
+            settings = _settings(root, enabled=False)
+            worker = AdvisoryWorker(settings)
+            create = worker._store.create_job
+            transition = worker._store.transition_job
+            create_attempts = 0
+            attempts = 0
+
+            def fail_create_once(value):
+                nonlocal create_attempts
+                create_attempts += 1
+                if create_attempts == 1:
+                    raise OSError("injected job creation failure")
+                return create(value)
+
+            def fail_once(job_id, status, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("injected transition failure")
+                return transition(job_id, status, **kwargs)
+
+            with patch.object(
+                worker._store,
+                "create_job",
+                side_effect=fail_create_once,
+            ), patch.object(
+                worker._store,
+                "transition_job",
+                side_effect=fail_once,
+            ):
+                summary = await worker.run_once()
+
+            self.assertEqual(summary.eligible, 3)
+            self.assertEqual(summary.enrolled, 2)
+            self.assertEqual(summary.paused, 1)
+            self.assertEqual(summary.unavailable, 1)
+            self.assertEqual(summary.discovery_errors, 2)
+            self.assertEqual(
+                {job["status"] for job in _state_values(root, "jobs")},
+                {"discovered", "paused"},
+            )
+            worker_state = json.loads(
+                (
+                    settings.advisory_dir
+                    / "worker"
+                    / "current.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(len(worker_state["current_job_ids"]), 2)
+            self.assertEqual(worker_state["eligible"], 3)
+            self.assertEqual(worker_state["enrolled"], 2)
+            self.assertEqual(worker_state["discovery_errors"], 2)
+            snapshot = build_safe_snapshot(settings.advisory_dir)
+            self.assertEqual(snapshot["coverage"]["eligible"], 3)
+            self.assertEqual(snapshot["coverage"]["enrolled"], 2)
+            self.assertEqual(
+                snapshot["coverage"]["percentages"]["enrolled"],
+                66.67,
+            )
+            worker_state["eligible"] = 1
+            (
+                settings.advisory_dir / "worker" / "current.json"
+            ).write_text(
+                json.dumps(worker_state),
+                encoding="utf-8",
+            )
+            invalid_snapshot = build_safe_snapshot(
+                settings.advisory_dir
+            )
+            self.assertEqual(
+                invalid_snapshot["coverage"]["eligible"],
+                2,
+            )
+            self.assertGreaterEqual(
+                invalid_snapshot["coverage"]["eligible"],
+                invalid_snapshot["coverage"]["enrolled"],
+            )
+            self.assertEqual(
+                invalid_snapshot["health"]["state_errors"],
+                1,
+            )
+
     async def test_fake_judge_success_persists_four_non_blocking_metrics(
         self,
     ) -> None:
@@ -274,6 +374,11 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             _write_sources(root)
+            _write_sources(
+                root,
+                run_id="run_unconfigured_a_case",
+                pack_id="pack_unconfigured_a_case",
+            )
             missing_pack_run = _read_fixture("run_finished.json")
             missing_pack_run["run_id"] = "run_missing_pack_case"
             missing_pack_run["pack_id"] = "pack_missing_pack_case"
@@ -293,7 +398,23 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 update={"runtime_advisory_enabled": True}
             )
 
-            summary = await AdvisoryWorker(settings).run_once()
+            worker = AdvisoryWorker(settings)
+            transition = worker._store.transition_job
+            attempts = 0
+
+            def fail_once(job_id, status, **kwargs):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise OSError("injected transition failure")
+                return transition(job_id, status, **kwargs)
+
+            with patch.object(
+                worker._store,
+                "transition_job",
+                side_effect=fail_once,
+            ):
+                summary = await worker.run_once()
             jobs = _state_values(root, "jobs")
             job = next(
                 item
@@ -303,8 +424,9 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
             snapshot = build_safe_snapshot(settings.advisory_dir)
 
             self.assertEqual(summary.judge_evaluations, 0)
-            self.assertEqual(summary.eligible, 2)
-            self.assertEqual(summary.enrolled, 2)
+            self.assertEqual(summary.eligible, 3)
+            self.assertEqual(summary.enrolled, 3)
+            self.assertEqual(summary.discovery_errors, 2)
             self.assertEqual(job["status"], "paused")
             self.assertEqual(job["error_category"], "judge_unconfigured")
             self.assertTrue(
@@ -315,8 +437,8 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     for item in jobs
                 )
             )
-            self.assertEqual(snapshot["coverage"]["enrolled"], 2)
-            self.assertEqual(snapshot["coverage"]["paused"], 1)
+            self.assertEqual(snapshot["coverage"]["enrolled"], 3)
+            self.assertEqual(snapshot["coverage"]["paused"], 2)
             self.assertEqual(snapshot["coverage"]["unavailable"], 2)
 
     async def test_reporting_http_exposes_only_safe_aggregate_snapshot(
@@ -365,6 +487,30 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 settings,
                 evaluator=successful_evaluator,
             ).run_once()
+            scored_snapshot = build_safe_snapshot(
+                settings.advisory_dir
+            )
+            self.assertEqual(scored_snapshot["coverage"]["scored"], 1)
+            self.assertEqual(
+                scored_snapshot["metrics"]["answer_relevancy_v1"]["mean"],
+                0.8,
+            )
+
+            updated_run = dict(raw_run)
+            updated_run["version"] = 2
+            updated_run["report_markdown"] = (
+                raw_body + "\n补充说明：当前版本等待评分。"
+            )
+            run_path.write_text(
+                json.dumps(updated_run, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            await AdvisoryWorker(
+                settings.model_copy(
+                    update={"runtime_advisory_enabled": False}
+                ),
+                evaluator=successful_evaluator,
+            ).run_once()
             snapshot = build_safe_snapshot(settings.advisory_dir)
             server, thread = start_reporting_server(
                 settings.advisory_dir,
@@ -389,11 +535,15 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
             rendered = json.dumps(snapshot, ensure_ascii=False) + "".join(
                 payloads.values()
             )
-            self.assertEqual(snapshot["coverage"]["scored"], 1)
+            self.assertEqual(snapshot["coverage"]["eligible"], 1)
+            self.assertEqual(snapshot["coverage"]["enrolled"], 1)
+            self.assertEqual(snapshot["coverage"]["scored"], 0)
             self.assertEqual(
-                snapshot["metrics"]["answer_relevancy_v1"]["mean"],
-                0.8,
+                snapshot["metrics"]["answer_relevancy_v1"],
+                {"sample_count": 0, "mean": None},
             )
+            self.assertEqual(len(snapshot["recent"]), 1)
+            self.assertEqual(snapshot["recent"][0]["report_version"], 2)
             self.assertIn("coverage", rendered)
             self.assertIn("claim_faithfulness_v1", rendered)
             self.assertRegex(rendered, r"runref_[0-9a-f]{32}")

@@ -314,75 +314,26 @@ class AdvisoryWorker:
             cache_mode="use",
         )
 
-    async def run_once(self) -> WorkerSummary:
+    async def _process_job(
+        self,
+        *,
+        job_id: str,
+        projection_sha256: str,
+        paused: bool,
+        summary: WorkerSummary,
+    ) -> None:
         from app.deepeval_advisory.cache import CacheError
-        from app.deepeval_advisory.store import StoreError
 
-        summary = WorkerSummary()
-        enrolled_jobs: list[tuple[str, str]] = []
-        paused = (
-            not self.settings.runtime_advisory_enabled
-            or runtime_is_paused(self.settings.advisory_dir)
-        )
-        for run_path in sorted(
-            self.settings.analysis_run_dir.glob("run_*.json"),
-            reverse=True,
-        ):
-            try:
-                snapshot = load_run_snapshot(
-                    run_path,
-                    self._hmac_key,
-                    max_bytes=self.settings.max_run_bytes,
-                )
-            except ProjectionError:
-                summary.discovery_errors += 1
-                continue
-            if not snapshot.eligible:
-                continue
-            summary.eligible += 1
-            pack_path = (
-                self.settings.evidence_pack_dir
-                / f"{snapshot.pack_id}.json"
+        try:
+            job = self._store.read_job(job_id)
+            projection = self._store.read_projection(
+                projection_sha256
             )
-            try:
-                projection = build_projection(
-                    snapshot,
-                    pack_path,
-                    max_bytes=self.settings.max_pack_bytes,
-                )
-                self._store.write_projection(projection)
-                job = self._job_for(snapshot, projection)
-            except ProjectionError:
-                summary.discovery_errors += 1
-                try:
-                    self._projection_unavailable_job(snapshot)
-                    summary.enrolled += 1
-                    summary.unavailable += 1
-                except (StoreError, OSError):
-                    pass
-                continue
-            except (StoreError, OSError):
-                summary.discovery_errors += 1
-                continue
-            summary.enrolled += 1
-            enrolled_jobs.append(
-                (job.job_id, projection.projection_sha256)
-            )
-
-        for job_id, projection_sha256 in enrolled_jobs:
-            try:
-                job = self._store.read_job(job_id)
-                projection = self._store.read_projection(
-                    projection_sha256
-                )
-            except StoreError:
-                summary.discovery_errors += 1
-                continue
             if job.status in {JobStatus.COMPLETED, JobStatus.CACHED}:
                 summary.scored += 1
                 if job.status is JobStatus.CACHED:
                     summary.cached += 1
-                continue
+                return
             if job.status in {
                 JobStatus.UNAVAILABLE,
                 JobStatus.OVER_BUDGET,
@@ -390,9 +341,9 @@ class AdvisoryWorker:
                 JobStatus.INDETERMINATE,
             }:
                 summary.unavailable += 1
-                continue
+                return
             if job.status is JobStatus.RUNNING:
-                continue
+                return
             if paused:
                 if job.status is JobStatus.DISCOVERED:
                     job = self._store.transition_job(
@@ -405,7 +356,7 @@ class AdvisoryWorker:
                         JobStatus.PAUSED,
                     )
                 summary.paused += 1
-                continue
+                return
             if not self._configured():
                 if job.status is JobStatus.DISCOVERED:
                     job = self._store.transition_job(
@@ -431,108 +382,178 @@ class AdvisoryWorker:
                     )
                 summary.paused += 1
                 summary.unavailable += 1
-                continue
-            try:
-                if job.status is JobStatus.PAUSED:
-                    job = self._store.transition_job(
-                        job.job_id,
-                        JobStatus.PENDING,
-                        error_category=None,
-                    )
-                elif job.status is JobStatus.DISCOVERED:
-                    job = self._store.transition_job(
-                        job.job_id,
-                        JobStatus.PENDING,
-                    )
-                if job.status not in {
+                return
+
+            if job.status is JobStatus.PAUSED:
+                job = self._store.transition_job(
+                    job.job_id,
                     JobStatus.PENDING,
-                    JobStatus.RUNNING,
-                }:
-                    summary.unavailable += 1
-                    continue
+                    error_category=None,
+                )
+            elif job.status is JobStatus.DISCOVERED:
+                job = self._store.transition_job(
+                    job.job_id,
+                    JobStatus.PENDING,
+                )
+            if job.status not in {
+                JobStatus.PENDING,
+                JobStatus.RUNNING,
+            }:
+                summary.unavailable += 1
+                return
 
-                try:
-                    cached = self._cache.read(
-                        job.advisory_input_sha256
-                    )
-                except CacheError:
-                    cached = None
-                if cached is not None:
-                    if job.status is JobStatus.PENDING:
-                        job = self._store.transition_job(
-                            job.job_id,
-                            JobStatus.RUNNING,
-                            evaluation_id=self._evaluation_id(job),
-                        )
-                    self._store.record_cache_hit(
-                        job.job_id,
-                        cached,
-                        evaluation_id=self._evaluation_id(job),
-                    )
-                    summary.scored += 1
-                    summary.cached += 1
-                    summary.cache_hits += 1
-                    continue
-
-                if (
-                    summary.judge_evaluations
-                    >= self.settings.max_judge_evaluations_per_scan
-                ):
-                    continue
+            try:
+                cached = self._cache.read(job.advisory_input_sha256)
+            except CacheError:
+                cached = None
+            if cached is not None:
                 if job.status is JobStatus.PENDING:
                     job = self._store.transition_job(
                         job.job_id,
                         JobStatus.RUNNING,
                         evaluation_id=self._evaluation_id(job),
                     )
-                if job.status is not JobStatus.RUNNING:
+                self._store.record_cache_hit(
+                    job.job_id,
+                    cached,
+                    evaluation_id=self._evaluation_id(job),
+                )
+                summary.scored += 1
+                summary.cached += 1
+                summary.cache_hits += 1
+                return
+
+            if (
+                summary.judge_evaluations
+                >= self.settings.max_judge_evaluations_per_scan
+            ):
+                return
+            if job.status is JobStatus.PENDING:
+                job = self._store.transition_job(
+                    job.job_id,
+                    JobStatus.RUNNING,
+                    evaluation_id=self._evaluation_id(job),
+                )
+            if job.status is not JobStatus.RUNNING:
+                summary.unavailable += 1
+                return
+            summary.judge_evaluations += 1
+            result = await self._evaluate(job, projection)
+            self._store.write_result(result)
+            self._store.transition_job(
+                job.job_id,
+                result.status,
+                evaluation_id=result.evaluation_id,
+            )
+            if result.status is JobStatus.COMPLETED:
+                summary.scored += 1
+                try:
+                    self._cache.write_completed(
+                        job.advisory_input_sha256,
+                        result,
+                    )
+                except CacheError:
+                    summary.discovery_errors += 1
+            else:
+                summary.unavailable += 1
+        except Exception:
+            summary.discovery_errors += 1
+            summary.unavailable += 1
+            try:
+                current = self._store.read_job(job_id)
+                if current.status is JobStatus.RUNNING:
+                    self._store.transition_job(
+                        current.job_id,
+                        JobStatus.UNAVAILABLE,
+                        error_category="evaluation_failed",
+                    )
+            except Exception:
+                pass
+
+    async def run_once(self) -> WorkerSummary:
+        summary = WorkerSummary()
+        enrolled_jobs: list[tuple[str, str]] = []
+        current_job_ids: list[str] = []
+        paused = (
+            not self.settings.runtime_advisory_enabled
+            or runtime_is_paused(self.settings.advisory_dir)
+        )
+        try:
+            for run_path in sorted(
+                self.settings.analysis_run_dir.glob("run_*.json"),
+                reverse=True,
+            ):
+                try:
+                    snapshot = load_run_snapshot(
+                        run_path,
+                        self._hmac_key,
+                        max_bytes=self.settings.max_run_bytes,
+                    )
+                except ProjectionError:
+                    summary.discovery_errors += 1
+                    continue
+                if not snapshot.eligible:
+                    continue
+                summary.eligible += 1
+                pack_path = (
+                    self.settings.evidence_pack_dir
+                    / f"{snapshot.pack_id}.json"
+                )
+                try:
+                    projection = build_projection(
+                        snapshot,
+                        pack_path,
+                        max_bytes=self.settings.max_pack_bytes,
+                    )
+                    self._store.write_projection(projection)
+                    job = self._job_for(snapshot, projection)
+                except ProjectionError:
+                    summary.discovery_errors += 1
+                    try:
+                        job = self._projection_unavailable_job(
+                            snapshot
+                        )
+                    except Exception:
+                        continue
+                    current_job_ids.append(job.job_id)
+                    summary.enrolled += 1
                     summary.unavailable += 1
                     continue
-                summary.judge_evaluations += 1
-                result = await self._evaluate(job, projection)
-                self._store.write_result(result)
-                self._store.transition_job(
-                    job.job_id,
-                    result.status,
-                    evaluation_id=result.evaluation_id,
-                )
-                if result.status is JobStatus.COMPLETED:
-                    summary.scored += 1
-                    try:
-                        self._cache.write_completed(
-                            job.advisory_input_sha256,
-                            result,
-                        )
-                    except CacheError:
-                        summary.discovery_errors += 1
-                else:
-                    summary.unavailable += 1
-            except Exception:
-                summary.discovery_errors += 1
-                summary.unavailable += 1
-                try:
-                    current = self._store.read_job(job.job_id)
-                    if current.status is JobStatus.RUNNING:
-                        self._store.transition_job(
-                            job.job_id,
-                            JobStatus.UNAVAILABLE,
-                            error_category="evaluation_failed",
-                        )
                 except Exception:
-                    pass
+                    summary.discovery_errors += 1
+                    continue
+                current_job_ids.append(job.job_id)
+                summary.enrolled += 1
+                enrolled_jobs.append(
+                    (job.job_id, projection.projection_sha256)
+                )
 
-        self._write_summary(summary)
+            for job_id, projection_sha256 in enrolled_jobs:
+                await self._process_job(
+                    job_id=job_id,
+                    projection_sha256=projection_sha256,
+                    paused=paused,
+                    summary=summary,
+                )
+        finally:
+            self._write_summary(summary, current_job_ids)
         return summary
 
-    def _write_summary(self, summary: WorkerSummary) -> None:
+    def _write_summary(
+        self,
+        summary: WorkerSummary,
+        current_job_ids: list[str],
+    ) -> None:
         directory = self.settings.advisory_dir / "worker"
         try:
             directory.mkdir(parents=True, exist_ok=True)
             target = directory / "current.json"
             temporary = directory / f".current-{os.getpid()}.tmp"
+            payload = asdict(summary)
+            payload["current_job_ids"] = list(current_job_ids)
             temporary.write_text(
                 json.dumps(
-                    asdict(summary),
+                    payload,
                     sort_keys=True,
                     separators=(",", ":"),
                 )

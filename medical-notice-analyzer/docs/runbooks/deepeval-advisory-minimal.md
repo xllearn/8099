@@ -11,6 +11,23 @@ The compose file starts with runtime evaluation disabled. Discovery and
 enrollment still run, so eligible reports are persisted as paused jobs without
 calling a Judge.
 
+Create only the sidecar state directory. The analysis-run and evidence-pack
+directories belong to the primary service: verify that they already exist and
+are readable, but do not create them or change their ownership or mode. On
+Linux, use the same variables and defaults as the compose file:
+
+```bash
+test -d "${DEEPEVAL_ANALYSIS_RUN_SOURCE:-./data/analysis_runs}" &&
+test -r "${DEEPEVAL_ANALYSIS_RUN_SOURCE:-./data/analysis_runs}" &&
+test -d "${DEEPEVAL_EVIDENCE_PACK_SOURCE:-./data/evidence_packs}" &&
+test -r "${DEEPEVAL_EVIDENCE_PACK_SOURCE:-./data/evidence_packs}" &&
+sudo install -d -m 0700 -o 10001 -g 10001 \
+  "${DEEPEVAL_ADVISORY_STATE_SOURCE:-./deepeval-advisory-state}"
+```
+
+The bind definitions set `create_host_path: false`. A missing directory must
+make Compose fail instead of being silently created as root.
+
 ```powershell
 docker compose -f docker-compose.deepeval-advisory.yml up -d --build
 Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8100/health
@@ -62,10 +79,14 @@ docker compose -f docker-compose.deepeval-advisory.yml exec deepeval-advisory py
 docker compose -f docker-compose.deepeval-advisory.yml exec deepeval-advisory python scripts/run_deepeval_advisory.py --resume
 ```
 
-For a single discovery/evaluation pass:
+Never start a one-shot worker alongside the resident sidecar. Stop the
+resident process first, run the one-shot, and restore the resident process
+after it exits:
 
 ```powershell
+docker compose -f docker-compose.deepeval-advisory.yml stop deepeval-advisory
 docker compose -f docker-compose.deepeval-advisory.yml run --rm --no-deps deepeval-advisory python scripts/run_deepeval_advisory.py --once
+docker compose -f docker-compose.deepeval-advisory.yml up -d --no-deps deepeval-advisory
 ```
 
 ## Read-only reporting
