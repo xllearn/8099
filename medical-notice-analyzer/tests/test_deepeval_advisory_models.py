@@ -559,7 +559,7 @@ class AdvisorySettingsTests(unittest.TestCase):
 
         self.assertFalse(settings.runtime_advisory_enabled)
         self.assertFalse(settings.scheduled_evaluation_enabled)
-        self.assertEqual(settings.scan_interval_seconds, 30)
+        self.assertEqual(settings.scan_interval_seconds, 300)
         self.assertEqual(settings.worker_concurrency, 1)
         self.assertEqual(settings.lease_ttl_seconds, 900)
         self.assertEqual(settings.lease_heartbeat_seconds, 30)
@@ -605,7 +605,8 @@ class AdvisorySettingsTests(unittest.TestCase):
         settings = AdvisorySettings.from_mapping(
             {
                 **required_settings(),
-                "DEEPEVAL_SCAN_INTERVAL_SECONDS": "5",
+                "DEEPEVAL_SCAN_INTERVAL_SECONDS": "300",
+                "DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN": "1",
                 "DEEPEVAL_WORKER_CONCURRENCY": "4",
                 "DEEPEVAL_LEASE_TTL_SECONDS": "3600",
                 "DEEPEVAL_LEASE_HEARTBEAT_SECONDS": "300",
@@ -613,7 +614,8 @@ class AdvisorySettingsTests(unittest.TestCase):
                 "DEEPEVAL_MAX_PACK_BYTES": "2048",
             }
         )
-        self.assertEqual(settings.scan_interval_seconds, 5)
+        self.assertEqual(settings.scan_interval_seconds, 300)
+        self.assertEqual(settings.max_judge_evaluations_per_scan, 1)
         self.assertEqual(settings.worker_concurrency, 4)
         self.assertEqual(settings.lease_ttl_seconds, 3600)
         self.assertEqual(settings.lease_heartbeat_seconds, 300)
@@ -622,6 +624,7 @@ class AdvisorySettingsTests(unittest.TestCase):
 
         for name in (
             "DEEPEVAL_SCAN_INTERVAL_SECONDS",
+            "DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN",
             "DEEPEVAL_WORKER_CONCURRENCY",
             "DEEPEVAL_LEASE_TTL_SECONDS",
             "DEEPEVAL_LEASE_HEARTBEAT_SECONDS",
@@ -639,7 +642,8 @@ class AdvisorySettingsTests(unittest.TestCase):
 
     def test_settings_enforce_integer_bounds_and_required_paths(self) -> None:
         invalid_bounds = {
-            "DEEPEVAL_SCAN_INTERVAL_SECONDS": "4",
+            "DEEPEVAL_SCAN_INTERVAL_SECONDS": "299",
+            "DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN": "2",
             "DEEPEVAL_WORKER_CONCURRENCY": "5",
             "DEEPEVAL_LEASE_TTL_SECONDS": "59",
             "DEEPEVAL_LEASE_HEARTBEAT_SECONDS": "301",
