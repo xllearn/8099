@@ -1,0 +1,40 @@
+services:
+  deepeval-advisory:
+    container_name: medical-notice-analyzer-deepeval-advisory
+    build:
+      context: .
+      dockerfile: Dockerfile.deepeval
+    image: medical-notice-analyzer-deepeval:advisory
+    command: ["python", "scripts/run_deepeval_advisory.py"]
+    environment:
+      ANALYSIS_RUN_DIR: /source/analysis_runs
+      EVIDENCE_PACK_DIR: /source/evidence_packs
+      DEEPEVAL_ADVISORY_DIR: /state/advisory
+      DEEPEVAL_RUNTIME_ADVISORY_ENABLED: ${DEEPEVAL_RUNTIME_ADVISORY_ENABLED:-false}
+      DEEPEVAL_SCAN_INTERVAL_SECONDS: ${DEEPEVAL_SCAN_INTERVAL_SECONDS:-300}
+      DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN: ${DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN:-1}
+      DEEPEVAL_JUDGE_BASE_URL: ${DEEPEVAL_JUDGE_BASE_URL:-}
+      DEEPEVAL_JUDGE_MODEL: ${DEEPEVAL_JUDGE_MODEL:-}
+      DEEPEVAL_ADVISORY_HOST: 0.0.0.0
+      DEEPEVAL_ADVISORY_PORT: 8100
+    ports:
+      - "${DEEPEVAL_ADVISORY_BIND_IP:-127.0.0.1}:${DEEPEVAL_ADVISORY_PORT:-8100}:8100"
+    volumes:
+      - ${DEEPEVAL_ANALYSIS_RUN_SOURCE:-./data/analysis_runs}:/source/analysis_runs:ro
+      - ${DEEPEVAL_EVIDENCE_PACK_SOURCE:-./data/evidence_packs}:/source/evidence_packs:ro
+      - ${DEEPEVAL_ADVISORY_STATE_SOURCE:-./deepeval-advisory-state}:/state/advisory
+    read_only: true
+    tmpfs:
+      - /tmp
+    cpus: 1.0
+    mem_limit: 2g
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - deepeval-advisory-internal
+    restart: unless-stopped
+
+networks:
+  deepeval-advisory-internal:
+    internal: true

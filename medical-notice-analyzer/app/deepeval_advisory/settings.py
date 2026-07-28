@@ -8,6 +8,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SecretStr,
     ValidationError,
     field_validator,
     model_validator,
@@ -63,6 +64,11 @@ class AdvisorySettings(BaseModel):
     runtime_advisory_enabled: bool = False
     scheduled_evaluation_enabled: bool = False
     scan_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    max_judge_evaluations_per_scan: int = Field(
+        default=1,
+        ge=1,
+        le=100,
+    )
     worker_concurrency: int = Field(default=1, ge=1, le=4)
     lease_ttl_seconds: int = Field(default=900, ge=60, le=3600)
     lease_heartbeat_seconds: int = Field(default=30, ge=5, le=300)
@@ -76,6 +82,13 @@ class AdvisorySettings(BaseModel):
         ge=1024,
         le=_MAX_PACK_BYTES,
     )
+    judge_base_url: str = ""
+    judge_api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    judge_model: str = ""
+    judge_timeout_seconds: int = Field(default=60, ge=1, le=120)
+    http_host: str = "127.0.0.1"
+    http_port: int = Field(default=8100, ge=1, le=65535)
+    locale: str = "zh-CN"
 
     @field_validator(
         "analysis_run_dir",
@@ -142,6 +155,13 @@ class AdvisorySettings(BaseModel):
                 scan_interval_seconds=_int(
                     mapping, "DEEPEVAL_SCAN_INTERVAL_SECONDS", 30, 5, 3600
                 ),
+                max_judge_evaluations_per_scan=_int(
+                    mapping,
+                    "DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN",
+                    1,
+                    1,
+                    100,
+                ),
                 worker_concurrency=_int(
                     mapping, "DEEPEVAL_WORKER_CONCURRENCY", 1, 1, 4
                 ),
@@ -165,6 +185,35 @@ class AdvisorySettings(BaseModel):
                     1024,
                     _MAX_PACK_BYTES,
                 ),
+                judge_base_url=str(
+                    mapping.get("DEEPEVAL_JUDGE_BASE_URL", "")
+                ).strip(),
+                judge_api_key=SecretStr(
+                    str(mapping.get("DEEPEVAL_JUDGE_API_KEY", "")).strip()
+                ),
+                judge_model=str(
+                    mapping.get("DEEPEVAL_JUDGE_MODEL", "")
+                ).strip(),
+                judge_timeout_seconds=_int(
+                    mapping,
+                    "DEEPEVAL_JUDGE_TIMEOUT_SECONDS",
+                    60,
+                    1,
+                    120,
+                ),
+                http_host=str(
+                    mapping.get("DEEPEVAL_ADVISORY_HOST", "127.0.0.1")
+                ).strip(),
+                http_port=_int(
+                    mapping,
+                    "DEEPEVAL_ADVISORY_PORT",
+                    8100,
+                    1,
+                    65535,
+                ),
+                locale=str(
+                    mapping.get("DEEPEVAL_ADVISORY_LOCALE", "zh-CN")
+                ).strip(),
             )
         except ValidationError as exc:
             messages = "; ".join(

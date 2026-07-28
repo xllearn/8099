@@ -20,6 +20,8 @@ artifacts/**
 secrets
 secrets/**
 deepeval-advisory-data
+deepeval-advisory-state
+deepeval-advisory-state/**
 *.docx
 dify-db-backups
 

@@ -29,6 +29,7 @@ COPY app/diagnostics.py ./app/diagnostics.py
 COPY app/schema_migrations.py ./app/schema_migrations.py
 COPY app/report_rules ./app/report_rules
 COPY app/deepeval_advisory ./app/deepeval_advisory
+COPY scripts/run_deepeval_advisory.py ./scripts/run_deepeval_advisory.py
 COPY tests/__init__.py ./tests/__init__.py
 COPY tests/deepeval_advisory_image_contract.py ./tests/deepeval_advisory_image_contract.py
 COPY tests/test_deepeval_advisory_judge.py ./tests/test_deepeval_advisory_judge.py
