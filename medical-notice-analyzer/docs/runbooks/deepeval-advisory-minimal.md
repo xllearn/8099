@@ -42,8 +42,11 @@ Every scan first enrolls all eligible reports, including safe unavailable jobs
 for missing or invalid evidence projections. It then handles cache hits
 without consuming the limit and performs at most
 `DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN` real evaluations. The base compose
-sets that limit to `1` and scans every 300 seconds. Remaining jobs stay
-`pending` for a later scan; they are not marked failed or unavailable.
+fixes that limit to `1` and fixes the scan interval at 300 seconds. Runtime
+settings reject intervals below 300 seconds and reject any per-scan Judge
+limit other than `1`; these are hard cost ceilings, not deployment tuning
+knobs. Remaining jobs stay `pending` for a later scan; they are not marked
+failed or unavailable.
 
 If any Judge setting is absent, enrollment continues but the job remains
 paused with availability reported as unavailable. No placeholder score is

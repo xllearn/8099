@@ -63,11 +63,11 @@ class AdvisorySettings(BaseModel):
     advisory_dir: Path
     runtime_advisory_enabled: bool = False
     scheduled_evaluation_enabled: bool = False
-    scan_interval_seconds: int = Field(default=30, ge=5, le=3600)
+    scan_interval_seconds: int = Field(default=300, ge=300, le=3600)
     max_judge_evaluations_per_scan: int = Field(
         default=1,
         ge=1,
-        le=100,
+        le=1,
     )
     worker_concurrency: int = Field(default=1, ge=1, le=4)
     lease_ttl_seconds: int = Field(default=900, ge=60, le=3600)
@@ -153,14 +153,18 @@ class AdvisorySettings(BaseModel):
                     mapping, "DEEPEVAL_SCHEDULED_EVALUATION_ENABLED", False
                 ),
                 scan_interval_seconds=_int(
-                    mapping, "DEEPEVAL_SCAN_INTERVAL_SECONDS", 30, 5, 3600
+                    mapping,
+                    "DEEPEVAL_SCAN_INTERVAL_SECONDS",
+                    300,
+                    300,
+                    3600,
                 ),
                 max_judge_evaluations_per_scan=_int(
                     mapping,
                     "DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN",
                     1,
                     1,
-                    100,
+                    1,
                 ),
                 worker_concurrency=_int(
                     mapping, "DEEPEVAL_WORKER_CONCURRENCY", 1, 1, 4

@@ -18,7 +18,7 @@ from app.deepeval_advisory.reporting import (
     build_safe_snapshot,
     start_reporting_server,
 )
-from app.deepeval_advisory.settings import AdvisorySettings
+from app.deepeval_advisory.settings import AdvisorySettings, SettingsError
 from app.deepeval_advisory.worker import (
     AdvisoryWorker,
     set_runtime_paused,
@@ -102,6 +102,23 @@ class MinimalRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_disabled_and_runtime_pause_still_enroll_without_writes_or_judge(
         self,
     ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = {
+                "ANALYSIS_RUN_DIR": str(root / "runs"),
+                "EVIDENCE_PACK_DIR": str(root / "packs"),
+                "DEEPEVAL_ADVISORY_DIR": str(root / "state"),
+            }
+            for override in (
+                {"DEEPEVAL_SCAN_INTERVAL_SECONDS": "299"},
+                {"DEEPEVAL_MAX_JUDGE_EVALUATIONS_PER_SCAN": "2"},
+            ):
+                with self.subTest(override=override):
+                    with self.assertRaises(SettingsError):
+                        AdvisorySettings.from_mapping(
+                            {**base, **override}
+                        )
+
         for enabled, paused in ((False, False), (True, True)):
             with self.subTest(enabled=enabled, paused=paused):
                 with tempfile.TemporaryDirectory() as directory:
