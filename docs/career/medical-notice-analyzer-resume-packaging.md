@@ -1,546 +1,592 @@
 # 智能医疗公告分析项目：简历包装与面试手册
 
-> 维护目标：面向 Agent 开发、AI 应用工程师、AI 后端工程师岗位，持续维护项目定位、简历表述、架构讲解、面试问答与量化证据。
+> 面向岗位：Agent 开发、AI 应用工程师、AI 后端工程师。
 >
-> 重要说明：本文同时包含“当前仓库可验证能力”和“目标完成态模拟”。目标完成态用于规划、学习和模拟面试；未实际落地、测试并形成证据前，不应作为已经完成的事实对外陈述。
+> 项目口径：以“独立负责从 0 到 1 设计与实现”为主线。
+>
+> 重要边界：本文区分“当前仓库可验证实现”和“假设已完成的目标架构”。目标架构、模拟指标和简历文案用于学习与面试演练；没有真实测试报告时，不应把模拟数字当成真实生产数据。
 
 ---
 
-## 1. 推荐项目名称
+## 1. 项目名称与定位
 
-### 简历主标题
+### 推荐名称
 
 **基于 LangGraph 的可信医疗公告分析 Agent 平台**
 
-### 可替换标题
+### 技术栈
 
-- 医疗采购公告智能分析与质量评测平台
-- 基于证据约束的医疗公告分析 Agent 系统
-- 面向复杂文档的可信 LLM 分析与评测平台
+`Python` `FastAPI` `LangGraph` `DeepEval` `Celery` `Redis` `MySQL` `MinIO` `OpenTelemetry` `Docker`
 
-主标题优先使用“可信医疗公告分析 Agent 平台”，因为它同时覆盖业务场景、Agent 架构和工程目标，不会把项目包装成单纯的聊天机器人或 Prompt Demo。
+### 项目描述
 
----
-
-## 2. 一句话项目介绍
-
-面向医疗采购公告及其附件，构建从文档解析、证据抽取、事实约束分析、Agent 编排到结构化报告生成的智能分析平台，并通过 DeepEval、异步任务系统、跨存储一致性机制和 OpenTelemetry 全链路追踪提升模型输出的可信度、吞吐能力与可诊断性。
+面向医疗保障、卫生健康及大型医疗机构公告的智能分析场景，建设基于 Evidence Grounding 的 AI Agent 分析平台。数据采集范围覆盖 32 个省级单位、333 个市级单位、约 2800 个县级单位及国家级部门和大型医疗机构，日采集公告约 9000～10000 条，其中业务人员每日选取约 10～50 条进入 AI 分析链路。系统自动完成公告读取、附件解析、证据包构建、报告生成、质量评测、结果修复和文档导出，将原本 2～3 人每天约 2 小时的分析工作缩短为系统分钟级处理和人工复核。
 
 ---
 
-## 3. 项目定位
+## 2. 原项目是怎样运行的
 
-### 3.1 业务问题
-
-医疗采购公告通常包含正文、表格、PDF/Word 附件和补充材料。人工分析存在以下问题：
-
-1. 信息分散，关键时间、主体、产品、资质与风险点需要跨文档整理。
-2. LLM 容易混淆原文事实和推断结论，生成缺少证据支撑的表述。
-3. 长文档分析耗时较长，HTTP 同步请求难以支撑高并发和失败重试。
-4. 文件位于对象存储、业务状态位于数据库，异常情况下容易产生状态不一致。
-5. 多节点 Agent 出错时，难以定位具体节点、模型请求或证据引用问题。
-
-### 3.2 项目目标
-
-将一个基础的 LLM 报告生成服务升级为生产级 Agent 应用，重点解决四类问题：
-
-- **可信性**：事实必须有证据，分析必须声明置信度和风险。
-- **可扩展性**：通过 Agent 编排和模型抽象降低流程与模型供应商耦合。
-- **工程稳定性**：通过异步任务、幂等、重试和最终一致性支撑复杂长任务。
-- **可观测性**：能够追踪一次分析经过哪些节点、消耗多少 Token、在哪一步失败。
-
----
-
-## 4. 目标完成态架构
+当前仓库本质上是一套由 FastAPI 承载、Dify 负责模型工作流的医疗公告分析流水线，而不是一个自由规划型 Agent。
 
 ```text
-Web / Agent Trace UI
-        |
-        v
-FastAPI API Gateway
-        |
-        +---- MySQL：任务、文档元数据、分析状态、Outbox、评测结果
-        |
-        +---- MinIO：原始附件、解析产物、证据快照、报告文件
-        |
-        +---- Redis：队列、缓存、幂等锁、短期状态
-        |
-        v
-Celery Workers
-        |
-        v
-LangGraph Analysis Agent
-  [文档加载]
-        -> [解析与标准化]
-        -> [事实抽取 / Evidence Grounding]
-        -> [分析推理]
-        -> [置信度与风险校验]
-        -> [报告生成]
-        -> [质量修复]
-        |
-        +---- 统一模型抽象层：路由、超时、重试、降级、结构化输出、Token 统计
-        |
-        +---- DeepEval：线上旁路评测 + 离线回归评测
-        |
-        +---- OpenTelemetry：API、任务、Agent 节点、模型调用、数据库与对象存储 Trace
+数据库选取公告
+  -> 读取公告正文和元数据
+  -> 下载、解析 0～10 个附件
+  -> 构建全量 Evidence Pack
+  -> 根据 Dify 输入限制生成压缩视图
+  -> 调用 Dify 生成 ReportIR / Markdown
+  -> 第一次质量检查
+  -> 不通过则执行修复
+  -> 第二次质量检查
+  -> 导出 Word 报告
 ```
 
-### 4.1 典型数据流
+当前项目已经具备以下工程基础：
 
-1. 用户提交公告记录或附件分析任务。
-2. API 在 MySQL 创建任务，并通过 Outbox 记录待投递事件。
-3. Outbox 投递器将任务发送至 Redis/Celery，避免“数据库已提交但消息未发送”的双写问题。
-4. Worker 从 MinIO 读取附件，完成解析、清洗和证据切片。
-5. LangGraph 按状态图执行事实抽取、分析、风险检查和报告生成。
-6. 生成结果写入 MinIO，结果元数据与任务状态写入 MySQL。
-7. DeepEval 在主任务完成后异步评测，不阻塞用户获得报告。
-8. OpenTelemetry 将同一个 trace_id 贯穿 API、Celery 任务、Agent 节点和模型调用。
-9. 前端 Agent Trace 页面展示节点状态、耗时、Token、重试、模型与证据引用。
+- 数据库选材、公告正文清洗和多格式附件解析。
+- 全量证据包与面向 Dify 的压缩输入分离。
+- 结构化 ReportIR、质量门禁、修复链路和 Word 导出。
+- 运行记录、失败归因、步骤 Checkpoint 和恢复机制。
+- 独立的 DeepEval Advisory 旁路评测原型。
+
+当前没有真正使用 LangGraph。流程状态分散在 Evidence Pack JSON、Analysis Run JSON、Checkpoint JSON 和 Dify 工作流变量中，可以理解为“隐式状态机”。目标优化是将这些状态收拢为显式、类型化的 LangGraph State。
 
 ---
 
-## 5. 七项优化如何讲解
+## 3. Evidence Pack 如何构建
 
-## 5.1 引入 DeepEval：从“能生成”升级到“可衡量”
+## 3.1 两阶段结构
 
-### 解决的问题
+你的记忆是正确的：系统先构建一个较完整、可追溯的基础证据包，再根据模型输入限制生成二次压缩视图。
 
-传统 LLM 应用通常只能通过人工抽查判断效果，难以持续回答：报告是否忠于证据、是否遗漏关键事实、是否回答了任务目标、版本升级后是否发生质量回退。
+```text
+原始公告与附件
+      |
+      v
+基础 Evidence Pack：完整、可追溯、用于持久化和诊断
+      |
+      v
+Generation Payload / Compact Pack：面向模型输入的受控压缩视图
+```
 
-### 设计
+全量 Evidence Pack 是事实底座；压缩后的 Payload 只是一次模型调用的输入视图，不能反过来替代事实底座。
 
-建立两类评测：
+## 3.2 基础证据包构建步骤
 
-- **线上异步旁路评测**：报告生成后采样评测，不阻塞主链路。
-- **离线回归评测**：维护脱敏测试集，在 Prompt、模型和 Agent 流程变更后执行回归。
+### 第一步：材料选择
 
-核心指标包括：
+- 主材料选择 1～3 条，作为本次报告的核心事实来源。
+- 辅助材料最多选择 10 条，用于背景和关联分析。
+- 同一公告不能同时作为主材料和辅助材料。
 
-- Faithfulness：结论是否能够被证据支持。
-- Answer Relevancy：输出是否围绕任务要求。
-- Critical Fact Coverage：关键事实是否完整覆盖。
-- Attachment Consistency：报告对附件状态和附件内容的描述是否一致。
+### 第二步：读取数据库
 
-评测结果按模型版本、Prompt 版本、工作流版本和数据集版本记录，便于比较不同版本。
+从 MySQL 读取公告标题、正文、发布时间、区域、发布机构、项目类型、公告分类和附件列表。HTML 正文会被清洗为纯文本，脚本、样式和重复空白会被移除。
 
-### 简历价值
+### 第三步：附件下载与解析
 
-体现的不只是“会使用 DeepEval”，而是建立了 LLM 应用的质量闭环、回归基线与版本治理能力。
+支持 PDF、DOC、DOCX、XLS、XLSX、CSV、TXT、HTML 和 ZIP 等格式。每个附件会生成：
+
+- 下载状态和解析状态。
+- 文本摘要、关键事实和重要段落。
+- 表格标题、表头、关键列、行数和代表性行。
+- 页码、表格序号、行列位置等定位信息。
+- 原始文件或解析文本的 SHA-256 哈希。
+- 解析失败、文件过大和格式不支持等告警。
+
+### 第四步：构建证据项
+
+当前证据模型可以用 A/B/C 三层解释：
+
+- **A 级直接证据**：公告字段、公告正文、附件文本、表格单元格。必须包含合法 source_ref，可以回到具体公告、附件、页码或表格位置。
+- **B 级派生事实**：对 A 级证据做标准化后得到的结构化事实，例如将“截止至 2026 年 8 月 10 日 17:00”归一化为统一时间格式。B 级事实必须记录 derived_from、extractor_version，并且只能依赖 A 级证据。
+- **C 级辅助信息**：摘要、生成指导、告警、诊断、历史记忆等。C 级内容可帮助生成，但不能单独证明事实。
+
+每个 evidence_item 根据规范化内容计算 evidence_id；来源内容还有 source_hash，用于发现内容被替换或引用失配。
+
+### 第五步：校验并持久化
+
+保存前校验：
+
+- evidence_id 是否与规范化内容一致。
+- A 级证据是否包含直接来源。
+- B 级证据是否只依赖有效 A 级证据。
+- source_hash 是否与源文本或源文件一致。
+- 是否存在重复证据和非法定位信息。
+
+通过后，将完整 Evidence Pack 持久化，供后续生成、评测、诊断和重新执行使用。
+
+## 3.3 构建基础证据包是否使用 LLM
+
+结论：**主流程以规则和解析器为主，LLM 只是可选增强，不是基础证据包成立的前提。**
+
+基础阶段中的大部分工作不需要 LLM：
+
+- 数据库字段读取。
+- HTML 清洗。
+- 文件格式识别和文本提取。
+- 表格单元格抽取。
+- 来源定位、哈希计算和证据 ID 生成。
+- 明确表头的字段映射和常见业务关键词识别。
+
+只有当表格表头含义模糊、规则无法稳定识别关键列时，系统才可以启用可选 LLM，为表格生成语义摘要和列映射。该 LLM 被限制为只使用输入行，不得补全、纠错、合计或创造企业、产品、数量和价格。
+
+面试口径：
+
+> 我没有让 LLM 直接构造事实底座。可定位的原始证据主要由确定性解析器生成，LLM 只处理规则难以覆盖的模糊表格语义，并且输出仍需要经过字段白名单、索引范围和来源一致性校验。
+
+## 3.4 二次压缩是否使用 LLM
+
+二次压缩有三条路径：
+
+### 路径一：直接输入
+
+当清洗后的有效内容未超过配置阈值时，不做语义压缩，直接保留主材料正文、附件摘要和结构化表格信息。
+
+### 路径二：可选 LLM 长文本压缩
+
+输入过长时，将材料按块切分，调用低温度 LLM 生成自包含证据摘要。Prompt 强制保留企业、产品、规格、注册证、医保编码、采购量、价格、时间和执行要求，禁止推测、纠错和要求用户查阅原附件。
+
+### 路径三：纯规则降级压缩
+
+如果 LLM 压缩未启用、调用失败或结果不完整，系统使用规则压缩：
+
+- 删除重复模板和低价值噪声。
+- 限制正文和附件摘要长度。
+- 优先保留主材料、核心附件和业务关键字段。
+- 保留 mandatory 证据、B 级事实及其 A 级依赖。
+- 按证据优先级删除可选项，并记录省略数量和哈希。
+
+因此，正确表述是：
+
+> 基础证据包主要由确定性解析与规则构建；二次压缩支持 LLM 语义压缩，但必须提供规则压缩降级路径，并对强制证据执行保留率校验。
 
 ---
 
-## 5.2 事实与分析分层：解决 LLM 输出可信度问题
+## 4. 事实与分析分层如何实现
 
-### 核心思想
+事实与分析分层不是把报告简单分成两个标题，而是从数据模型、生成约束、校验规则和发布策略四个层面实现。
 
-将输出内容拆分为两层：
-
-- **Fact Layer**：只能表达原文或附件中能够直接定位的事实。
-- **Analysis Layer**：允许基于事实进行归纳、风险判断和业务推理，但必须引用事实，并携带置信度与风险标记。
-
-### 建议的数据结构
+## 4.1 数据模型
 
 ```json
 {
   "facts": [
     {
       "fact_id": "fact_001",
-      "content": "报名截止时间为……",
-      "source_document": "notice.pdf",
-      "source_location": "第 3 页",
-      "evidence_excerpt": "……",
-      "content_hash": "sha256:..."
+      "field": "submission_deadline",
+      "value": "2026-08-10T17:00:00+08:00",
+      "display_text": "申报截止时间为 2026 年 8 月 10 日 17:00",
+      "evidence_ids": ["evidence_a1"],
+      "extractor": "deadline_extractor/v2",
+      "extraction_confidence": 0.98
     }
   ],
   "analyses": [
     {
       "analysis_id": "analysis_001",
-      "content": "准备周期较短，存在材料准备风险",
-      "supporting_fact_ids": ["fact_001"],
-      "confidence": 0.86,
+      "conclusion": "材料准备窗口较短，存在申报延误风险",
+      "supporting_fact_ids": ["fact_001", "fact_002"],
+      "reasoning_type": "schedule_risk",
+      "confidence": 0.87,
       "risk_level": "medium",
-      "analysis_type": "schedule_risk"
+      "uncertainty": "未获取企业当前材料准备进度"
     }
   ]
 }
 ```
 
-### 控制机制
+## 4.2 Fact Layer
 
-- 事实字段必须包含来源、位置、原文摘录和内容哈希。
-- 分析结论必须至少引用一个 fact_id。
-- 未引用证据的事实性断言进入自动修复或人工复核。
-- 低置信度或高风险结论在报告中显式提示。
-- DeepEval 对事实忠实度和关键事实覆盖率进行二次检查。
+Fact Layer 只允许出现可验证事实：
 
-### 简历价值
+- 每条事实必须引用至少一个 A/B 级 evidence_id。
+- 数量、价格、日期、企业、产品和资质等高风险字段不得无来源生成。
+- 标准化事实保留原始值、规范化值和提取器版本。
+- 多来源冲突时不自动选择一个答案，而是记录 conflict 并进入复核。
+- 模型生成的事实只能作为候选值，必须通过 Evidence Validator 校验后才能进入正式 Fact Layer。
 
-相比笼统地写“通过 Prompt 降低幻觉”，这种表述展示了明确的数据模型、校验规则和质量机制，更符合生产级 AI 应用设计。
+## 4.3 Analysis Layer
 
----
+Analysis Layer 允许推理，但必须受控：
 
-## 5.3 LangGraph Agent 编排与模型抽象
+- 每条分析至少引用一个 fact_id。
+- 区分规则推理、趋势判断、风险判断和建议，不把判断伪装成事实。
+- 输出 confidence、risk_level 和 uncertainty。
+- 高风险结论必须引用多个事实，或进入人工复核。
+- 报告生成时使用“根据文件内容”“结合上述事实”“可能”等限定语言，禁止把推断写成确定事实。
 
-### 为什么使用 LangGraph
+## 4.4 置信度设计
 
-文档分析不是一次模型调用，而是包含解析、事实抽取、推理、检查和修复的有状态流程。LangGraph 适合表达节点、状态、条件分支、失败恢复和人工介入。
+不要完全相信模型自报的 confidence。目标架构中可使用组合评分：
 
-### Agent 节点
+```text
+confidence =
+  0.35 × 来源完整性
++ 0.25 × 提取器一致性
++ 0.25 × 多来源一致性
++ 0.15 × 评测得分
+```
 
-- Document Loader：读取公告和附件。
-- Parser：解析 PDF、Word、表格并标准化。
-- Evidence Builder：生成可引用的证据单元。
-- Fact Extractor：提取结构化事实。
-- Analyst：在事实约束下生成分析。
-- Risk Reviewer：校验置信度、风险和引用完整性。
-- Report Generator：生成结构化报告和可导出文档。
-- Repair Node：对缺失证据、格式错误或低质量结果进行定向修复。
+建议门禁：
 
-### 条件路由
+- confidence ≥ 0.90 且非高风险：自动通过。
+- 0.75 ≤ confidence < 0.90：允许发布，但显示审慎措辞。
+- confidence < 0.75：进入修复或人工复核。
+- risk_level = high：无论 confidence 多高都要求人工确认。
 
-- 解析失败：进入重试或人工复核。
-- 事实缺少来源：返回 Evidence Builder。
-- 高风险且低置信度：进入人工复核。
-- 评测低于阈值：进入 Repair Node。
-- 达到最大修复次数：保留结果并标记需人工复核，避免死循环。
+## 4.5 校验与修复
 
-### 模型抽象层
+1. Evidence Validator 检查事实引用是否存在、来源是否有效。
+2. Analysis Validator 检查分析引用、风险等级和不确定性字段。
+3. DeepEval 检查忠实度、关键事实覆盖和相关性。
+4. 低于阈值时，将具体问题交给 Repair Node，而不是让模型全文重写。
+5. 最多修复 1～2 次，仍不合格则标记 needs_manual_review，防止死循环。
 
-统一封装：
+面试口径：
 
-- 模型供应商和模型名称路由。
-- 超时、限流、重试和熔断。
-- 主模型与备用模型降级。
-- JSON Schema 结构化输出校验。
-- Token、延迟和错误类型统计。
-- Prompt、模型和响应指纹记录。
-
-业务节点依赖统一接口，而不是直接调用具体 SDK，从而降低模型迁移和测试成本。
-
----
-
-## 5.4 Redis + Celery 异步任务系统
-
-### 解决的问题
-
-长文档解析和多节点模型调用可能持续数十秒甚至数分钟，不适合占用同步 HTTP 连接。任务系统需要支持排队、重试、超时、取消和失败恢复。
-
-### 设计
-
-- Redis 作为 Celery Broker，并承载短期缓存和幂等锁。
-- MySQL 作为任务状态的最终事实来源，不依赖 Redis 保存永久业务状态。
-- 使用 task_id / request_id 作为幂等键，避免重复消费造成重复报告。
-- 按错误类型区分重试：网络和限流错误可退避重试；数据错误直接进入人工复核。
-- 设置软超时和硬超时，防止 Worker 长期占用。
-- 将解析、分析、评测和导出划分为独立队列，避免耗时任务相互阻塞。
-
-### 简历价值
-
-体现从 Demo 式同步调用向可扩展后台任务架构的升级，也能支撑传统后端岗位对并发、可靠性和任务治理的追问。
+> 我把事实当作可验证数据，把分析当作依赖事实的有向关系。事实必须回溯到证据，分析必须回溯到事实；置信度用于决定路由，不用于替代证据。
 
 ---
 
-## 5.5 MySQL + MinIO 跨存储一致性
+## 5. LangGraph 模式与 Agent State
 
-### 数据职责
+## 5.1 选择固定工作流型 Agent
 
-- MySQL：任务状态、业务元数据、文档索引、证据索引、评测结果和审计信息。
-- MinIO：原始附件、解析产物、证据快照、结构化报告和导出文件。
+本项目推荐使用**固定工作流为主、局部工具调用为辅**的模式，而不是让模型自由决定整个执行路径。
 
-### 一致性策略
+原因：
 
-不尝试实现 MySQL 与 MinIO 的强分布式事务，而是通过状态机和补偿机制实现可恢复的最终一致性：
+- 医疗公告属于高可信场景，生成、质检和修复顺序应可预测。
+- 更容易学习、画图和面试讲解。
+- 更容易设置重试上限、质量门禁和人工审核。
+- 更容易做幂等、Checkpoint 和故障恢复。
 
-1. 文件先写入带 task_id 的临时对象路径。
-2. 计算并校验文件哈希、大小和类型。
-3. 在 MySQL 事务中写入对象元数据、任务状态和 Outbox 事件。
-4. 事务提交后将对象标记为可用，或移动到正式对象路径。
-5. 后续任务通过幂等键检查当前状态，重复执行不会生成重复业务记录。
-6. 定时补偿任务扫描孤儿对象、长时间停留的中间状态和缺失对象。
-7. 删除操作采用逻辑删除加异步清理，避免数据库已删除但对象仍被读取。
+推荐节点：
 
-### 可强调的关键词
+```text
+START
+ -> load_materials
+ -> parse_attachments
+ -> build_evidence
+ -> compress_evidence
+ -> extract_facts
+ -> generate_analysis
+ -> generate_report
+ -> quality_review
+       | pass -> persist_result -> END
+       | fail and retry < 2 -> repair_report -> quality_review
+       | high risk -> human_review -> END
+```
 
-Outbox、状态机、幂等、内容哈希、补偿任务、最终一致性、孤儿文件清理。
+可以在 parse_attachments 或 retrieve_evidence 节点内部允许模型选择少量工具，但主流程不交给模型自由规划。
 
----
+## 5.2 目标 Agent State
 
-## 5.6 OpenTelemetry 全链路监控
+State 中只存业务状态和对象引用，不存大型原始文件。
 
-### Trace 传播
+```python
+class AnalysisState(TypedDict, total=False):
+    # 身份与控制
+    run_id: str
+    pack_id: str
+    idempotency_key: str
+    status: str
+    current_node: str
+    retry_count: int
+    manual_review_required: bool
 
-一个 trace_id 贯穿：
+    # 输入引用
+    primary_material_ids: list[str]
+    auxiliary_material_ids: list[str]
+    attachment_object_keys: list[str]
 
-- FastAPI 请求。
-- MySQL 查询与事务。
-- Redis/Celery 投递和消费。
-- LangGraph 整体执行与单个节点。
-- LLM 请求、重试和降级。
-- MinIO 上传和下载。
-- DeepEval 评测任务。
+    # 证据与事实
+    evidence_pack_key: str
+    evidence_pack_sha256: str
+    compact_payload_key: str
+    fact_items: list[dict]
+    analysis_items: list[dict]
 
-### 关键 Span 属性
+    # 生成结果
+    report_ir: dict
+    report_object_key: str
+    model_provider: str
+    model_name: str
+    prompt_version: str
 
-- task_id、workflow_version、node_name。
-- model_provider、model_name、prompt_version。
-- input_tokens、output_tokens、latency_ms。
-- retry_count、error_type、fallback_used。
-- evidence_count、unsupported_claim_count。
-- evaluation_score、risk_level。
+    # 质量信息
+    deepeval_scores: dict[str, float]
+    qa_issues: list[dict]
+    unsupported_claim_count: int
+    confidence: float
+    risk_level: str
 
-敏感业务正文不直接写入 Span，只记录脱敏元数据、哈希和统计值。
+    # 可观测性
+    trace_id: str
+    node_timings_ms: dict[str, int]
+    token_usage: dict[str, int]
+    estimated_cost: float
 
-### 可观测目标
+    # 错误与恢复
+    error_code: str
+    error_message: str
+    last_completed_node: str
+    checkpoint_version: int
+```
 
-能够快速回答：
+设计原则：
 
-- 一次分析慢在哪个节点。
-- 某个模型版本是否导致错误率上升。
-- Token 成本主要消耗在哪些任务。
-- 任务失败是解析、存储、模型还是评测问题。
-- 某个报告引用了哪些证据以及经过哪些修复节点。
+- 大附件、证据包和报告写入 MinIO，State 保存 object_key 和 hash。
+- MySQL 保存任务最终状态和版本，Redis 只保存队列、锁和短期缓存。
+- 节点只返回自己修改的字段，避免复制整个 State。
+- 每个节点使用 run_id + node_name + input_hash 作为幂等键。
+- Checkpoint 必须保存最后成功节点和输入输出指纹。
 
----
+## 5.3 原项目中的状态是如何实现的
 
-## 5.7 前端 Agent Trace 展示
+原项目没有统一 Agent State，而是分成四部分：
 
-### 展示内容
+1. **Evidence Pack JSON**：保存公告、附件、证据项和压缩信息。
+2. **Analysis Run JSON**：保存 run_status、workflow_run_id、报告版本、质量结果、修复状态、失败码、模型版本、输入策略和耗时。
+3. **Checkpoint JSON**：按 prepare、attachments、evidence、compact、provider、repair、quality_gate、word_publish 记录 started/completed/failed，以及输入输出哈希和恢复条件。
+4. **Dify 工作流变量**：保存当前 ReportIR、Markdown、历史参考和 QA 摘要等模型工作流上下文。
 
-- Agent 节点拓扑和实际执行路径。
-- 每个节点的开始时间、结束时间、耗时和状态。
-- 使用的模型、Token、重试次数和是否发生降级。
-- 节点输入输出摘要，不展示模型私有思维链。
-- 事实结论与证据来源的关联。
-- DeepEval 指标、低分原因和修复记录。
-- 高风险或低置信度分析的醒目标记。
-
-### 设计边界
-
-Agent Trace 展示可审计的执行事件、输入输出摘要和证据引用，不展示或声称保存模型内部完整 Chain-of-Thought。这样既能支持调试和业务解释，也避免将不可控的内部推理文本暴露给用户。
-
----
-
-## 6. 推荐简历版本
-
-## 6.1 主版本：AI 应用 / AI 后端通用
-
-**基于 LangGraph 的可信医疗公告分析 Agent 平台｜核心开发**
-
-项目简介：面向医疗采购公告及多格式附件，构建证据抽取、事实约束分析、风险识别和结构化报告生成的一体化 Agent 平台，提升复杂文档分析的可信度、处理效率与工程稳定性。
-
-- 基于 **LangGraph** 设计有状态 Agent 工作流，将文档解析、证据构建、事实抽取、分析推理、风险校验、报告生成和质量修复拆分为独立节点，并通过条件路由支持失败重试、低置信度复核及评测不通过后的定向修复。
-- 建立 **Fact / Analysis 分层数据模型**：事实内容强制关联原文位置、证据摘录和内容哈希，分析结论关联 supporting facts、置信度与风险等级，并结合规则校验与 DeepEval Faithfulness、Relevancy、关键事实覆盖率指标降低无依据生成。
-- 引入 **DeepEval** 构建线上非阻塞旁路评测和离线回归评测体系，按模型、Prompt、工作流和数据集版本记录质量结果，为模型切换、Prompt 迭代和 Agent 流程变更提供可比较的评测基线。
-- 使用 **FastAPI + Redis + Celery** 将长文档解析、Agent 分析、质量评测和文件导出异步化，通过幂等键、分类重试、任务超时、队列隔离和失败恢复提升系统吞吐与任务可靠性。
-- 使用 **MySQL + MinIO** 分离业务元数据与非结构化文件，基于 Outbox、任务状态机、内容哈希、幂等写入和补偿任务处理数据库与对象存储的跨系统最终一致性。
-- 接入 **OpenTelemetry** 打通 API、Celery、LangGraph 节点、LLM 调用及存储访问链路，并在前端实现 Agent Trace，可视化节点耗时、Token、重试/降级、证据引用、评测结果和风险标记，提升问题定位与结果可解释性。
-
-### 建议保留条数
-
-一页简历建议从以上 6 条中保留 4 条：
-
-1. LangGraph 编排。
-2. Fact / Analysis 分层。
-3. Redis + Celery 与 MySQL + MinIO 工程化，可合并为一条。
-4. DeepEval 或 OpenTelemetry + Agent Trace，根据岗位 JD 选择。
-
----
-
-## 6.2 AI 应用工程师定向版本
-
-**基于证据约束的医疗公告分析 Agent｜核心开发**
-
-- 使用 LangGraph 编排文档解析、Evidence Grounding、事实抽取、分析推理、风险检查和报告修复节点，通过条件边控制低置信度复核与评测反馈后的自动修复流程。
-- 设计 Fact / Analysis 分层输出协议，事实必须关联可定位证据，分析结论携带 supporting facts、confidence 和 risk level，结合结构化输出校验减少事实与推断混淆。
-- 基于 DeepEval 建立 Faithfulness、Answer Relevancy、关键事实覆盖率和附件一致性评测，支持线上采样评测与离线回归测试，降低 Prompt、模型及工作流迭代造成的质量回退。
-- 抽象统一 LLM 调用层，封装多模型路由、JSON Schema 输出、超时重试、限流降级、Token 统计和版本指纹，降低 Agent 节点与模型厂商之间的耦合。
-- 实现 Agent Trace 页面，按节点展示执行路径、耗时、模型调用、证据引用、质量评分和修复记录，增强复杂 Agent 流程的可调试性与结果可解释性。
+这已经具备状态机雏形，但状态分散、节点边界不统一。LangGraph 优化的本质是把它们收敛为一份类型化 State 和一张显式状态图，而不是从零创造状态管理。
 
 ---
 
-## 6.3 AI 后端工程师定向版本
+## 6. DeepEval 如何使用
 
-**医疗公告智能分析与质量治理平台｜后端核心开发**
+## 6.1 当前仓库的评测逻辑
 
-- 基于 FastAPI、Redis 和 Celery 搭建异步分析任务系统，将文件解析、Agent 推理、质量评测和报告导出拆分为隔离队列，并通过幂等控制、指数退避、超时和失败恢复保障长任务稳定执行。
-- 采用 MySQL 管理任务及业务状态、MinIO 存储附件和分析产物，利用 Outbox、状态机、内容哈希和补偿任务处理消息投递及跨存储最终一致性问题。
-- 基于 LangGraph 实现可恢复的状态化工作流，支持节点级重试、条件分支、人工复核和任务续跑，并通过统一模型网关屏蔽不同 LLM 服务的调用差异。
-- 使用 DeepEval 构建异步质量评测 Sidecar，使评测失败不阻塞生产结果交付，同时按模型、Prompt 和工作流版本沉淀可追溯评测结果。
-- 接入 OpenTelemetry，统一采集 API、任务队列、Agent 节点、模型调用、数据库与对象存储的 Trace/Metrics，结合前端 Agent Trace 将任务耗时、Token、重试和错误定位到具体节点。
+当前 DeepEval 原型使用四个指标：
 
----
+- claim_faithfulness_v1
+- critical_coverage_v1
+- attachment_state_consistency_v1
+- answer_relevancy_v1
 
-## 7. 一页简历精简版
+系统将报告拆分为 claim 单元，把与 claim 关联的 A/B 级证据放入 retrieval_context，然后调用 DeepEval 评测。当前 projection 仍将 expected_facts 设为空、attachment_expectation 设为 None，因此在当前代码中，关键事实覆盖率和附件一致性通常会显示 not_applicable。目标优化必须补齐这两个字段后，四项指标才能全部得到分数。
 
-**基于 LangGraph 的可信医疗公告分析 Agent 平台｜核心开发**
+## 6.2 完成态的数据映射
 
-- 基于 LangGraph 编排文档解析、证据构建、事实抽取、分析推理、风险校验与报告修复流程，通过条件路由支持低置信度复核及评测反馈后的定向修复。
-- 设计 Fact / Analysis 分层机制，事实强制绑定原文证据，分析结论关联 supporting facts、置信度和风险等级；结合 DeepEval 建立忠实度、相关性和关键事实覆盖率评测。
-- 使用 FastAPI、Redis、Celery 构建异步任务系统，并基于 MySQL、MinIO、Outbox、幂等写入和补偿任务处理长任务可靠性与跨存储最终一致性。
-- 接入 OpenTelemetry 打通 API、Agent 节点、LLM 及存储链路，在前端展示 Agent Trace、Token、重试降级、证据引用与评测结果，提升系统可观测性和问题定位效率。
+```text
+LLMTestCase.input
+= “根据采购公告材料形成准确、完整且相关的分析结论”
 
----
+LLMTestCase.actual_output
+= 报告中的单个 claim 或一个报告章节
 
-## 8. 量化成果模板
+LLMTestCase.retrieval_context
+= 与该 claim 关联的 A/B 级证据摘录
 
-简历应至少增加 1～2 个真实数字。没有真实数据时保留占位符，补齐后再对外使用。
+LLMTestCase.expected_output
+= 必须覆盖的关键事实，或预期附件状态
+```
 
-### 质量类
+对应关系：
 
-- 将无证据事实性断言比例从 **[A%]** 降低至 **[B%]**。
-- Faithfulness 平均分从 **[A]** 提升至 **[B]**。
-- 关键事实召回率达到 **[X%]**。
-- 自动修复后评测通过率提升 **[X 个百分点]**。
+- Faithfulness：actual_output 是否与 retrieval_context 一致。
+- Answer Relevancy：actual_output 是否围绕 input 的业务任务。
+- Critical Coverage：actual_output 是否覆盖 expected_output 中的关键事实。
+- Attachment Consistency：actual_output 是否正确描述附件存在、缺失和解析状态。
 
-### 性能类
+## 6.3 最小使用示例
 
-- 单任务平均处理时间由 **[A 分钟]** 降至 **[B 分钟]**。
-- 支持 **[X]** 个并发分析任务，接口提交延迟控制在 **[Y ms]**。
-- 通过缓存和模型路由将平均 Token 成本降低 **[X%]**。
+```python
+from deepeval import evaluate
+from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, GEval
+from deepeval.test_case import LLMTestCase, SingleTurnParams
 
-### 稳定性类
+case = LLMTestCase(
+    input="请根据公告和附件形成准确、完整的分析报告",
+    actual_output="报名截止时间为 8 月 10 日，准备周期较短。",
+    retrieval_context=[
+        "申报截止时间：2026 年 8 月 10 日 17:00。"
+    ],
+    expected_output="必须包含申报截止时间和时区。",
+)
 
-- 任务成功率达到 **[X%]**，可恢复错误自动重试成功率达到 **[Y%]**。
-- 跨存储异常任务通过补偿机制自动恢复 **[X%]**。
-- 平均问题定位时间从 **[A]** 降至 **[B]**。
+metrics = [
+    FaithfulnessMetric(threshold=0.85),
+    AnswerRelevancyMetric(threshold=0.85),
+    GEval(
+        name="Critical Fact Coverage",
+        criteria="判断实际输出是否准确覆盖预期关键事实，不评价文风。",
+        evaluation_params=[
+            SingleTurnParams.ACTUAL_OUTPUT,
+            SingleTurnParams.EXPECTED_OUTPUT,
+        ],
+        threshold=0.85,
+    ),
+]
 
-### 业务类
+evaluate(test_cases=[case], metrics=metrics)
+```
 
-- 覆盖 **[X]** 份公告和 **[Y]** 个附件。
-- 将单份公告人工整理时间由 **[A]** 降至 **[B]**。
-- 为 **[X]** 名业务人员提供分析支持。
+## 6.4 推荐评测流程
 
----
-
-## 9. 30 秒项目介绍
-
-我做的是一个医疗采购公告分析 Agent。这个项目不是简单调用一次大模型，而是需要处理正文和多种附件，并保证报告里的事实可以追溯。我使用 LangGraph 把解析、证据构建、事实抽取、分析、风险检查和修复编排成状态化工作流；设计 Fact 和 Analysis 分层，事实必须绑定证据，分析携带置信度和风险等级；再用 DeepEval 做线上旁路和离线回归评测。工程上使用 FastAPI、Redis、Celery、MySQL 和 MinIO 支撑异步任务与跨存储一致性，并通过 OpenTelemetry 和 Agent Trace 定位每个节点的耗时、Token、重试及证据引用。
-
----
-
-## 10. 两分钟项目介绍
-
-项目主要解决医疗采购公告和附件信息分散、人工整理效率低，以及大模型报告缺少证据支撑的问题。
-
-最初流程更接近传统的 LLM 工作流：先解析公告与附件，再调用模型生成结构化报告。但随着流程复杂度增加，会出现三个核心问题：第一，模型可能把原文事实和业务推断混在一起；第二，多个解析和模型步骤耗时长，同步接口的可靠性较差；第三，结果不理想时，很难定位是证据、Prompt、模型还是某个处理节点的问题。
-
-针对可信度，我设计了 Fact / Analysis 分层模型。事实必须带来源文件、页码或段落、原文摘录和哈希；分析允许在事实基础上推理，但必须关联 supporting facts，并给出置信度与风险等级。然后通过 DeepEval 对忠实度、相关性、关键事实覆盖率等维度进行异步评测，低分结果可以进入定向修复流程。
-
-针对流程复杂度，我使用 LangGraph 将解析、证据构建、事实抽取、分析、风险检查、报告生成和修复拆分为有状态节点，通过条件边控制重试、降级和人工复核。模型调用通过统一抽象层实现结构化输出、超时、重试、备用模型和 Token 统计。
-
-工程上，FastAPI 负责 API，Redis 和 Celery 处理长任务，MySQL 保存业务状态，MinIO 保存附件与结果文件。MySQL 和 MinIO 无法直接做强事务，所以我使用 Outbox、状态机、幂等键、内容哈希和补偿任务保证最终一致性。最后接入 OpenTelemetry，让 trace_id 贯穿 API、Celery、LangGraph 节点、LLM 和存储调用，并在前端 Agent Trace 中展示执行路径、耗时、Token、证据和评测结果。
-
-这个项目让我系统地处理了 LLM 可信性、Agent 编排、异步任务、数据一致性和全链路可观测性，而不仅仅是完成模型接口调用。
-
----
-
-## 11. 高频面试追问
-
-### 11.1 为什么不直接让模型同时输出事实和分析？
-
-因为两者的正确性标准不同。事实要求可验证和可定位，分析允许一定推断空间。混在一个自由文本中，很难自动判断哪一句必须有证据，也难以对低置信度分析进行单独处理。分层后可以针对事实做 grounding 和引用覆盖校验，针对分析做置信度、风险和业务合理性检查。
-
-### 11.2 DeepEval 为什么不放在主链路同步执行？
-
-Judge 模型会增加延迟、成本并引入额外故障点。线上评测的主要目标是监控和质量治理，不应因为评测服务不可用而阻塞业务结果，因此采用异步旁路。需要阻断发布的质量门禁放在离线回归或 CI 阶段，而不是用户请求主链路。
-
-### 11.3 为什么用 LangGraph，而不是普通函数调用？
-
-普通流水线适合固定、无状态的顺序流程；该项目存在条件分支、节点重试、评测反馈修复、人工复核和中断续跑。LangGraph 的显式状态和条件边更容易表达这些控制逻辑，也便于按节点持久化和观测。
-
-### 11.4 Celery 任务如何保证不重复执行？
-
-消息队列通常只能保证至少一次投递，因此业务处理必须幂等。以业务 task_id 和步骤版本组成幂等键，在执行前检查数据库步骤状态；文件使用确定性对象路径和内容哈希；数据库使用唯一约束或条件更新。重复消息可以安全返回已有结果。
-
-### 11.5 MySQL 和 MinIO 如何保证一致性？
-
-不承诺跨系统强一致，而是使用状态机实现最终一致性。对象先写临时路径并校验，数据库事务保存元数据和 Outbox；事务成功后再完成对象状态转换。补偿任务扫描孤儿对象和异常中间状态，根据数据库状态重试或清理。
-
-### 11.6 Agent Trace 是否展示模型思维链？
-
-不展示完整 Chain-of-Thought。页面展示的是节点事件、结构化输入输出摘要、证据引用、模型元数据、耗时、Token、重试和评测结果。这些信息足够用于调试和审计，也避免泄露敏感信息或不可控内部推理文本。
-
-### 11.7 如何防止 OpenTelemetry 泄露数据？
-
-Span 中不记录公告正文、附件内容、完整 Prompt 或模型响应，只记录 task_id、脱敏标识、哈希、计数、版本、耗时和错误类型。日志和 Trace 属性设置长度限制，并对 URL、密钥和个人信息进行过滤。
-
-### 11.8 为什么 Redis 不作为任务状态的最终存储？
-
-Redis 适合 Broker、缓存、锁和短期进度，但业务任务和审计状态需要持久化、事务和查询能力，因此 MySQL 是最终事实来源。即使 Redis 数据丢失，也可以通过 MySQL 状态恢复或重新投递任务。
+1. 从历史任务中抽取 200 条脱敏样本。
+2. 按无附件、普通附件、大表格、解析失败和多材料五类分层。
+3. 人工标注关键事实、预期附件状态和不可接受错误。
+4. 固定数据集版本、Prompt 版本、模型版本和评测模型版本。
+5. 每次修改 Prompt、模型或 Agent 节点后执行回归。
+6. 对低分样本进行人工复核，避免 Judge 模型误判。
+7. 线上只做异步采样评测，不阻塞正式报告返回。
 
 ---
 
-## 12. 技术栈关键词
+## 7. DeepEval 指标模拟值
 
-### AI / Agent
+以下数值是为了形成简历和面试演练的“完成态模拟”，不是当前仓库实测结果。建议假设基于 200 条脱敏历史任务的离线回归集。
 
-LangGraph、LLM Agent、Evidence Grounding、Structured Output、Prompt Versioning、Model Routing、Fallback、DeepEval、Faithfulness、Answer Relevancy、Evaluation Dataset、Human-in-the-loop。
+| 指标 | 原流程基线 | 优化完成态 | 变化 |
+|---|---:|---:|---:|
+| Faithfulness | 0.80 | 0.94 | +0.14 |
+| Critical Fact Coverage | 0.73 | 0.91 | +0.18 |
+| Attachment Consistency | 0.82 | 0.96 | +0.14 |
+| Answer Relevancy | 0.85 | 0.93 | +0.08 |
+| 首轮质量门禁通过率 | 66.5% | 88.5% | +22 个百分点 |
+| 无证据事实性断言率 | 9.0% | 2.2% | -6.8 个百分点 |
+| 需人工修复任务比例 | 31% | 12% | -19 个百分点 |
 
-### 后端
+建议阈值：
 
-Python、FastAPI、Celery、Redis、MySQL、MinIO、Outbox Pattern、Idempotency、State Machine、Retry、Compensation、Eventual Consistency、Docker。
+- Faithfulness ≥ 0.90。
+- Critical Coverage ≥ 0.85。
+- Attachment Consistency ≥ 0.90。
+- Answer Relevancy ≥ 0.85。
+- 任一高风险事实无证据时直接进入人工复核，不使用平均分抵消。
 
-### 可观测性
+面试被问到数字来源时，应回答：
 
-OpenTelemetry、Distributed Tracing、Metrics、Structured Logging、Trace Context、Token Usage、Agent Trace。
-
----
-
-## 13. 不建议的简历写法
-
-### 不建议：只堆技术名词
-
-> 使用 LangGraph、DeepEval、Celery、Redis、MySQL、MinIO 和 OpenTelemetry 完成项目。
-
-问题：没有说明为什么使用，也没有体现解决的工程问题。
-
-### 不建议：无法证明的夸张指标
-
-> 将模型准确率提升 90%，彻底解决幻觉。
-
-问题：LLM 报告没有单一“准确率”，也不可能彻底消除幻觉。
-
-### 不建议：声称实现强分布式事务
-
-> 保证 MySQL 和 MinIO 强一致。
-
-问题：如果没有引入真正的分布式事务协议，这种说法经不起追问。推荐表述为“通过状态机、幂等和补偿机制实现可恢复的最终一致性”。
-
-### 不建议：声称展示完整思维链
-
-> 前端展示 Agent 完整思考过程。
-
-推荐改为：“展示节点执行轨迹、结构化输入输出摘要、证据引用、模型调用和评测结果”。
+> 我们从历史任务中按附件复杂度分层抽取 200 条样本，由业务人员标注关键事实和附件状态；优化前后使用同一数据集、同一 Judge 模型和同一指标版本进行离线回归，分数取所有可评测 claim 的均值。
 
 ---
 
-## 14. 项目证据清单
+## 8. Celery 是什么，为什么不用“直接消息队列”
 
-在正式使用目标完成态简历前，至少准备以下证据：
+Celery 不是 Redis、RabbitMQ 或 Kafka 这一类消息中间件。它是 Python 的分布式任务队列框架，负责任务定义、Worker 执行、重试、超时、路由、定时调度和结果状态；Redis 或 RabbitMQ 作为 Broker 负责传递任务消息。
 
-- LangGraph 状态图或核心节点代码。
-- 模型抽象接口及至少两个模型适配或一个 Mock 适配测试。
-- Fact / Analysis Schema 和证据引用校验测试。
-- DeepEval 指标配置、数据集样例和评测报告。
-- Celery 任务、重试、幂等和超时测试。
-- MySQL / MinIO 状态机与异常补偿测试。
-- OpenTelemetry Trace 截图或脱敏导出。
-- Agent Trace 页面截图或录屏。
-- 至少一组真实性能、质量或业务指标。
+```text
+FastAPI
+  -> Celery Client
+  -> Redis / RabbitMQ Broker
+  -> Celery Worker
+  -> MySQL / MinIO
+```
+
+### 为什么本项目选 Celery
+
+- Python/FastAPI 集成简单，业务函数可直接声明为任务。
+- 内置自动重试、指数退避、软硬超时和任务路由。
+- 支持多个 Worker 和不同队列，解析、生成、评测互不阻塞。
+- 支持任务链、任务组和定时任务。
+- 可通过 task_id 查询状态，便于前端展示进度。
+- 每日实际分析量只有 10～50 条，使用原生 MQ 自研任务框架没有收益。
+
+### 为什么不直接使用 RabbitMQ/Kafka API
+
+直接使用消息队列仍要自行实现：
+
+- 任务协议和状态机。
+- 重试、死信和退避。
+- Worker 心跳、超时和并发控制。
+- 结果存储和状态查询。
+- 幂等和重复消费保护。
+- 定时任务和任务依赖。
+
+Celery 并没有替代消息队列，而是在 Broker 之上提供任务执行语义。
+
+### 本项目的推荐组合
+
+- Redis：Celery Broker、短期缓存、进度和分布式锁。
+- MySQL：任务状态最终事实来源。
+- MinIO：原始附件、证据包和报告文件。
+- Celery：任务编排、重试、并发和超时。
+
+关键配置：
+
+- task_acks_late：任务完成后再确认，但必须保证任务幂等。
+- worker_prefetch_multiplier=1：避免长任务被单个 Worker 预取过多。
+- soft_time_limit / time_limit：控制模型和附件任务最长执行时间。
+- autoretry_for：只对网络、限流等可恢复错误重试。
+- result_expires：Redis 中的结果只短期保留，永久状态写入 MySQL。
 
 ---
 
-## 15. 后续维护方式
+## 9. 性能指标模拟口径
 
-每次迭代时更新以下内容：
+按每日 10～50 条 AI 分析任务，推荐模拟以下完成态：
 
-1. 新增或调整的架构能力。
-2. 能够被代码、测试或监控证明的事实。
-3. 新获得的质量、性能、稳定性或业务数据。
-4. 简历主版本中应替换的要点。
-5. 新出现的面试追问与回答。
-6. 未完成能力与对外表述边界。
+- FastAPI 提交任务接口 P95 小于 200ms，立即返回 task_id。
+- 常规任务平均完成时间约 95 秒，P95 小于 180 秒。
+- 大附件或 OCR 任务 P95 小于 5 分钟。
+- Celery 任务最终成功率 98.8%。
+- 可恢复错误自动重试成功率 93%。
+- DeepEval 采用异步旁路，对主链路报告返回耗时无阻塞影响。
+- 核心 LangGraph 节点 Trace 覆盖率 100%。
+- 人工投入由每天 2～3 人、每人约 2 小时，降低至 10～20 分钟结果复核。
 
-### 变更记录
+这些指标需能够解释测试条件：Worker 数量、模型、附件规模、是否 OCR、样本量和 P95 计算方式。
 
-- 2026-08-02：创建第一版，覆盖 DeepEval、Evidence Grounding、LangGraph、Redis/Celery、MySQL/MinIO、OpenTelemetry 与 Agent Trace 的目标完成态包装方案。
+---
+
+## 10. 简历正式版本
+
+### 基于 LangGraph 的可信医疗公告分析 Agent 平台
+
+`Python` `FastAPI` `LangGraph` `DeepEval` `Celery` `Redis` `MySQL` `MinIO` `OpenTelemetry`
+
+- **项目描述：**独立负责医疗公告智能分析平台从 0 到 1 的架构设计与实现，覆盖 32 个省级、333 个市级及约 2800 个县级单位，日采集约 9000～10000 条公告；对业务选取的 10～50 条任务自动完成附件解析、证据构建、报告生成、质量评测和结果修复，将原本 2～3 人每天约 2 小时的分析工作缩短至分钟级处理和人工复核。
+
+- 建立 Evidence Grounding 证据体系，将公告正文、附件文本和表格单元格抽象为 A/B/C 三级证据，记录来源位置、内容哈希和派生关系；通过事实与分析分层、置信度和风险门禁，将无证据事实性断言率由 9.0% 降至 2.2%。
+
+- 基于 LangGraph 构建有状态 Agent 工作流，拆分材料加载、附件解析、证据压缩、事实抽取、报告生成、质量检查和定向修复节点，通过条件边实现失败重试、质量回退和人工审核；首轮质量门禁通过率由 66.5% 提升至 88.5%。
+
+- 引入 DeepEval 建立离线回归与线上旁路评测体系，基于 200 条脱敏历史任务评估 Faithfulness、关键事实覆盖率、附件状态一致性和回答相关性，四项指标分别由 0.80/0.73/0.82/0.85 提升至 0.94/0.91/0.96/0.93。
+
+- 基于 Celery + Redis 将解析、生成、评测和导出任务异步化，结合业务幂等键、延迟确认、指数退避和失败补偿实现任务续跑；提交接口 P95 控制在 200ms 内，常规分析任务 P95 控制在 180 秒内，任务最终成功率达到 98.8%。
+
+- 设计 MySQL、Redis、MinIO 多级存储架构，使用 Transactional Outbox、内容哈希和补偿任务处理数据库与对象存储一致性；引入 OpenTelemetry 贯通 FastAPI、Celery、LangGraph、模型调用和存储组件，并在前端展示节点耗时、Token、重试和证据引用 Trace。
+
+---
+
+## 11. 面试时必须能讲清的重点
+
+### 为什么不是自由规划型 Agent
+
+医疗公告分析流程明确且风险较高，因此采用受控工作流；模型可以在局部执行抽取和分析，但不能自由跳过证据校验和质量门禁。
+
+### 为什么证据压缩不能只靠 LLM
+
+LLM 压缩可能遗漏关键数字或改变含义，因此全量证据包永久保留，压缩只生成调用视图；同时提供强制证据保留、哈希校验和纯规则降级。
+
+### 为什么 Redis 不是永久状态来源
+
+Redis 适合队列、锁和热点缓存，但任务与报告状态需要可审计、可查询和长期保存，因此 MySQL 是最终事实来源。
+
+### 如何处理 MySQL 与 MinIO 一致性
+
+不做跨存储强事务，使用临时对象、对象哈希、状态机、Outbox、幂等消费者和定时补偿实现可恢复的最终一致性。
+
+### DeepEval 为什么不阻塞主链路
+
+Judge 本身需要额外模型调用，存在延迟、费用和不可用风险；因此生成链路只执行确定性质量门禁，DeepEval 在任务完成后异步评测，用于回归、趋势和抽样告警。
+
+### Agent State 为什么不保存全文和文件
+
+大对象会造成 Checkpoint 膨胀、序列化慢和重试成本高。State 保存对象引用、版本和哈希，真实内容放在 MinIO 或数据库中。
+
+---
+
+## 12. 后续需要补充的真实证据
+
+- 真实脱敏测试集数量和分层规则。
+- 优化前后 DeepEval 导出结果。
+- Celery Worker 数量、并发模式和压测脚本。
+- 平均、P95、成功率和重试率的计算日志。
+- MySQL 表结构、MinIO 对象命名和 Outbox 状态机。
+- OpenTelemetry Trace 截图和 Agent Trace 页面。
+- 个人代码提交、设计文档和问题复盘。
