@@ -317,6 +317,103 @@ Evidence构建不应描述成“主要只靠正则”，而是确定性解析、
 
 冲突事实记录`conflict`并转人工，不能自动任选一个答案。
 
+### 7.5 确定性提取与模糊语义路由
+
+“确定性”表示在输入、规则版本和配置相同的情况下产生相同结果，并且能够解释每个字段怎样得到；它不等于只按关键词截取文本。
+
+```text
+文件结构解析
+  -> 候选识别
+  -> 字段语义映射
+  -> 值标准化
+  -> 一致性与约束校验
+```
+
+- 文件结构解析：恢复页、段落、表格、单元格和位置，不负责判断业务字段。
+- 候选识别：关键词、同义词、正则、表头别名和邻近窗口找到可能相关的原文或单元格。
+- 字段映射：根据章节、表头、行列关系、公告类型和阶段映射到标准字段。
+- 值标准化：日期、金额、数量、百分比和枚举转为统一表示，同时保留原值。
+- 一致性校验：检查候选唯一性、类型、范围、来源定位、跨字段约束和跨来源冲突。
+
+清晰事实示例：
+
+```json
+{
+  "field": "submission_deadline",
+  "raw_value": "2026-08-10 17:00",
+  "normalized_value": "2026-08-10T17:00:00+08:00",
+  "derived_from": ["ev_a_cell_001"],
+  "extraction_method": "exact_header_rule",
+  "rule_confidence": 0.98,
+  "ambiguity_flags": []
+}
+```
+
+| 字段名 | 中文含义 | 数据来源 | 为什么需要 | 读写节点 | 示例 |
+|---|---|---|---|---|---|
+| `extraction_method` | 当前事实使用的提取方式 | 规则路由器 | 审计是精确表头、正则、LLM候选还是人工确认 | `extract_facts`写入；QA和评测读取 | `exact_header_rule` |
+| `rule_confidence` | 规则对字段映射与值解析的综合置信度 | 候选唯一性、表头匹配、类型校验、来源质量等规则计算 | 决定规则直出、LLM候选或人工复核 | `extract_facts`写入；LangGraph条件边读取 | `0.98` |
+| `ambiguity_flags` | 语义模糊原因码列表 | 字段映射和Validator | 避免只用一个平均分掩盖高风险问题 | 提取器和Validator写入；路由、人工页面读取 | `['multiple_candidates']` |
+| `candidate_source_indices` | 候选原文、行或单元格索引 | ParsedDocument | 限制LLM只能在真实候选范围内选择 | 候选识别节点写入；LLM候选与校验节点读取 | `[3,4]` |
+| `source_quality_score` | 来源解析质量分 | OCR、PDF或表格解析器 | 区分语义不确定和源文本本身不可靠 | 解析器写入；提取路由读取 | `0.72` |
+| `validation_status` | 候选校验结果 | Evidence Validator | 明确是否可正式进入B级事实 | Validator写入；质量门读取 | `candidate_only` |
+
+常见`ambiguity_flags`：
+
+- `multiple_candidates`：同一字段存在多个合理候选；
+- `unknown_or_multi_match_header`：表头无法唯一映射；
+- `cross_sentence_dependency`：含义依赖前后句或省略主语；
+- `cross_document_dependency`：需要关联原公告、补充公告或历史材料；
+- `incomplete_value`：缺少年份、单位、币种、时区等；
+- `scope_unclear`：当前项目与历史/辅助材料范围不清；
+- `exception_or_modality`：存在“不超过”“原则上”“除外”“暂定”等限定；
+- `layout_ambiguity`：合并单元格、跨页表格或阅读顺序不稳定；
+- `low_source_confidence`：OCR或解析质量低；
+- `source_conflict`：正文和附件等来源值不一致；
+- `out_of_domain_pattern`：新模板或新术语偏离现有规则覆盖范围。
+
+推荐路由：
+
+```text
+候选唯一
++ 类型/范围/来源校验通过
++ 无高风险ambiguity_flags
++ rule_confidence达到校准阈值
+  -> 自动生成正式B级事实
+
+存在可解释歧义
++ 来源索引清楚
++ 未触发高风险冲突
+  -> 受约束LLM只做候选字段映射
+  -> Schema、字段白名单、索引和值解析再次校验
+  -> 校验通过后生成B级事实
+
+高风险字段冲突
+或来源无法定位
+或关键数字OCR低置信
+或LLM输出不能被规则验证
+  -> 保留unknown/conflict
+  -> needs_manual_review=true
+```
+
+阈值只能作为可配置示例，例如高于0.90规则直出、0.65～0.90进入LLM候选路由；真实阈值必须通过分地区、公告类型、附件复杂度的脱敏标注集校准。任何高风险硬条件都不能被平均分抵消。
+
+受约束LLM示例输出：
+
+```json
+{
+  "candidate_field": "submission_deadline",
+  "selected_source_indices": [3, 4],
+  "reason_code": "deadline_phrase_with_context",
+  "confidence": 0.82,
+  "uncertainty": "表头仅写时间要求"
+}
+```
+
+LLM输出只是候选，程序必须再次检查索引存在、字段白名单、原值可解析、来源可定位且无冲突，之后才能写入正式B级事实。
+
+规则稳定性应在标注集上按字段和数据分层统计Precision、Recall、冲突率、`llm_fallback_rate`、`manual_review_rate`和模板外失败率。规则在某个示例上能够匹配，不代表在不同地区和文档模板上稳定。
+
 ---
 
 ## 8. 第5步：Compact Payload二次压缩
@@ -617,7 +714,7 @@ class AnalysisState(TypedDict, total=False):
 1. 用户选择1～3条主材料，手选或GraphRAG确定0～10条辅助材料
 2. 从MySQL读取HTML正文和附件元数据，从MinIO读取原始附件
 3. 专用解析器/OCR生成可缓存ParsedDocument
-4. 构建A/B/C Evidence、Fact Layer和独立Analysis Layer
+4. 通过结构解析、候选识别、字段映射、值标准化和一致性校验构建A/B/C Evidence、Fact Layer和独立Analysis Layer；模糊语义路由到LLM候选或人工
 5. 依据24万字符硬上限与Token预算生成Compact Payload
 6. 组装系统规则、当前任务、Evidence Context和已确认偏好，DeepSeek V4 Pro生成ReportIR/Markdown
 7. 规则质量门+DeepSeek V4 Flash语义质检
@@ -645,3 +742,4 @@ class AnalysisState(TypedDict, total=False):
 3. 绘制MySQL、MinIO、Redis、Celery、LangGraph、GraphRAG和DeepEval架构图，并逐箭头解释格式。
 4. 为每个节点确定具体超时、最大重试次数、并发池和错误码。
 5. 设计用户偏好确认、查看、撤销和删除页面的数据接口。
+6. 为日期、价格、采购量、企业和产品等高风险字段建立分层标注集，校准`rule_confidence`阈值和LLM/人工回退率。
