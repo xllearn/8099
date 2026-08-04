@@ -4,7 +4,7 @@
 >
 > 岗位方向：Agent 开发、AI 应用工程师、AI 后端工程师。
 >
-> 当前业务口径：日采集约 9000～10000 条公告，正式进入分析链路的任务通常为每天 10 份以内。
+> 当前业务口径：日采集约 9000～10000 条公告；内部验证阶段正式分析通常每天 10 份以内；客户化包装完成态按日均 300～500 份、活动期峰值约 1000 份/日进行容量设计，后两项属于目标容量和模拟口径。
 >
 > 模型口径：报告生成使用 DeepSeek V4 Pro；质检与修订使用 DeepSeek V4 Flash；DeepEval Judge 使用公司部署的 GLM-5 与 DeepSeek V4 Flash。
 >
@@ -49,23 +49,30 @@
 ### 2.2 假设完成的目标链路
 
 ```text
-FastAPI 创建任务
+客户请求进入 FastAPI
+  -> 鉴权、账号额度、幂等检查和限流
   -> MySQL 事务写任务与 Outbox
-  -> Celery 将任务投递给 Worker
+  -> Celery 按优先级和任务类型投递队列
   -> LangGraph 根据 Agent State 执行节点
   -> MySQL 保存状态，MinIO 保存文件和大对象，Redis 保存队列/缓存/锁
   -> DeepEval 异步评测
-  -> OpenTelemetry 记录全链路 Trace
+  -> OpenTelemetry 记录提交、排队、执行、模型调用和存储 Trace
+  -> 根据队列积压与等待 P95 扩容或收缩 Worker
 ```
 
 ---
 
-## 3. 第 0 步：用户选择材料
+## 3. 第 0 步：用户选择材料并创建客户任务
 
 ### 输入格式
 
 ```json
 {
+  "customer_id": "customer_demo_001",
+  "requested_by_user_id": "user_demo_008",
+  "idempotency_key": "req_20260804_001",
+  "request_priority": 5,
+  "capacity_profile": "customer_normal_v1",
   "primary_materials": [
     {"menu_code": "project_notice", "articleid": "article_001"}
   ],
@@ -79,16 +86,29 @@ FastAPI 创建任务
 
 ### 字段解释
 
-| 字段名 | 中文含义 | 数据来源 | 存在原因 | 示例 |
-|---|---|---|---|---|
-| `primary_materials` | 主分析材料列表 | 用户选择 | 主材料可以直接决定本次报告的事实范围 | 采购公告 |
-| `auxiliary_materials` | 辅助材料列表 | 用户选择 | 提供背景和上下文，但不能覆盖主材料事实 | 政策说明 |
-| `menu_code` | 公告栏目或来源分类代码 | MySQL | 与 `articleid` 一起唯一定位一条公告 | `project_notice` |
-| `articleid` | 公告业务主键 | MySQL | 定位具体公告 | `article_001` |
-| `enable_attachment_download` | 是否下载附件 | 用户或系统配置 | 某些测试场景只读取正文，生产分析通常需要附件 | `true` |
-| `force_refresh_attachments` | 是否绕过附件缓存重新解析 | 用户或系统配置 | 处理附件更新、缓存损坏或解析器升级 | `false` |
+| 字段名 | 中文含义 | 数据来源 | 存在原因 | 读取或写入节点 | 示例 |
+|---|---|---|---|---|---|
+| `customer_id` | 发起任务的客户账号标识 | 登录鉴权上下文或客户账号表 | 用于额度、限流、计费和权限审计；不代表客户拥有私有知识库 | FastAPI任务创建接口写入MySQL和State；限流器、报表与审计读取 | `customer_demo_001` |
+| `requested_by_user_id` | 客户账号下的具体操作用户 | 登录令牌解析结果 | 区分同一客户内由谁创建、取消或修订任务 | FastAPI写入；任务详情、审计日志和反馈修订读取 | `user_demo_008` |
+| `idempotency_key` | 客户请求幂等键 | 客户端生成或服务端根据请求指纹生成 | 网络重试时避免创建两份相同正式任务 | FastAPI和MySQL唯一索引读取/写入；Celery任务启动前再次检查 | `req_20260804_001` |
+| `request_priority` | 任务优先级 | 套餐规则、业务规则或管理员配置 | 峰值期间优先处理正式客户报告，避免低优先级评测占用资源 | FastAPI写入State；Celery路由节点读取并选择队列 | `5` |
+| `capacity_profile` | 当前容量场景名称 | 部署配置、压测场景或任务策略 | 区分内部验证、客户常态和活动峰值使用的限流与告警阈值 | FastAPI写入；限流器、扩缩容与监控规则读取 | `customer_normal_v1` |
+| `primary_materials` | 主分析材料列表 | 用户选择 | 主材料可以直接决定本次报告的事实范围 | FastAPI写入任务材料关系；`load_materials`读取 | 采购公告 |
+| `auxiliary_materials` | 辅助材料列表 | 用户选择或RAG推荐后确认 | 提供背景和上下文，但不能覆盖主材料事实 | FastAPI或检索确认节点写入；`build_evidence`读取 | 政策说明 |
+| `menu_code` | 公告栏目或来源分类代码 | MySQL | 与 `articleid` 一起唯一定位一条公告 | `load_materials`读取 | `project_notice` |
+| `articleid` | 公告业务主键 | MySQL | 定位具体公告 | `load_materials`读取 | `article_001` |
+| `enable_attachment_download` | 是否下载附件 | 用户或系统配置 | 某些测试场景只读取正文，生产分析通常需要附件 | `parse_attachments`读取 | `true` |
+| `force_refresh_attachments` | 是否绕过附件缓存重新解析 | 用户或系统配置 | 处理附件更新、缓存损坏或解析器升级 | `parse_attachments`读取并决定是否复用MinIO资产 | `false` |
 
 主材料与辅助材料必须分开。主材料中的事实可以写入正式结论；辅助材料只能用于背景、关联关系或受限补充，不能把历史项目价格、时间和范围直接当成本次事实。
+
+### 输出、存储与失败处理
+
+- FastAPI在MySQL事务中创建`run_id`、任务记录、材料关系和Outbox事件。
+- API成功响应只表示任务已被可靠接收，不表示报告已生成。
+- 如果相同`customer_id + idempotency_key`已经存在，返回原`run_id`，而不是重复创建任务。
+- 如果客户超过即时提交额度，可返回限流状态或进入受控队列；不能让HTTP请求一直等待模型完成。
+- 如果Redis暂时不可用，Outbox事件仍保存在MySQL，由补偿任务在Broker恢复后重新投递。
 
 ---
 
@@ -257,6 +277,8 @@ FastAPI 创建任务
 | `warnings` | 解析告警 | 防止失败被误认为成功 |
 
 解析并不保证对任意文件 100% 无损。扫描 PDF、异常编码、复杂合并单元格、公式、图片表格和损坏文件都可能产生信息损失。因此系统必须保存解析状态、告警、原始文件哈希和人工复核标记。
+
+客户化后，多个客户选择同一公告时不应重复执行相同OCR和表格解析。系统使用`source_hash + parser_version`定位可复用的`ParsedDocument`；只有来源内容或解析器版本变化时才重新解析。
 
 ---
 
@@ -663,6 +685,9 @@ C 级包括摘要、生成指导、告警、诊断和历史记忆。它可以帮
 {
   "run_id": "run_001",
   "pack_id": "pack_001",
+  "customer_id": "customer_demo_001",
+  "request_priority": 5,
+  "capacity_profile": "customer_normal_v1",
   "status": "finished",
   "run_status": "finished",
   "workflow_run_id": "workflow_run_001",
@@ -692,6 +717,9 @@ C 级包括摘要、生成指导、告警、诊断和历史记忆。它可以帮
 | 字段名 | 中文含义 | 存在原因 |
 |---|---|---|
 | `run_id` | 本地分析任务 ID | 查询进度、报告和历史版本 |
+| `customer_id` | 任务所属客户账号 | 支持额度、计费与审计，但不改变共享知识库边界 |
+| `request_priority` | 当前任务优先级 | 决定峰值时的队列路由和资源顺序 |
+| `capacity_profile` | 容量场景 | 关联该任务使用的限流、扩容和告警阈值 |
 | `status` / `run_status` | 当前任务状态 | 两个字段必须一致，防止状态迁移歧义 |
 | `workflow_run_id` | Dify 工作流 ID | 上游排障 |
 | `version` | 报告版本 | 用户修订时递增 |
@@ -812,13 +840,16 @@ DeepEval 输出：
 - 模型生成、修复和质检耗时；
 - 成功率、超时率和重试率；
 - 队列等待时间；
+- 日均与峰值日完成任务数；
+- 峰值提交速率和稳定并发运行数；
+- 队列积压量、最老任务年龄和积压清空时间；
 - Worker 利用率；
 - Token 使用量和单任务成本；
 - Evidence 压缩率；
 - Mandatory Evidence 保留率；
 - Checkpoint 恢复成功率。
 
-不要把 DeepEval 分数与系统延迟混成同一类指标。
+不要把 DeepEval 分数与系统延迟混成同一类指标，也不能把目标容量配置当成实际测量值。
 
 ---
 
@@ -839,8 +870,18 @@ Agent State 不是“状态机图本身”，而是状态机执行过程中共�
 
 ```python
 class AnalysisState(TypedDict, total=False):
+    customer_id: str
+    requested_by_user_id: str
     run_id: str
     pack_id: str
+    idempotency_key: str
+    request_priority: int
+    capacity_profile: str
+    queue_name: str
+    submitted_at: str
+    started_at: str
+    queue_wait_ms: int
+
     status: str
     current_node: str
     retry_count: int
@@ -877,6 +918,9 @@ class AnalysisState(TypedDict, total=False):
 
 | 分组 | 主要字段 | 设计原因 |
 |---|---|---|
+| 客户身份 | `customer_id`、`requested_by_user_id` | 额度、计费和审计；不等于客户私有知识空间 |
+| 幂等与容量 | `idempotency_key`、`request_priority`、`capacity_profile`、`queue_name` | 防止重复任务并支持峰值队列路由 |
+| 排队时间 | `submitted_at`、`started_at`、`queue_wait_ms` | 区分排队慢和节点执行慢，驱动扩容告警 |
 | 身份 | `run_id`、`pack_id` | 关联任务和证据包 |
 | 流程控制 | `status`、`current_node`、`retry_count` | 决定下一节点及是否停止重试 |
 | 人工介入 | `manual_review_required`、`risk_level` | 高风险任务进入人工复核 |
@@ -887,6 +931,8 @@ class AnalysisState(TypedDict, total=False):
 | 模型审计 | `model_provider`、`model_name`、`prompt_version` | 解释某个结果由哪个版本生成 |
 | 可观测性 | `trace_id`、`node_timings_ms`、`token_usage` | Trace 页面和性能分析 |
 | 异常恢复 | `error_code`、`checkpoint_version` | 失败后判断能否从检查点恢复 |
+
+`queue_name`由FastAPI任务路由或Celery路由器写入，表示任务进入哪个队列，例如`generation_high`；Worker读取它完成消费和审计。`submitted_at`由FastAPI创建任务时写入，`started_at`由Worker真正开始执行时写入，`queue_wait_ms`由两者差值计算并写入MySQL与OpenTelemetry。脱敏示例：提交时间`2026-08-04T10:00:00+08:00`、开始时间`2026-08-04T10:00:21+08:00`、排队等待`21000`毫秒。
 
 当前仓库没有统一 LangGraph State，但 Evidence Pack JSON、Analysis Run JSON、Checkpoint JSON 和 Dify 会话变量共同承担了相似职责。优化的意义是将这些隐式状态收敛为一个类型化、显式、可检查的共享状态。
 
@@ -918,15 +964,17 @@ Celery 是 Python 分布式任务队列框架。它不等于 Redis 或 RabbitMQ�
 ### 15.3 一次任务如何执行
 
 ```text
-用户请求 FastAPI
-  -> MySQL 创建 run_id
-  -> FastAPI 调用 task.delay(run_id)
+客户请求 FastAPI
+  -> 鉴权、额度、限流和幂等检查
+  -> MySQL 创建 run_id 与 Outbox
+  -> Outbox Publisher 调用 task.apply_async(run_id, priority)
   -> Celery 将任务消息写入 Redis
-  -> Worker 获取消息
+  -> Worker 获取消息并记录 started_at
   -> Worker 根据 run_id 从 MySQL/MinIO 读取数据
   -> 执行 LangGraph
   -> 将最终业务状态写回 MySQL
   -> Celery 记录 SUCCESS/FAILURE
+  -> OpenTelemetry计算queue_wait_ms和节点耗时
 ```
 
 消息中只传 `run_id`、`pack_id` 等小型标识，不传完整 PDF 或 Evidence Pack，避免消息过大。
@@ -986,15 +1034,48 @@ Celery `SUCCESS` 只表示 Python 任务没有抛出异常，不等于报告质�
 
 ### 15.6 本项目推荐的队列
 
-| 队列 | 任务 |
-|---|---|
-| `attachment_queue` | 文件下载、OCR 和解析 |
-| `generation_queue` | DeepSeek V4 Pro 报告生成 |
-| `quality_queue` | DeepSeek V4 Flash 质检与修订 |
-| `evaluation_queue` | GLM-5 / DeepSeek V4 Flash DeepEval 评测 |
-| `export_queue` | ReportIR 渲染和 Word 导出 |
+| 队列 | 任务 | 峰值处理原则 |
+|---|---|---|
+| `attachment_queue` | 文件下载、OCR 和解析 | 可水平扩容；优先复用相同附件解析缓存 |
+| `generation_high` | 正式客户报告生成 | 高优先级，受模型并发配额控制 |
+| `generation_normal` | 普通报告生成 | 常态队列，可根据积压扩容 |
+| `quality_queue` | DeepSeek V4 Flash 质检与修订 | 不与生成使用同一并发池 |
+| `evaluation_queue` | GLM-5 / DeepSeek V4 Flash DeepEval 评测 | 低优先级；主链路积压时可暂停消费 |
+| `export_queue` | ReportIR 渲染和 Word 导出 | CPU/IO任务，与模型调用隔离 |
 
-每天正式任务不足 10 份时，不需要非常复杂的 Kafka 事件平台。Celery + Redis 更容易实现、部署和讲解；但依然要做好幂等、超时、重试和业务状态持久化。
+内部验证阶段每天正式任务不足10份时，一个Celery主任务运行一次LangGraph即可满足需求。客户化完成态按日均300～500份、峰值约1000份/日设计后，仍采用Celery + Redis，但必须增加队列隔离、优先级、账号限流、Worker弹性扩缩容和模型并发控制。这里的日均与峰值是目标容量，不是真实生产数据。
+
+### 15.7 客户化容量数据流与模拟指标
+
+```text
+FastAPI提交成功
+  -> submitted_at写入MySQL
+  -> Celery进入指定queue_name
+  -> Worker启动时写started_at
+  -> 计算queue_wait_ms
+  -> LangGraph执行并记录node_timings_ms
+  -> OpenTelemetry聚合队列等待P95、并发数和失败率
+  -> 扩缩容控制器读取积压与等待指标
+  -> 增减对应队列Worker
+```
+
+目标模拟口径：
+
+- 日均分析任务：300～500份；
+- 活动期峰值：约1000份/日；
+- 峰值提交速率：50份/小时；
+- 最大稳定并发运行数：20；
+- 队列等待P95：60秒以内；
+- 常规任务端到端P95：180秒以内；
+- 最终成功率：98.8%。
+
+失败处理：
+
+- 单客户超过速率时由限流器拒绝或延迟，不允许占满全局生成队列。
+- 模型返回限流错误时，任务保留在队列并执行指数退避；Schema错误等不可恢复异常不自动无限重试。
+- `queue_wait_ms`持续超过目标时优先扩容对应Worker，若受模型并发上限限制，则暂停低优先级评测并告警。
+- Worker崩溃后依赖`acks_late`重新投递，通过节点幂等键和Checkpoint跳过已完成步骤。
+- Redis故障时依赖MySQL Outbox重新投递，Redis不能成为唯一业务事实源。
 
 ---
 
@@ -1025,3 +1106,4 @@ Celery `SUCCESS` 只表示 Python 任务没有抛出异常，不等于报告质�
 1. 明确正式报告最常分析的五类公告，并为每类列出必须保留的关键事实字段。
 2. 设计 20～50 条脱敏的 DeepEval 基准样本，而不是一开始虚构 200 条真实测试数据。
 3. 绘制一张包含 MySQL、MinIO、Redis、Celery、LangGraph 和 DeepEval 的架构图，并能够逐箭头解释数据格式。
+4. 设计客户常态与活动峰值两套压测场景，明确Worker数量、模型并发配额、附件分布和积压清空时间。
