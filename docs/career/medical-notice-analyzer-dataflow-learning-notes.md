@@ -1,215 +1,163 @@
 # 医疗公告分析 Agent：数据流、字段与面试学习笔记
 
-> 本文是 `medical-notice-analyzer-resume-packaging.md` 的配套学习文档。
+> 本文记录包装完成态的九步业务数据流，以及每一步的输入、输出、存储、LangGraph State变化和失败处理。
 >
-> 岗位方向：Agent 开发、AI 应用工程师、AI 后端工程师。
+> 最高优先级口径以 `medical-notice-analyzer/docs/career/PROJECT_PACKAGING_CONTEXT.md` 为准。
 >
-> 当前业务口径：日采集约9000～10000条公告；内部验证阶段正式分析通常每天10份以内；客户化包装完成态按日均300～500份、活动期峰值约1000份/日进行容量设计，后两项属于目标容量和模拟口径。
->
-> 模型口径：报告生成使用DeepSeek V4 Pro；质检、自动修复与反馈修订使用DeepSeek V4 Flash；DeepEval Judge使用公司部署的GLM-5与DeepSeek V4 Flash。
->
-> 说明：文档同时描述当前仓库实现与假设已完成的目标架构。未经真实测试的数字不能当成真实生产指标。第19节是当前完整数据流的最高优先级学习口径。
+> 最近更新：2026-08-04
+
+---
+
+## 0. 数据来源和职责边界
+
+公司上游数据平台负责公告采集和公告库维护，历史数据口径为每天采集约9000～10000条公告。医疗公告分析Agent不负责采集，只消费以下数据：
+
+- 用户显式选择的1～3个主材料；
+- 用户手动选择的0～10个辅助材料；
+- 用户未选择辅助材料时，由公司GraphRAG自动召回的1～10个文档；
+- 用户反馈阶段为补证或跨地区对比再次召回的文档。
+
+客户化完成态按日均300～500份、活动期峰值约1000份分析任务进行容量设计；该数字是目标容量或模拟口径。
 
 ---
 
 ## 1. 字段阅读规则
 
-后续所有字段按以下格式解释：
+所有字段按以下维度解释：
 
-| 项目 | 含义 |
+| 维度 | 说明 |
 |---|---|
-| 字段名 | 程序或JSON中实际使用的名称 |
-| 中文含义 | 业务人员可以理解的含义 |
-| 数据来源 | 数据库、解析器、规则、模型或运行时 |
-| 存在原因 | 业务查询、追溯、状态、恢复、质量、审计或性能 |
-| 读写节点 | 哪个节点写入或读取 |
-| 示例 | 不包含公司敏感信息的样例 |
+| 字段名 | 程序、数据库或JSON中的实际名称 |
+| 中文含义 | 业务人员可理解的含义 |
+| 数据来源 | 用户、MySQL、GraphRAG、解析器、规则、模型或运行时 |
+| 为什么需要 | 业务、追溯、恢复、质量、安全或性能目的 |
+| 项目作用 | 在当前九步流程中解决什么问题 |
+| 读写节点 | 哪个节点写入、哪个节点读取 |
+| 脱敏示例 | 不含公司敏感信息的样例 |
 
 ---
 
-## 2. 当前系统与目标系统总览
-
-### 2.1 当前仓库主链路
+## 2. 整体架构与状态流转
 
 ```text
-材料选择
-  -> 从MySQL读取公告正文和附件元数据
-  -> 下载并解析附件
-  -> 构建完整Evidence Pack
-  -> 生成面向Dify的紧凑输入
-  -> Dify Workflow生成ReportIR / Markdown
-  -> 本地结构修复与质量门
-  -> 必要时受控修复
-  -> 保存Analysis Run
-  -> 页面展示 / 用户修订 / 受控Word导出
-  -> DeepEval旁路评测
-```
-
-### 2.2 包装完成态主链路
-
-```text
-客户请求进入FastAPI
-  -> 鉴权、额度、幂等、参数和限流
-  -> MySQL事务创建run_id与Outbox
+FastAPI接单
+  -> MySQL事务创建run_id和Outbox
   -> Celery可靠入队
-  -> GraphRAG检索辅助材料
-  -> LangGraph执行加载、解析、证据、事实、分析、生成、质检和修复
-  -> MySQL保存业务状态，MinIO保存大对象，Redis保存队列/缓存/锁
-  -> 可交付报告受控导出
-  -> 用户反馈补证修订
-  -> 偏好记忆候选与用户确认
+  -> 1. 主辅材料确定
+  -> 2. 解析与两阶段证据包构建
+  -> 3. Prompt组装与报告生成
+  -> 4. 第一次质检
+  -> 5. 定向修订
+  -> 6. 二次质检
+  -> 7. 后端校验、前端展示与Word交付
+  -> 8. 用户反馈分类、补证和新版本修订
+  -> 9. 偏好候选与用户确认
   -> DeepEval异步旁路
-  -> OpenTelemetry全链路观测
+```
+
+### LangGraph State基本原则
+
+- State只保存任务状态、小型结构化结果和MinIO对象引用，不保存大型附件和完整Evidence Pack正文。
+- 每个节点使用`run_id + node_name + input_hash`作为幂等键。
+- 节点成功后保存Checkpoint，失败重试从最后安全节点继续。
+- `heartbeat_at`由运行节点周期更新，Watchdog根据心跳和截止时间判断卡死任务。
+
+核心State示例：
+
+```python
+class AnalysisState(TypedDict, total=False):
+    run_id: str
+    customer_id: str
+    requested_by_user_id: str
+    idempotency_key: str
+    status: str
+    current_node: str
+    last_completed_node: str
+    checkpoint_version: int
+    retry_count: int
+    auto_repair_count: int
+    user_revision_count: int
+
+    primary_material_ids: list[str]
+    auxiliary_material_ids: list[str]
+    retrieval_result_key: str
+    parsed_document_keys: list[str]
+    evidence_pack_object_key: str
+    compact_payload_object_key: str
+    report_object_key: str
+
+    quality_gate_passed: bool
+    claim_ab_support_rate: float
+    unsupported_claim_count: int
+    deliverable: bool
+    needs_manual_review: bool
+
+    preference_profile_id: str
+    trace_id: str
+    heartbeat_at: str
+    error_code: str
 ```
 
 ---
 
-## 3. 第0步：用户选择材料并创建客户任务
+## 3. 接单前置步骤：FastAPI、幂等和异步入队
 
-### 输入示例
+虽然简历主叙事从主辅材料开始，但工程链路先完成可靠接单。
+
+### 输入
 
 ```json
 {
   "customer_id": "customer_demo_001",
   "requested_by_user_id": "user_demo_008",
   "idempotency_key": "req_20260804_001",
-  "request_priority": 5,
-  "capacity_profile": "customer_normal_v1",
-  "analysis_goal": "分析项目规则、时间和企业准备风险",
-  "auto_retrieve_auxiliary": true,
-  "primary_materials": [
-    {"menu_code": "project_notice", "articleid": "article_001"}
-  ],
-  "auxiliary_materials": [],
-  "enable_attachment_download": true,
-  "force_refresh_attachments": false
+  "analysis_goal": "分析项目要求并识别企业准备风险",
+  "primary_material_ids": ["notice_001"],
+  "manual_auxiliary_material_ids": [],
+  "auto_retrieve_auxiliary": true
 }
 ```
 
-| 字段名 | 中文含义 | 数据来源 | 为什么需要 | 读写节点 | 示例 |
-|---|---|---|---|---|---|
-| `customer_id` | 客户账号标识 | 鉴权上下文 | 额度、限流、计费和审计 | FastAPI写入；报表、审计读取 | `customer_demo_001` |
-| `requested_by_user_id` | 操作用户标识 | 登录令牌 | 确认由谁创建、修订和导出 | FastAPI写入；审计读取 | `user_demo_008` |
-| `idempotency_key` | 请求幂等键 | 客户端或请求指纹 | 网络重试不重复创建任务 | FastAPI/MySQL唯一索引读写 | `req_20260804_001` |
-| `request_priority` | 任务优先级 | 套餐或业务规则 | 峰值队列路由 | FastAPI写入；Celery路由读取 | `5` |
-| `capacity_profile` | 容量场景 | 部署或压测配置 | 区分常态与活动峰值阈值 | FastAPI写入；监控读取 | `customer_normal_v1` |
-| `analysis_goal` | 当前分析目标 | 用户输入 | 控制GraphRAG查询和报告重点 | FastAPI写入；检索/生成读取 | `比较挂网规则` |
-| `auto_retrieve_auxiliary` | 是否自动召回辅助材料 | 用户选择或默认配置 | 决定是否调用GraphRAG | FastAPI写入；检索节点读取 | `true` |
-| `primary_materials` | 主材料1～3条 | 用户显式选择 | 决定当前事实范围 | FastAPI写入；`load_materials`读取 | 项目公告 |
-| `auxiliary_materials` | 手动辅助材料0～10条 | 用户选择 | 提供历史、政策和背景 | FastAPI写入；检索合并节点读取 | 政策说明 |
+### 输出和存储
 
-### 输出、存储和失败处理
+- MySQL事务创建任务、`run_id`、材料关系和Outbox事件；
+- API返回`status=queued`，不等待检索或模型；
+- Outbox消费者将`run_id`投递到Celery队列；
+- Redis只作为Broker、锁和短期进度，不作为业务最终状态源。
 
-- MySQL事务创建`run_id`、任务、材料关系和Outbox事件。
-- API只返回`queued`，不等待模型。
-- 相同`customer_id + idempotency_key`返回原`run_id`。
-- Redis不可用时Outbox保留并补投。
-- 单客户和全局双层限流；超过额度返回可解释限流状态。
+### 失败处理
+
+- 相同`customer_id + idempotency_key`返回原`run_id`；
+- Redis不可用时Outbox保留，恢复后补投；
+- 参数、材料范围或权限错误不重试；
+- 单客户和全局限流防止队列被单一客户占满。
 
 ---
 
-## 4. 第1步：MySQL原始公告数据
+## 4. 第一步：主材料与辅助材料
 
-MySQL保存公告元数据、HTML正文和附件元数据；正文不是天然已经清洗好的纯文本。
+### 输入
 
-```json
-{
-  "menu_code": "project_notice",
-  "articleid": "article_001",
-  "title": "某医疗耗材采购公告",
-  "audittime": "2026-06-01 10:00:00",
-  "updatetime": "2026-06-02 10:00:00",
-  "areaname": "山东省",
-  "source": "省级采购平台",
-  "sourceurl": "https://example.invalid/notice/001",
-  "publicorg": "某公共资源交易中心",
-  "projectphase": "申报",
-  "projecttype": "医用耗材",
-  "dl_project_type": "带量采购",
-  "category": "高值耗材",
-  "referencenumber": "REF-001",
-  "content": "<p>公告HTML正文</p>"
-}
-```
+- 主材料：用户显式选择1～3个项目公告；
+- 手动辅助材料：0～10个；
+- 自动检索开关：用户未手选时可启用公司GraphRAG；
+- `analysis_goal`：本次分析目标，用于检索查询理解和报告重点控制。
 
-附件元数据包括`articleattid`、`filename`、`filepath`、`fileext`、`filesize`、`uploadtime`、`fileerrortype`。原始附件在目标架构中进入MinIO，MySQL保存对象Key和状态。
-
----
-
-## 5. 第2步：正文清洗与附件解析
-
-正文清洗输出：
-
-```json
-{
-  "content": "<p>申报时间为……</p>",
-  "content_text": "申报时间为……",
-  "content_text_length": 12800,
-  "content_hash": "sha256..."
-}
-```
-
-附件完成态解析策略：
-
-```text
-PDF -> pypdf等文本提取 -> 低文本密度/扫描页OCR -> 通用解析器兜底
-DOCX -> python-docx -> 通用解析器兜底
-DOC -> LibreOffice受控转换 -> DOCX解析 -> 通用解析器兜底
-XLSX/XLSM -> openpyxl(read_only/data_only，不执行宏) -> 通用解析器兜底
-XLS -> xlrd或受控转换 -> 通用解析器兜底
-CSV/TXT/HTML -> 编码检测与专用解析
-ZIP -> 安全解压后逐文件处理
-```
-
-`ParsedDocument`示例：
-
-```json
-{
-  "document_id": "doc_001",
-  "source_hash": "sha256...",
-  "parser_name": "openpyxl",
-  "parser_version": "xlsx-parser/v2",
-  "download_status": "downloaded",
-  "parse_status": "partial_success",
-  "text_object_key": "parsed/doc_001/text.json",
-  "table_summaries": [
-    {
-      "sheet_name": "采购清单",
-      "rows": 12000,
-      "columns_count": 12,
-      "headers": ["企业名称", "产品名称", "规格型号", "采购量"],
-      "field_stats": {},
-      "source_rows": [],
-      "table_heavy": true
-    }
-  ],
-  "warnings": ["merged_cells_detected"]
-}
-```
-
-工程机制：
-
-- `source_hash + parser_version`命中则复用解析资产。
-- 同一附件用Redis分布式锁避免重复OCR。
-- 下载、OCR、单文件解析和整组附件分别设置超时。
-- 网络和对象存储短时故障重试；文件损坏、密码保护、格式不支持不盲目重试。
-- 文件魔数、扩展名、大小、页数、行数和压缩比校验；宏不执行；ZIP防路径穿越；解析进程限制CPU/内存。
-
----
-
-## 6. 第3步：GraphRAG辅助材料召回
-
-主材料由用户选择1～3条；辅助材料最终0～10条，可以手动选择或自动召回。辅助类型包括补充/更正公告、历史轮次、政策、地区规则、公司审核分析、价格采购量和风险规则，不只限于项目公告。
+### GraphRAG处理
 
 ```text
 主材料 + analysis_goal
-  -> 查询理解、实体和时间识别
-  -> 关键词召回 || 向量召回 || 知识图谱关系扩展
-  -> 地区/品类/阶段/时间/source_scope过滤
-  -> Rerank、去重和有效期过滤
+  -> 实体、地区、品类和时间识别
+  -> 关键词召回 || 向量召回 || 知识图谱扩展
+  -> 权限/source_scope/地区/时间/有效期过滤
+  -> Rerank与去重
   -> 证据充分性判断
-  -> 选取1～10条辅助材料
+  -> 选取1～10个辅助文档
 ```
+
+GraphRAG属于公司提供的共享检索能力。本项目负责调用、过滤和消费结果，不将召回摘要直接当作事实。
+
+### 输出
 
 ```json
 {
@@ -226,30 +174,109 @@ ZIP -> 安全解压后逐文件处理
 }
 ```
 
-GraphRAG只返回候选资料，候选仍需经过第5步解析和后续Evidence构建。
+### 存储与State变化
 
-兜底：GraphRAG不可用时降级为关键词+结构化过滤；仍不可用时使用用户手动材料并记录告警。关键词、向量和图关系可并行，但分别受超时和并发池控制。权限和`source_scope`过滤必须在内容进入任务前完成。
+- MySQL保存任务与材料关系；
+- 完整召回明细进入MinIO；
+- State写入`auxiliary_material_ids`和`retrieval_result_key`；
+- `retrieve_auxiliary_materials`写入，`load_materials`和解析节点读取。
+
+### 失败处理
+
+- GraphRAG不可用：降级为关键词加结构化过滤；
+- 仍不可用：只使用用户手选材料并记录告警；
+- 空召回不是网络异常，不进行无意义重复调用；
+- 关键词、向量和图关系可并行，但各自设置超时和并发池。
 
 ---
 
-## 7. 第4步：完整Evidence Pack、Fact Layer与Analysis Layer
+## 5. 第二步：正文与附件解析
+
+### 正文输入和输出
+
+MySQL保存HTML正文和公告元数据，系统先清洗为纯文本：
 
 ```json
 {
-  "evidence_schema_version": 3,
-  "pack_id": "pack_001",
-  "primary_materials": [],
-  "auxiliary_materials": [],
-  "evidence_items": [],
-  "fact_items": [],
-  "analysis_items": [],
-  "generation_guidance": {},
-  "warnings": [],
-  "timings": {}
+  "article_id": "notice_001",
+  "content_html": "<p>集采开始日期为5月20日</p>",
+  "content_text": "集采开始日期为5月20日",
+  "content_text_length": 12,
+  "content_hash": "sha256_demo"
 }
 ```
 
-### 7.1 A级直接证据
+### 附件解析策略
+
+```text
+PDF -> pypdf文本提取 -> 扫描页或低文本密度时OCR -> Apache Tika兜底
+DOCX -> python-docx -> Apache Tika兜底
+XLSX/XLSM -> openpyxl只读解析 -> 结构化摘要/有限样例/统计 -> Apache Tika兜底
+DOC/XLS/未知格式 -> 受控转换或Apache Tika
+```
+
+XLSM只读取数据，不执行宏。大型Excel不把全部单元格直接放进模型输入，而是保存结构、表头、统计、有限样例和可定向查询的行列索引。
+
+### ParsedDocument输出
+
+```json
+{
+  "document_id": "doc_001",
+  "source_hash": "sha256_demo",
+  "parser_name": "openpyxl",
+  "parser_version": "xlsx-parser/v3",
+  "parse_status": "partial_success",
+  "fallback_used": false,
+  "text_object_key": "parsed/doc_001/text.json",
+  "table_summaries": [
+    {
+      "sheet_name": "采购清单",
+      "rows": 12000,
+      "columns_count": 12,
+      "headers": ["企业名称", "产品名称", "采购量"],
+      "sample_row_count": 20,
+      "table_heavy": true
+    }
+  ],
+  "warnings": ["merged_cells_detected"]
+}
+```
+
+### 存储与State变化
+
+- 原始附件、解析文本和表格明细存MinIO；
+- MySQL保存解析状态、解析器版本、哈希和对象Key；
+- Redis分布式锁防止同一附件重复OCR；
+- State只写`parsed_document_keys`和告警摘要。
+
+### 失败处理
+
+- `source_hash + parser_version`一致时复用解析资产；
+- 网络下载、对象存储短时故障可重试；
+- 文件损坏、密码保护或不支持格式不盲目重试；
+- 下载、OCR、单文件解析和整组附件分别设置超时；
+- 文件魔数、大小、页数、行数和压缩比校验；ZIP防路径穿越。
+
+---
+
+## 6. 第二步续：A/B/C Evidence Pack构建
+
+### 构建方式
+
+Evidence Pack不是简单关键词截取，由以下组件共同构建：
+
+```text
+文档结构解析
+  -> 领域词典/正则/表头映射识别候选
+  -> 字段语义映射
+  -> 值标准化
+  -> 一致性和来源校验
+  -> A/B/C证据写入
+```
+
+复杂表格、跨句引用或复杂PDF可调用受约束LLM做候选映射。LLM只能从提供的真实片段和索引中选择，输出还要通过Schema、字段白名单、索引存在性和值解析校验。
+
+### A级证据
 
 ```json
 {
@@ -258,308 +285,249 @@ GraphRAG只返回候选资料，候选仍需经过第5步解析和后续Evidence
   "kind": "attachment_text",
   "value": "集采开始日期为5月20日",
   "source_ref": {
-    "articleid": "article_001",
-    "attachment_id": "att_001",
+    "article_id": "notice_001",
     "filename": "采购文件.pdf",
     "page_no": 3,
-    "quote": "集采开始日期为5月20日",
-    "source_hash": "sha256..."
+    "quote": "集采开始日期为5月20日"
   },
-  "derived_from": [],
-  "extractor_version": "pdf-parser/v2",
   "mandatory": true
 }
 ```
 
-### 7.2 B级结构化事实
+A级保存原文是什么以及在哪里，是最终事实追溯依据。
+
+### B级证据
 
 ```json
 {
   "evidence_id": "ev_b_001",
   "level": "B",
   "kind": "derived_fact",
-  "value": {
-    "name": "集采开始日期",
-    "raw_value": "5月20日"
-  },
+  "value": {"集采开始日期": "5月20日"},
   "normalized_value": null,
   "derived_from": ["ev_a_001"],
   "extractor_version": "date-extractor/v3",
-  "source_hash": "sha256...",
-  "mandatory": true,
   "uncertainty": "原文未给出年份"
 }
 ```
 
-B级不能在原文缺少年份时擅自生成具体年份。
+B级保存程序对A级证据的结构化理解。原文没有年份时不能擅自补充年份。
 
-### 7.3 C级辅助信息
+### C级证据
 
-C级包括摘要、生成指导、告警、诊断和受控偏好。它不能单独支撑价格、时间、数量、企业、产品或资质事实。
+C级保存摘要、生成指导、解析告警、诊断和受控偏好。C级不能单独支撑价格、数量、时间、企业、产品、资质或中选条件等事实。
 
-### 7.4 Analysis Layer
+### 输出、存储和失败处理
 
-```json
-{
-  "analysis_id": "analysis_001",
-  "conclusion": "企业应在项目开始前完成材料准备",
-  "supporting_fact_ids": ["fact_start_date_001"],
-  "reasoning_type": "schedule_preparation",
-  "confidence": 0.78,
-  "risk_level": "medium",
-  "uncertainty": "未获取企业当前材料准备进度"
-}
-```
-
-“企业应在5月20日前准备好”是分析或建议，不是C级证据。
-
-Evidence构建不应描述成“主要只靠正则”，而是确定性解析、领域规则、词典、正则和结构化提取器共同完成。复杂语义可以调用受约束LLM生成候选，但候选必须通过Schema、字段白名单、索引范围和来源一致性校验。
-
-冲突事实记录`conflict`并转人工，不能自动任选一个答案。
-
-### 7.5 确定性提取与模糊语义路由
-
-“确定性”表示在输入、规则版本和配置相同的情况下产生相同结果，并且能够解释每个字段怎样得到；它不等于只按关键词截取文本。
-
-```text
-文件结构解析
-  -> 候选识别
-  -> 字段语义映射
-  -> 值标准化
-  -> 一致性与约束校验
-```
-
-- 文件结构解析：恢复页、段落、表格、单元格和位置，不负责判断业务字段。
-- 候选识别：关键词、同义词、正则、表头别名和邻近窗口找到可能相关的原文或单元格。
-- 字段映射：根据章节、表头、行列关系、公告类型和阶段映射到标准字段。
-- 值标准化：日期、金额、数量、百分比和枚举转为统一表示，同时保留原值。
-- 一致性校验：检查候选唯一性、类型、范围、来源定位、跨字段约束和跨来源冲突。
-
-清晰事实示例：
-
-```json
-{
-  "field": "submission_deadline",
-  "raw_value": "2026-08-10 17:00",
-  "normalized_value": "2026-08-10T17:00:00+08:00",
-  "derived_from": ["ev_a_cell_001"],
-  "extraction_method": "exact_header_rule",
-  "rule_confidence": 0.98,
-  "ambiguity_flags": []
-}
-```
-
-| 字段名 | 中文含义 | 数据来源 | 为什么需要 | 读写节点 | 示例 |
-|---|---|---|---|---|---|
-| `extraction_method` | 当前事实使用的提取方式 | 规则路由器 | 审计是精确表头、正则、LLM候选还是人工确认 | `extract_facts`写入；QA和评测读取 | `exact_header_rule` |
-| `rule_confidence` | 规则对字段映射与值解析的综合置信度 | 候选唯一性、表头匹配、类型校验、来源质量等规则计算 | 决定规则直出、LLM候选或人工复核 | `extract_facts`写入；LangGraph条件边读取 | `0.98` |
-| `ambiguity_flags` | 语义模糊原因码列表 | 字段映射和Validator | 避免只用一个平均分掩盖高风险问题 | 提取器和Validator写入；路由、人工页面读取 | `['multiple_candidates']` |
-| `candidate_source_indices` | 候选原文、行或单元格索引 | ParsedDocument | 限制LLM只能在真实候选范围内选择 | 候选识别节点写入；LLM候选与校验节点读取 | `[3,4]` |
-| `source_quality_score` | 来源解析质量分 | OCR、PDF或表格解析器 | 区分语义不确定和源文本本身不可靠 | 解析器写入；提取路由读取 | `0.72` |
-| `validation_status` | 候选校验结果 | Evidence Validator | 明确是否可正式进入B级事实 | Validator写入；质量门读取 | `candidate_only` |
-
-常见`ambiguity_flags`：
-
-- `multiple_candidates`：同一字段存在多个合理候选；
-- `unknown_or_multi_match_header`：表头无法唯一映射；
-- `cross_sentence_dependency`：含义依赖前后句或省略主语；
-- `cross_document_dependency`：需要关联原公告、补充公告或历史材料；
-- `incomplete_value`：缺少年份、单位、币种、时区等；
-- `scope_unclear`：当前项目与历史/辅助材料范围不清；
-- `exception_or_modality`：存在“不超过”“原则上”“除外”“暂定”等限定；
-- `layout_ambiguity`：合并单元格、跨页表格或阅读顺序不稳定；
-- `low_source_confidence`：OCR或解析质量低；
-- `source_conflict`：正文和附件等来源值不一致；
-- `out_of_domain_pattern`：新模板或新术语偏离现有规则覆盖范围。
-
-推荐路由：
-
-```text
-候选唯一
-+ 类型/范围/来源校验通过
-+ 无高风险ambiguity_flags
-+ rule_confidence达到校准阈值
-  -> 自动生成正式B级事实
-
-存在可解释歧义
-+ 来源索引清楚
-+ 未触发高风险冲突
-  -> 受约束LLM只做候选字段映射
-  -> Schema、字段白名单、索引和值解析再次校验
-  -> 校验通过后生成B级事实
-
-高风险字段冲突
-或来源无法定位
-或关键数字OCR低置信
-或LLM输出不能被规则验证
-  -> 保留unknown/conflict
-  -> needs_manual_review=true
-```
-
-阈值只能作为可配置示例，例如高于0.90规则直出、0.65～0.90进入LLM候选路由；真实阈值必须通过分地区、公告类型、附件复杂度的脱敏标注集校准。任何高风险硬条件都不能被平均分抵消。
-
-受约束LLM示例输出：
-
-```json
-{
-  "candidate_field": "submission_deadline",
-  "selected_source_indices": [3, 4],
-  "reason_code": "deadline_phrase_with_context",
-  "confidence": 0.82,
-  "uncertainty": "表头仅写时间要求"
-}
-```
-
-LLM输出只是候选，程序必须再次检查索引存在、字段白名单、原值可解析、来源可定位且无冲突，之后才能写入正式B级事实。
-
-规则稳定性应在标注集上按字段和数据分层统计Precision、Recall、冲突率、`llm_fallback_rate`、`manual_review_rate`和模板外失败率。规则在某个示例上能够匹配，不代表在不同地区和文档模板上稳定。
+- Full Evidence Pack存MinIO；MySQL保存`pack_id`、版本、哈希和状态；
+- State写`evidence_pack_object_key`；
+- 冲突事实保存为`conflict/unknown`并转人工，不能自动任选一个；
+- Mandatory Evidence无法定位来源时设置`needs_manual_review=true`。
 
 ---
 
-## 8. 第5步：Compact Payload二次压缩
+## 7. 第二步续：Compact Payload二次压缩
 
-完整Evidence Pack永久保留，Compact Payload只是模型输入视图。
+完整Evidence Pack永久保留，模型只消费派生的Compact Payload。
+
+### 压缩流程
+
+```text
+Full Evidence Pack
+  -> 去重和模板噪声清理
+  -> Mandatory Evidence保护
+  -> 规则压缩
+  -> 超预算时LLM分块压缩
+  -> 字符与Token预算复核
+  -> 仍超限则分阶段生成或人工复核
+```
+
+`application_input_cap_chars=240000`是应用硬上限。触发条件是输入超过安全预算，不是要求压缩结果尽量接近240000字符。实际预算需要扣除系统Prompt、用户任务、偏好、输出Token和安全余量。
+
+### 输出示例
 
 ```json
 {
   "pack_variant": "generation_payload",
   "application_input_cap_chars": 240000,
-  "model_context_tokens": 128000,
   "estimated_input_tokens": 56000,
   "reserved_output_tokens": 10000,
   "safety_margin_tokens": 6000,
-  "input_strategy": "safe_compact",
   "generation_payload_chars": 182000,
-  "mandatory_evidence_retention": {
-    "total": 36,
-    "retained": 36,
-    "rate": 1.0
-  },
-  "evidence_items_omitted_count": 120,
-  "evidence_items_omitted_sha256": "sha256..."
+  "mandatory_evidence_retention_rate": 1.0,
+  "input_strategy": "safe_compact"
 }
 ```
 
-24万字符是应用硬上限，不是目标填满长度。预算还要扣除系统Prompt、当前任务、偏好、工具消息、输出Token和安全余量，最终以Token估算校验。
+### 失败处理
 
-压缩顺序：去重/噪声清理 → Mandatory保护 → 规则压缩 → 必要时LLM分块压缩 → Token复核 → 仍超限则`staged_generation`。
-
-LLM压缩失败时使用规则降级；Mandatory Evidence无法保留时不得强行生成。
-
----
-
-## 9. 第6步：Prompt组装与生成
-
-Prompt优先级：
-
-1. 系统规则、身份、安全要求和输出Schema；
-2. 当前任务指令和报告结构；
-3. Compact Payload及来源引用；
-4. 用户已确认的结构化偏好Profile。
-
-公告正文、附件、GraphRAG资料和用户反馈均为不可信数据，使用明确分隔符包裹，不能覆盖系统规则。
-
-生成节点使用DeepSeek V4 Pro，输出`ReportIR + Markdown`。模型调用层记录：
-
-- `model_name`、`prompt_version`、`workflow_version`；
-- 连接、读取和总超时；
-- Token输入输出和成本；
-- 并发信号量；
-- 错误分类和重试次数；
-- 原始响应哈希和有界摘要。
-
-网络、限流和短时上游故障指数退避+抖动；Schema失败允许一次受控格式修复；权限、输入超限和安全错误不盲目重试。
+- LLM压缩失败时降级为规则压缩；
+- 仍超限时按章节或材料分阶段生成；
+- Mandatory Evidence不能保留时不得强行生成；
+- Compact Payload保存对象Key、哈希和省略明细，支持审计和复现。
 
 ---
 
-## 10. 第7步：第一次质量检查
+## 8. 第三步：Prompt组装与生成
 
-质量检查包括规则门和DeepSeek V4 Flash语义质检。
+### 四部分Prompt
 
-`Claim-Evidence Index`示例：
+1. 系统提示词：模型角色、证据边界、禁止编造、安全要求、输出Schema；
+2. 当前用户任务：分析目标和报告大致结构；
+3. Compact Payload和Evidence引用；
+4. 用户已确认的偏好Profile。
+
+公告、附件、RAG资料和反馈均为不可信数据，使用明确分隔符包裹，不能覆盖系统规则。
+
+### 生成输出
 
 ```json
 {
-  "claim_id": "claim_001",
-  "text": "申报截止时间为2026年8月10日17:00",
-  "locations": ["report_ir.sections[0].paragraphs[0].sentence[0]"],
-  "supported": true,
-  "evidence_ids": ["ev_a_001", "ev_b_001"],
-  "support_levels": ["A", "B"],
-  "match_score": 100
+  "report_ir": {
+    "title": "某项目公告分析",
+    "sections": [],
+    "claims": [
+      {
+        "claim_id": "claim_001",
+        "text": "集采开始日期为5月20日",
+        "evidence_ids": ["ev_a_001", "ev_b_001"]
+      }
+    ]
+  },
+  "markdown_object_key": "reports/run_001/v1/report.md"
 }
 ```
 
-同步质量门检查：非空输出、ReportIR Schema、必需章节、发布机构、时间、标的物、附件状态、数值日期Exact Match、Claim-Evidence支持、来源定位、C级误用、历史事实泄漏、禁用表达和高风险无证据结论。
+报告生成使用DeepSeek V4 Pro。模型调用层记录模型、Prompt版本、连接/读取/总超时、Token、成本、重试次数和响应哈希。
+
+### State与失败处理
+
+- State写`report_object_key`和报告版本；
+- 网络、限流和短时上游故障指数退避；
+- Schema错误允许一次受控格式修复；
+- 权限、安全或输入超限错误不盲目重试；
+- 生成并发受模型信号量和账号额度控制。
+
+---
+
+## 9. 第四步：第一次质检
+
+规则门和DeepSeek V4 Flash语义质检共同检查：
+
+- 是否为空、ReportIR Schema是否合法；
+- 发布机构、时间、标的物和必需章节是否缺失；
+- 数值与日期是否和A/B证据一致；
+- Claim是否存在有效Evidence引用；
+- C级内容是否被误作事实；
+- 辅助材料或历史项目事实是否泄漏为当前事实；
+- 附件失败状态是否与报告表述一致。
+
+输出：
 
 ```json
 {
   "status": "needs_fix",
-  "passed": false,
-  "issues": [],
-  "unsupported_claims": [],
-  "missing_section_ids": [],
-  "missing_topic_ids": [],
-  "history_leakage": [],
-  "fix_instructions": [],
-  "claim_ab_support_rate": 0.96
+  "issues": [
+    {
+      "issue_code": "MISSING_PUBLISH_ORG",
+      "target_path": "sections[0]",
+      "severity": "medium"
+    }
+  ],
+  "claim_ab_support_rate": 0.96,
+  "unsupported_claim_count": 2,
+  "missing_topic_ids": ["publish_org"]
 }
 ```
 
-DeepEval不作为同步阻断门。
+DeepEval不作为同步阻断门，保持异步旁路。
 
 ---
 
-## 11. 第8步：自动修复与二次质检
+## 10. 第五步：定向修订
 
-1. 确定性修复：结构、空字段、禁用表达、无证据表格行、Markdown/ReportIR同步。
-2. LLM局部修复：目标段落+问题码+允许使用的A/B证据+禁止新增事实约束。
-3. 生成新报告版本并记录diff和`repair_actions`。
-4. 重新执行相同质量门。
+### 输入
 
-`auto_repair_count`最多2次。报告版本使用乐观锁；两个修复任务不能覆盖同一基线版本。
+- 当前问题段落和路径；
+- 结构化`issue_code`；
+- 允许使用的A/B证据；
+- 禁止新增事实约束；
+- 当前报告版本和乐观锁版本号。
 
-两次后仍存在阻断问题、高风险无证据事实、关键附件失败或冲突事实时，`needs_manual_review=true`。
+### 处理
+
+1. 先修复结构、空字段、禁用表达和无证据表格行；
+2. 再由DeepSeek V4 Flash局部生成新段落；
+3. 保存新ReportIR版本、修改动作和前后diff。
+
+### 失败处理
+
+- `auto_repair_count`最多2次；
+- 两个修订任务不能覆盖同一基线版本；
+- 高风险无证据事实或冲突证据不自动修复，转人工。
 
 ---
 
-## 12. 第9步：最终Analysis Run、持久化和交付
+## 11. 第六步：二次质检
+
+二次质检执行与第一次相同的规则门和语义门，输出剩余问题、A/B支持率、无证据事实数量和阻断状态。
+
+State变化：
+
+- 通过：`quality_gate_passed=true`；
+- 可修复且次数未满：回到修订节点；
+- 高风险或次数耗尽：`needs_manual_review=true`。
+
+模拟评测口径：首轮质量门通过率66.5%提升至88.5%，无证据断言率9.0%下降至2.2%。该数据不是生产实测。
+
+---
+
+## 12. 第七步：后端校验、前端展示与Word交付
+
+### 最终后端校验
+
+- 报告非空；
+- 二次质检不存在阻断问题；
+- ReportIR与Markdown一致；
+- MinIO对象哈希、MySQL版本关系和状态迁移一致；
+- 关键附件解析状态满足交付要求；
+- 报告版本持久化成功。
+
+### 输出
 
 ```json
 {
   "run_id": "run_001",
-  "pack_id": "pack_001",
-  "customer_id": "customer_demo_001",
   "status": "finished",
   "version": 2,
+  "claim_ab_support_rate": 0.96,
+  "unsupported_claim_count": 2,
+  "quality_issues": [],
   "deliverable": true,
-  "needs_manual_review": false,
-  "auto_repair_count": 1,
-  "user_revision_count": 0,
-  "quality_gate": {},
-  "report_object_key": "reports/run_001/v2/report.json",
-  "report_sha256": "sha256...",
-  "trace_id": "trace_demo_001"
+  "needs_manual_review": false
 }
 ```
 
-最终校验确认ReportIR/Markdown一致、对象哈希、版本关系、MySQL/MinIO持久化、状态迁移和`deliverable`。Watchdog、超时和重试贯穿所有步骤，最终节点只负责状态收口和一致性。
+前端展示二次质检问题、原文遵循评分、A/B支持率、无证据事实数量和可交付状态。
 
-前端同步展示`claim_ab_support_rate`、`unsupported_claim_count`、`missing_topic_ids`、告警和可交付状态。
+只有`deliverable=true`的版本可以导出Word。DOCX由ReportIR受控渲染；导出失败进入独立队列重试，不重新生成报告。
+
+### 贯穿式失败处理
+
+重试、超时和降级并非只在第七步执行：
+
+- GraphRAG降级到关键词或手选；
+- 专用解析器降级到OCR或Apache Tika；
+- LLM压缩降级到规则压缩；
+- 网络和存储短时故障重试；
+- 不可恢复问题进入人工；
+- Watchdog根据心跳恢复卡死任务。
 
 ---
 
-## 13. 第10步：Word导出与DeepEval旁路
+## 13. 第八步：用户反馈与补证修订
 
-只有`deliverable=true`的报告允许正式导出。DOCX由ReportIR受控渲染，文件名清洗、模板/图片白名单、短时签名下载链接。导出失败进入`export_queue`单独重试，不重新调用生成模型。
-
-DeepEval进入低优先级`evaluation_queue`，前端先显示`pending`，完成后更新Faithfulness等指标；Judge不可用时为`unavailable`，不阻塞报告。
-
----
-
-## 14. 第11步：用户反馈修订
-
-统一反馈结构：
+### 统一反馈输入
 
 ```json
 {
@@ -569,177 +537,107 @@ DeepEval进入低优先级`evaluation_queue`，前端先显示`pending`，完成
   "feedback_source": "free_text",
   "feedback_text": "增加新疆与山东挂网规则对比",
   "intent_type": "shared_knowledge_extension",
-  "intent_confidence": 0.94,
   "user_revision_count": 1
 }
 ```
 
-三类路由：
+### 预制按钮
 
-- 样式/结构：当前报告+反馈+原Evidence Pack。
-- 当前公告补证：回到ParsedDocument定向检索并补建证据。
-- 跨地区/历史/政策：GraphRAG召回，构建`revision_evidence_pack`后局部修订。
+“更正式”“分析更详细”等预制按钮使用：反馈意见 + 当前最终报告 + 原Evidence Pack。修订结果仍需生成新版本并进入质检，不能直接覆盖正式报告。
 
-预制按钮也不能只使用“意见+报告”；至少要携带原Evidence Pack。针对性反馈可先召回1～3条高相关材料，但最终数量由证据充分性决定，最多10条。
+### 自由文本三类路由
 
-用户自助修订最多3轮。`user_revision_count`只在成功生成新版本后递增；网络重试、Worker重投和同一轮模型重试不占轮次。超过3轮或仍阻断则人工处理。
+1. 样式或结构：用户反馈 + 当前报告 + 原Evidence Pack；
+2. 当前公告补证：回到ParsedDocument，定向检索并补建新的A/B证据；
+3. 跨地区、历史或政策扩展：调用GraphRAG召回材料，构建`revision_evidence_pack`后修订。
+
+“新疆与山东挂网对比”通常先召回1～3个高相关文档；最终数量由证据充分性决定，但不超过辅助材料总上限10个。
+
+### 次数和失败处理
+
+- 用户最多自助修订3轮；
+- 成功产生新报告版本后才增加`user_revision_count`；
+- 网络重试、Worker重投和同一轮模型重试不计入轮次；
+- 超过3轮或仍有阻断问题提交人工处理。
 
 ---
 
-## 15. 第12步：偏好记忆候选和沉淀
+## 14. 第九步：偏好记忆候选与确认
 
-反馈日志与长期偏好记忆分开。
+反馈日志、审计记录和长期偏好记忆分开保存。
 
 ```json
 {
   "memory_candidate_id": "mem_candidate_001",
-  "customer_id": "customer_demo_001",
   "user_id": "user_demo_008",
   "source_feedback_ids": ["feedback_001"],
   "preference_type": "report_style",
-  "preference_value": "优先使用表格并保持结论简洁",
+  "preference_value": "优先展示数据并保持结论简洁",
   "status": "pending",
-  "scope": "user",
-  "created_at": "2026-08-04T10:30:00+08:00",
-  "expires_at": null
+  "scope": "user"
 }
 ```
 
-只允许稳定样式偏好进入候选；公告事实、一次性要求、敏感数据和跨客户数据不得进入。用户明确同意后状态变为`approved/active`。用户可查看、修改、撤销和删除。偏好优先级低于系统规则、证据和当前指令，不进入共享GraphRAG事实库。
+### 规则
+
+- 只抽取稳定的结构和表达偏好；
+- 公告事实、一次性需求和敏感信息不能进入记忆；
+- 用户明确同意后状态变为`approved/active`；
+- 用户可以查看、修改、撤销和删除；
+- 记忆优先级低于系统规则、证据和当前任务；
+- 不进入共享GraphRAG事实库，不跨客户复用。
 
 ---
 
-## 16. Agent State基础理解
+## 15. 核心字段完整解释
 
-```python
-class AnalysisState(TypedDict, total=False):
-    customer_id: str
-    requested_by_user_id: str
-    run_id: str
-    pack_id: str
-    idempotency_key: str
-    request_priority: int
-    capacity_profile: str
-    queue_name: str
-    submitted_at: str
-    started_at: str
-    heartbeat_at: str
-    watchdog_deadline_at: str
-    queue_wait_ms: int
-
-    status: str
-    current_node: str
-    retry_count: int
-    auto_repair_count: int
-    user_revision_count: int
-    manual_review_required: bool
-
-    primary_material_ids: list[str]
-    auxiliary_material_ids: list[str]
-    retrieval_result_key: str
-    evidence_pack_object_key: str
-    evidence_pack_sha256: str
-    compact_payload_object_key: str
-
-    fact_items: list[dict]
-    analysis_items: list[dict]
-    report_ir: dict
-    report_object_key: str
-
-    quality_gate_passed: bool
-    unsupported_claim_count: int
-    deepeval_status: str
-    deepeval_scores: dict[str, float]
-    risk_level: str
-
-    model_provider: str
-    model_name: str
-    prompt_version: str
-    preference_profile_id: str
-
-    trace_id: str
-    node_timings_ms: dict[str, int]
-    token_usage: dict[str, int]
-
-    error_code: str
-    error_message: str
-    last_completed_node: str
-    checkpoint_version: int
-```
-
-`heartbeat_at`由运行节点周期写入；Watchdog读取它和`watchdog_deadline_at`判断任务是否卡死。脱敏示例：节点`parse_attachments`最后心跳为`2026-08-04T10:02:15+08:00`，截止时间为`10:07:15`。
+| 字段名 | 中文含义 | 数据来源 | 为什么需要 | 项目作用 | 读写节点 | 脱敏示例 |
+|---|---|---|---|---|---|---|
+| `run_id` | 一次分析运行ID | FastAPI任务创建 | 关联状态、队列、报告、日志和评测 | 全链路主键 | 创建任务写；所有节点读 | `run_001` |
+| `primary_material_ids` | 主材料列表 | 用户选择 | 限定当前事实范围 | 防止辅助材料覆盖主公告 | 接单写；加载、证据、生成读 | `["notice_001"]` |
+| `auxiliary_material_ids` | 辅助材料列表 | 用户或GraphRAG | 提供政策、历史和对比背景 | 扩展分析但不改变主事实 | 检索写；解析和证据读 | `["policy_023"]` |
+| `source_ref` | 原文来源定位 | 解析器 | 支持事实追溯和人工复核 | 将Claim回溯到页码或单元格 | 解析/证据写；质检/前端读 | `采购文件.pdf，第3页` |
+| `derived_from` | B级依赖的A级证据 | 结构化提取器 | 证明结构化事实如何得到 | 连接原文和标准字段 | 证据构建写；质检读 | `["ev_a_001"]` |
+| `application_input_cap_chars` | 输入字符硬上限 | 系统配置 | 控制应用输入预算 | 触发压缩但不要求填满 | 压缩节点读 | `240000` |
+| `claim_ab_support_rate` | Claim获得A/B支持比例 | 质量门计算 | 评估事实可追溯性 | 决定修订和交付 | 质检写；后端/前端读 | `0.96` |
+| `unsupported_claim_count` | 无证据事实数量 | 质量门 | 发现模型幻觉或遗漏 | 触发修订或阻断 | 质检写；修订/前端读 | `2` |
+| `auto_repair_count` | 自动修复次数 | 修订节点 | 防止无限修复循环 | 最多2次后转人工 | 修订写；路由读 | `1` |
+| `user_revision_count` | 用户修订轮数 | 成功修订后累加 | 控制最多3轮 | 区分用户需求与网络重试 | 修订写；路由读 | `2` |
+| `deliverable` | 是否允许正式交付 | 后端最终校验 | 阻止不合格版本下载 | 控制Word导出 | 最终校验写；导出读 | `true` |
+| `memory_candidate_id` | 偏好候选ID | 记忆提取节点 | 候选与正式偏好分离 | 等待用户确认 | 记忆节点写；确认接口读写 | `mem_candidate_001` |
 
 ---
 
-## 17. Celery与并发控制
+## 16. Celery、存储和可观测性
 
-推荐队列：
+### 队列
 
-| 队列 | 任务 | 峰值原则 |
-|---|---|---|
-| `retrieval_queue` | GraphRAG查询和Rerank | 独立并发池和总超时 |
-| `attachment_queue` | 下载、OCR和解析 | 水平扩容、缓存复用、同附件锁 |
-| `generation_high` | 高优先级客户生成 | 模型信号量和账号配额 |
-| `generation_normal` | 普通生成 | 按积压扩容 |
-| `quality_queue` | 质检和自动修复 | 与生成并发池隔离 |
-| `revision_queue` | 用户反馈修订 | 报告版本乐观锁 |
-| `export_queue` | Word导出 | CPU/IO隔离 |
-| `evaluation_queue` | DeepEval | 低优先级，可暂停 |
-
-关键配置：`acks_late`、`worker_prefetch_multiplier=1`、`soft_time_limit/time_limit`、`autoretry_for`、`retry_backoff`、`task_routes`、`worker_concurrency`和短期`result_expires`。
-
----
-
-## 18. 跨步骤工程保护矩阵
-
-| 机制 | 统一规则 |
+| 队列 | 内容 |
 |---|---|
-| 幂等 | 创建任务使用`customer_id + idempotency_key`；节点使用`run_id + node_name + input_hash` |
-| 重试 | 仅可恢复异常重试，指数退避+抖动；不可恢复错误直接失败或人工 |
-| 超时 | API、下载、OCR、解析、GraphRAG、模型、导出、节点和整任务分层超时 |
-| Watchdog | 检查心跳、当前节点和截止时间，恢复卡死任务或转人工 |
-| Checkpoint | 每个成功节点保存输入输出指纹和最后完成节点 |
-| 并发 | 队列隔离、模型信号量、附件并行、同附件锁、报告乐观锁 |
-| 安全 | 鉴权、范围过滤、文件沙箱、Prompt注入隔离、日志脱敏、短时下载授权 |
-| 一致性 | MySQL Outbox、MinIO临时对象、哈希、幂等消费者和补偿任务 |
-| 可观测性 | OpenTelemetry关联`run_id/trace_id`，记录排队、检索、节点、模型、存储、重试和成本 |
-| 降级 | GraphRAG→关键词/手选；专用解析→OCR/通用解析；LLM压缩→规则压缩；DeepEval失败不阻塞 |
+| `retrieval_queue` | GraphRAG查询与Rerank |
+| `attachment_queue` | 下载、OCR与解析 |
+| `generation_queue` | 报告生成 |
+| `quality_queue` | 质检与自动修订 |
+| `revision_queue` | 用户反馈修订 |
+| `export_queue` | Word导出 |
+| `evaluation_queue` | DeepEval低优先级旁路 |
+
+### 存储
+
+- MySQL：任务、状态、材料关系、版本、反馈、候选记忆、Outbox和指标汇总；
+- MinIO：原始附件、ParsedDocument、Full Evidence Pack、Compact Payload、ReportIR、Markdown和DOCX；
+- Redis：Celery Broker、短期缓存、进度和分布式锁。
+
+### 工程机制
+
+- `acks_late`和`worker_prefetch_multiplier=1`降低Worker异常造成的任务丢失和长任务抢占；
+- Transactional Outbox解决MySQL任务已创建但队列消息未发出的不一致；
+- OpenTelemetry以`run_id/trace_id`串联API、队列、GraphRAG、节点、模型和存储；
+- 敏感原文、完整Prompt、令牌和个人信息不直接写日志；
+- DeepEval失败只更新`unavailable`，不阻塞可交付报告。
 
 ---
 
-## 19. 当前规范化0～12步复述口径
+## 17. 面试复述版本
 
-```text
-0. FastAPI鉴权、额度、限流、幂等，MySQL事务创建run_id与Outbox
-1. 用户选择1～3条主材料，手选或GraphRAG确定0～10条辅助材料
-2. 从MySQL读取HTML正文和附件元数据，从MinIO读取原始附件
-3. 专用解析器/OCR生成可缓存ParsedDocument
-4. 通过结构解析、候选识别、字段映射、值标准化和一致性校验构建A/B/C Evidence、Fact Layer和独立Analysis Layer；模糊语义路由到LLM候选或人工
-5. 依据24万字符硬上限与Token预算生成Compact Payload
-6. 组装系统规则、当前任务、Evidence Context和已确认偏好，DeepSeek V4 Pro生成ReportIR/Markdown
-7. 规则质量门+DeepSeek V4 Flash语义质检
-8. 确定性修复+局部LLM修复，最多2次，再次质检
-9. 最终后端一致性校验、持久化和deliverable判断
-10. 受控Word导出；DeepEval异步旁路
-11. 用户反馈意图分类、当前资料补证或GraphRAG补证，最多3轮自助修订
-12. 从反馈中提取稳定样式偏好候选，用户确认后加入账户偏好Profile
-```
-
-所有步骤均具备幂等、Checkpoint、可恢复重试、分层超时、Watchdog、权限和安全校验、并发控制及OpenTelemetry Trace。
-
----
-
-## 20. 面试回答：如何证明压缩可信
-
-> 我不会把方案描述成完全无损。完整Evidence Pack和原始解析资产永久保存，模型消费的是派生Compact Payload。24万字符只是应用硬上限，实际输入还要预留Prompt、输出Token和安全余量。压缩按主辅材料、证据等级和业务字段排序，价格、时间、数量、企业、产品等Mandatory Evidence及B级事实的A级父证据必须保留，并记录省略数量和哈希。LLM压缩失败时降级到规则压缩，仍超限则分阶段生成；关键证据无法保留时转人工。最后通过关键事实覆盖、Claim-Evidence支持和异步DeepEval检查关键遗漏。
-
----
-
-## 21. 下一步学习问题
-
-1. 明确五类高频公告的Mandatory Evidence字段。
-2. 设计20～50条脱敏DeepEval基准样本，再扩展到200条模拟回归集。
-3. 绘制MySQL、MinIO、Redis、Celery、LangGraph、GraphRAG和DeepEval架构图，并逐箭头解释格式。
-4. 为每个节点确定具体超时、最大重试次数、并发池和错误码。
-5. 设计用户偏好确认、查看、撤销和删除页面的数据接口。
-6. 为日期、价格、采购量、企业和产品等高风险字段建立分层标注集，校准`rule_confidence`阈值和LLM/人工回退率。
+> 用户先选择1～3个主公告，辅助材料可以手选0～10个，也可以由公司GraphRAG通过关键词、向量和知识图谱自动召回1～10个。系统从MySQL读取HTML正文并清洗，附件按PDF、DOCX和Excel使用专用解析器，失败时用Apache Tika兜底。解析结果先构建完整A/B/C Evidence Pack，再根据24万字符硬上限和Token预算生成Compact Payload。Prompt由系统规则、当前任务、证据上下文和用户确认偏好四部分组成，生成节点要求关键Claim返回Evidence引用。报告经过第一次质检、局部修订和二次质检，再由后端做非空、阻断、版本和持久化校验，前端展示A/B支持率和无证据事实数量。用户可以通过按钮或文字反馈，文字反馈分为样式修改、当前公告补证和GraphRAG扩展三类，最多自助修订3轮。流程结束后只抽取稳定样式偏好形成候选记忆，必须由用户确认后才生效。九步业务链路由LangGraph编排，Celery、MySQL、MinIO、Redis、Checkpoint、幂等和OpenTelemetry负责异步执行、失败恢复和追踪。
